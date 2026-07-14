@@ -38,7 +38,6 @@ impl AnthropicProvider {
 
         let client = reqwest::Client::builder()
             .default_headers(headers)
-            .timeout(Duration::from_secs(120))
             .connect_timeout(Duration::from_secs(30))
             .build()
             .map_err(|err| {

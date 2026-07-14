@@ -10,6 +10,13 @@ use nca_common::message::{ContentPart, Message, MessageContent, Role};
 use nca_common::tool::{ToolCall, ToolDefinition};
 use serde_json::{Value, json};
 
+/// 单次流式读取的空闲超时。
+///
+/// 替代 reqwest 的全局总超时：只要持续有 token 流出，任意长的总耗时都不会被掐断；
+/// 仅在连接真正静默（无任何字节）超过该阈值时才报错。这对 reasoning/thinking 模型
+/// 尤其重要——thinking 阶段总耗时常超过 120s，但 token 间隔很小。
+pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
 pub fn openai_request_body(
     messages: &[Message],
     tools: &[ToolDefinition],
@@ -62,7 +69,36 @@ pub fn spawn_openai_stream(
         let mut buffer = String::new();
         let mut tool_calls: BTreeMap<u64, ToolCallAccumulator> = BTreeMap::new();
 
-        while let Some(item) = byte_stream.next().await {
+        loop {
+            // 用单次读取的空闲超时替代 reqwest 全局总超时：只要持续有 token 流出，
+            // 整个流可以跑任意长时间；仅在连接静默超过 STREAM_IDLE_TIMEOUT 时报错。
+            let item = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, byte_stream.next()).await {
+                Ok(Some(result)) => result,
+                Ok(None) => break,
+                Err(_elapsed) => {
+                    let chain = format!(
+                        "operation timed out (stream idle for more than {STREAM_IDLE_TIMEOUT:?})"
+                    );
+                    let buffer_preview = if buffer.is_empty() {
+                        String::from("(none)")
+                    } else {
+                        buffer.chars().take(500).collect()
+                    };
+                    tracing::error!(
+                        provider = provider_name,
+                        idle_timeout_secs = STREAM_IDLE_TIMEOUT.as_secs(),
+                        buffer_preview = %buffer_preview,
+                        "stream_idle_timeout"
+                    );
+                    let _ = tx
+                        .send(StreamChunk::TextDelta(format!(
+                            "\n[{provider_name} stream error: {chain}\nBuffered data before error: {buffer_preview}]"
+                        )))
+                        .await;
+                    break;
+                }
+            };
+
             let chunk = match item {
                 Ok(chunk) => chunk,
                 Err(err) => {
@@ -486,7 +522,6 @@ impl OpenAiCompatProvider {
 
         let client = reqwest::Client::builder()
             .default_headers(headers)
-            .timeout(Duration::from_secs(120))
             .connect_timeout(Duration::from_secs(30))
             .build()
             .map_err(|err| {

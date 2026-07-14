@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Duration;
 
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use futures_util::StreamExt;
@@ -7,6 +8,13 @@ use nca_common::tool::{ToolCall, ToolDefinition};
 use serde_json::{Value, json};
 
 use super::{ProviderError, StreamChunk};
+
+/// 单次流式读取的空闲超时（与 `openai_compat::STREAM_IDLE_TIMEOUT` 保持一致）。
+///
+/// 用 `tokio::time::timeout` 包裹每次 `bytes_stream().next()`，替代 reqwest 的全局
+/// 总超时：只要持续有 token 流出，整个流可以跑任意长时间（reasoning/thinking 模型
+/// 总耗时常超过 120s）；仅在连接静默超过该阈值时才报错。
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 pub fn anthropic_request_body(
     messages: &[Message],
@@ -60,7 +68,36 @@ pub fn spawn_anthropic_stream(
         let mut tool_input = String::new();
         let mut input_tokens: u64 = 0;
 
-        while let Some(item) = byte_stream.next().await {
+        loop {
+            // 用单次读取的空闲超时替代 reqwest 全局总超时：只要持续有 token 流出，
+            // 整个流可以跑任意长时间；仅在连接静默超过 STREAM_IDLE_TIMEOUT 时报错。
+            let item = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, byte_stream.next()).await {
+                Ok(Some(result)) => result,
+                Ok(None) => break,
+                Err(_elapsed) => {
+                    let chain = format!(
+                        "operation timed out (stream idle for more than {STREAM_IDLE_TIMEOUT:?})"
+                    );
+                    let buffer_preview = if buffer.is_empty() {
+                        String::from("(none)")
+                    } else {
+                        buffer.chars().take(500).collect()
+                    };
+                    tracing::error!(
+                        provider = provider_name,
+                        idle_timeout_secs = STREAM_IDLE_TIMEOUT.as_secs(),
+                        buffer_preview = %buffer_preview,
+                        "stream_idle_timeout"
+                    );
+                    let _ = tx
+                        .send(StreamChunk::TextDelta(format!(
+                            "\n[{provider_name} stream error: {chain}\nBuffered data before error: {buffer_preview}]"
+                        )))
+                        .await;
+                    break;
+                }
+            };
+
             let chunk = match item {
                 Ok(chunk) => chunk,
                 Err(err) => {
