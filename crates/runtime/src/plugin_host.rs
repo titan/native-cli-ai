@@ -692,4 +692,159 @@ mod tests {
         // Parser must consume exactly the full frame — no trailing bytes.
         assert_eq!(reader.len(), 0);
     }
+
+    // Integration test: spawn the REAL trellis plugin binary and exercise the
+    // full Hello → Config → CommandExecuteBefore round-trip.
+    #[tokio::test]
+    async fn trellis_plugin_command_execute_before_round_trip() {
+        let binary = std::path::Path::new("/home/titan/.config/nca/plugins/trellis");
+        if !binary.exists() {
+            eprintln!("skipping: trellis plugin not installed");
+            return;
+        }
+
+        let mut cmd = Command::new(binary);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
+        let mut process = cmd.spawn().expect("spawn trellis");
+        let mut stdin = process.stdin.take().unwrap();
+        let mut stdout = process.stdout.take().unwrap();
+
+        // 1. Read Hello.
+        let hello_raw = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            read_capnp_message(&mut stdout),
+        )
+        .await
+        .expect("plugin did not send Hello in time")
+        .expect("read hello");
+        let (caps, proto_major) = parse_hello(&hello_raw).expect("parse hello");
+        eprintln!(
+            "hello: name commands={:?} proto={}",
+            caps.commands, proto_major
+        );
+        assert!(
+            caps.commands.iter().any(|c| c == "trellis:init"),
+            "trellis:init not in commands: {:?}",
+            caps.commands
+        );
+
+        // 2. Send Config.
+        let cfg_wire = plugin_protocol::build_config("1", ".", "test-session", "accept-edits", "");
+        write_capnp_message(&mut stdin, &cfg_wire)
+            .await
+            .expect("write config");
+
+        // 3. Send CommandExecuteBefore for "trellis:init".
+        let cmd_wire = plugin_protocol::build_message("2", |b| {
+            let mut req = b.reborrow().init_command_execute_before();
+            req.set_command("trellis:init");
+            req.set_session_id("");
+            req.set_arguments("");
+        });
+        write_capnp_message(&mut stdin, &cmd_wire)
+            .await
+            .expect("write command");
+
+        // 4. Read response.
+        let resp_raw = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            read_capnp_message(&mut stdout),
+        )
+        .await
+        .expect("plugin did not respond in time")
+        .expect("read response");
+
+        let mut buf = std::io::BufReader::new(&resp_raw[..]);
+        let result = plugin_protocol::read_message_then(&mut buf, |msg| {
+            let body = msg.get_body()?;
+            match body.which() {
+                Ok(body::CommandExecuteBeforeResult(r)) => {
+                    let r = r?;
+                    Ok((r.get_handled(), r.get_text()?.to_string()?))
+                }
+                _ => Err(WireError::Capnp("unexpected body".into())),
+            }
+        });
+        let (handled, text) = result.expect("parse response");
+        eprintln!("response: handled={handled} text={text}");
+        assert!(handled, "plugin should handle trellis:init");
+
+        // Cleanup.
+        let _ = process.start_kill();
+    }
+
+    // Verify ponytail returns handled=false for commands it doesn't own,
+    // which causes check_command_before to short-circuit before trellis.
+    #[tokio::test]
+    async fn ponytail_returns_not_handled_for_foreign_command() {
+        let binary = std::path::Path::new("/home/titan/.config/nca/plugins/ponytail");
+        if !binary.exists() {
+            eprintln!("skipping: ponytail plugin not installed");
+            return;
+        }
+
+        let mut cmd = Command::new(binary);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
+        let mut process = cmd.spawn().expect("spawn ponytail");
+        let mut stdin = process.stdin.take().unwrap();
+        let mut stdout = process.stdout.take().unwrap();
+
+        // Read Hello.
+        let hello_raw = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            read_capnp_message(&mut stdout),
+        )
+        .await
+        .expect("no hello")
+        .expect("read hello");
+        let (caps, _) = parse_hello(&hello_raw).expect("parse hello");
+        eprintln!("ponytail commands={:?}", caps.commands);
+
+        // Send Config.
+        let cfg_wire = plugin_protocol::build_config("1", ".", "test", "accept-edits", "");
+        write_capnp_message(&mut stdin, &cfg_wire).await.unwrap();
+
+        // Send CommandExecuteBefore for trellis:init.
+        let cmd_wire = plugin_protocol::build_message("2", |b| {
+            let mut req = b.reborrow().init_command_execute_before();
+            req.set_command("trellis:init");
+            req.set_session_id("");
+            req.set_arguments("");
+        });
+        write_capnp_message(&mut stdin, &cmd_wire).await.unwrap();
+
+        // Read response.
+        let resp_raw = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            read_capnp_message(&mut stdout),
+        )
+        .await
+        .expect("no response")
+        .expect("read response");
+
+        let mut buf = std::io::BufReader::new(&resp_raw[..]);
+        let result = plugin_protocol::read_message_then(&mut buf, |msg| {
+            let body = msg.get_body()?;
+            match body.which() {
+                Ok(body::CommandExecuteBeforeResult(r)) => {
+                    let r = r?;
+                    Ok((r.get_handled(), r.get_text()?.to_string()?))
+                }
+                _ => Err(WireError::Capnp("unexpected body".into())),
+            }
+        });
+        let (handled, text) = result.expect("parse response");
+        eprintln!("ponytail response: handled={handled} text={text:?}");
+        // THIS is the root cause: ponytail returns handled=false (not None),
+        // so check_command_before returns it and never asks trellis.
+        assert!(!handled, "ponytail should NOT handle trellis:init");
+
+        let _ = process.start_kill();
+    }
 }

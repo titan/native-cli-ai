@@ -293,14 +293,18 @@ impl PluginRegistry {
         }
     }
 
-    /// Run `command.execute.before` hooks. First non-`None` result wins.
+    /// Run `command.execute.before` hooks. First plugin that **handles**
+    /// the command (handled=true) wins. Plugins that respond with
+    /// handled=false are skipped so later plugins get a chance.
     pub fn check_command_before(
         &self,
         command: &str,
         arguments: &str,
     ) -> Option<(String, CommandIntercept)> {
         for plugin in &self.plugins {
-            if let Some(result) = plugin.on_command_execute_before(command, arguments) {
+            if let Some(result) = plugin.on_command_execute_before(command, arguments)
+                && result.handled
+            {
                 return Some((plugin.name().to_string(), result));
             }
         }
