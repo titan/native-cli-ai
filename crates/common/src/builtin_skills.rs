@@ -29,6 +29,17 @@ pub const BUILTIN_SPECIALIST_SKILLS: &[(&str, &str)] = &[
     ("council", include_str!("../skills/council/SKILL.md")),
 ];
 
+/// `(name, embedded SKILL.md content)` pairs for built-in workflow skills.
+///
+/// Unlike [`BUILTIN_SPECIALIST_SKILLS`], these are **not** agent personas —
+/// they are methodology prompts (e.g. evidence-path planning) discovered as
+/// normal skills but never registered as agent profiles, because they lack
+/// `agent: true` and are not in the specialist-name list.
+pub const BUILTIN_WORKFLOW_SKILLS: &[(&str, &str)] = &[(
+    "verification-planning",
+    include_str!("../skills/verification-planning/SKILL.md"),
+)];
+
 /// Ensure built-in specialist skills exist in the user's XDG skills directory.
 ///
 /// Writes only files that are missing — never overwrites existing ones. This
@@ -46,7 +57,12 @@ pub fn seed_builtin_skills() -> usize {
 /// Seed built-in skills into a specific directory (testable variant).
 fn seed_into(skills_root: &Path) -> usize {
     let mut written = 0;
-    for (name, content) in BUILTIN_SPECIALIST_SKILLS {
+    // Specialists first, then workflow skills. Both follow the same
+    // idempotent, never-overwrite contract.
+    for (name, content) in BUILTIN_SPECIALIST_SKILLS
+        .iter()
+        .chain(BUILTIN_WORKFLOW_SKILLS)
+    {
         let dest = skills_root.join(name).join("SKILL.md");
         if dest.exists() {
             continue;
@@ -80,7 +96,10 @@ mod tests {
 
     #[test]
     fn builtin_skills_have_valid_frontmatter() {
-        for (name, content) in BUILTIN_SPECIALIST_SKILLS {
+        for (name, content) in BUILTIN_SPECIALIST_SKILLS
+            .iter()
+            .chain(BUILTIN_WORKFLOW_SKILLS)
+        {
             assert!(
                 content.starts_with("---\n"),
                 "{name}: missing frontmatter delimiter"
@@ -103,9 +122,12 @@ mod tests {
         let root = dir.path().join("skills");
         let n = seed_into(&root);
 
-        // All eight should be written.
-        assert_eq!(n, 8, "all eight specialists should be seeded");
-        for (name, content) in BUILTIN_SPECIALIST_SKILLS {
+        // All nine should be written (8 specialists + 1 workflow skill).
+        assert_eq!(n, 9, "all builtin skills should be seeded");
+        for (name, content) in BUILTIN_SPECIALIST_SKILLS
+            .iter()
+            .chain(BUILTIN_WORKFLOW_SKILLS)
+        {
             let dest = root.join(name).join("SKILL.md");
             assert!(dest.exists(), "{name}/SKILL.md should exist");
             let written = std::fs::read_to_string(&dest).unwrap();
@@ -125,8 +147,8 @@ mod tests {
 
         let n = seed_into(&root);
 
-        // Only seven should be written (explorer already exists).
-        assert_eq!(n, 7);
+        // Only eight should be written (explorer already exists; 9 - 1).
+        assert_eq!(n, 8);
         // The custom explorer must be untouched.
         assert_eq!(
             std::fs::read_to_string(&explorer).unwrap(),
@@ -139,7 +161,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().join("skills");
 
-        assert_eq!(seed_into(&root), 8, "first run seeds all");
+        assert_eq!(seed_into(&root), 9, "first run seeds all");
         assert_eq!(seed_into(&root), 0, "second run seeds nothing");
     }
 }
