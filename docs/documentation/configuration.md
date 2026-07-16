@@ -178,6 +178,7 @@ blocking = false    # If true, waits for completion
 timeout_secs = 15
 max_fetch_chars = 25000
 default_search_limit = 5
+search_endpoint = "https://cn.bing.com/search"
 user_agent = "nca/0.5 (+https://github.com/user/native-cli-ai)"
 ```
 
@@ -250,6 +251,7 @@ Environment variables override config file values.
 | `NCA_MEMORY_PATH` | Override memory file path |
 | `NCA_WEB_TIMEOUT_SECS` | Override web request timeout |
 | `NCA_WEB_MAX_FETCH_CHARS` | Override max characters for web fetches |
+| `NCA_WEB_SEARCH_ENDPOINT` | Override `web_search` engine endpoint (default: Bing CN) |
 | `NCA_DEBUG_REQUEST` | Enable debug logging for MiniMax requests |
 | `NCA_SKIP_CONTEXT_API` | Set to `1` to skip provider model API queries |
 | `NCA_CONTEXT_API_CACHE_TTL_SECS` | Cache TTL for model context API |
