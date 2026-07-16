@@ -67,15 +67,15 @@ impl ToolExecutor for SpawnSubagentTool {
                     },
                     "provider": {
                         "type": "string",
-                        "description": "Optional provider override for the sub-agent (e.g. \"openai\", \"anthropic\", \"deepseek\"). Routes the child session to a different LLM endpoint."
+                        "description": "Optional provider override. Only used when `specialist` is NOT set — a specialist profile's provider is authoritative and takes precedence over this. Use one of the configured provider names."
                     },
                     "model": {
                         "type": "string",
-                        "description": "Optional model name override for the sub-agent (e.g. \"gpt-4o\"). Used in conjunction with provider or alone for alias-based routing."
+                        "description": "Optional model name override. Only used when `specialist` is NOT set — a specialist profile's model is authoritative and takes precedence over this."
                     },
                     "specialist": {
                         "type": "string",
-                        "description": "Optional specialist agent name (e.g. 'explorer', 'oracle', 'fixer'). When set, the runtime loads the matching agent profile (provider, model, system prompt) automatically."
+                        "description": "Optional specialist agent name (e.g. 'explorer', 'oracle', 'librarian', 'fixer'). When set, the runtime loads the matching agent profile (provider, model, system prompt) automatically. Do NOT also pass `provider` or `model` — the profile's routing is authoritative and any such override is ignored."
                     }
                 },
                 "required": ["task"]
