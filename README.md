@@ -89,6 +89,33 @@ cargo build --release
 cp target/release/nca /usr/local/bin/
 ```
 
+### Cross-compile for macOS (from Linux)
+
+To produce a `x86_64-apple-darwin` binary on a Linux host, use [osxcross](https://github.com/tpoechtrager/osxcross) with the `o64-clang`/`o64-clang++` wrappers.
+
+> **SDK requirement.** osxcross must be pointed at a macOS SDK that ships libc++ headers (`usr/include/c++/v1`). The `MacOSX10.11.sdk` bundled with some osxcross packages only has the legacy libstdc++ and will fail with `cannot find libc++ headers` while building `ring`. Use `MacOSX11.3.sdk` (or later) instead, and expose it to the wrappers via `OSXCROSS_SDKROOT`.
+
+```bash
+env CC=o64-clang CXX=o64-clang++ \
+    OSXCROSS_SDKROOT=/usr/local/osx-ndk-x86/SDK/MacOSX11.3.sdk \
+    cargo build --release --target x86_64-apple-darwin
+```
+
+To avoid passing `OSXCROSS_SDKROOT` on every build, set it once in your user-level cargo config (`~/.cargo/config.toml`):
+
+```toml
+[env]
+OSXCROSS_SDKROOT = "/usr/local/osx-ndk-x86/SDK/MacOSX11.3.sdk"
+```
+
+With that in place, the build is just:
+
+```bash
+env CC=o64-clang CXX=o64-clang++ cargo build --release --target x86_64-apple-darwin
+```
+
+The resulting binary is at `target/x86_64-apple-darwin/release/nca` (a Mach-O `x86_64` executable). The `aarch64-apple-darwin` target needs the arm64 osxcross wrappers in addition to the same `OSXCROSS_SDKROOT`.
+
 ## Quick Start
 
 ```bash
