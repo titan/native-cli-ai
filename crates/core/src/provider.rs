@@ -50,6 +50,10 @@ pub enum StreamChunk {
         cache_creation_tokens: u64,
         cache_read_tokens: u64,
     },
+    /// A fatal error occurred mid-stream (e.g. connection reset, idle timeout).
+    /// The stream terminates after this chunk. Consumers MUST propagate it as an
+    /// error rather than treating any buffered text as a successful assistant reply.
+    Error(ProviderError),
     Done,
 }
 
@@ -78,7 +82,7 @@ pub trait Provider: Send + Sync {
     ) -> Result<tokio::sync::mpsc::Receiver<StreamChunk>, ProviderError>;
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ProviderError {
     #[error("provider configuration error: {0}")]
     Configuration(String),

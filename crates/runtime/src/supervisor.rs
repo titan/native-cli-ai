@@ -553,8 +553,15 @@ impl Supervisor {
         self.refresh_session_summary();
 
         // Generate session title from the first user prompt if not yet set.
+        // Bounded timeout: title generation is best-effort. A flaky network
+        // must not hold the main command loop hostage for the full 90s
+        // stream-idle window — if it can't finish quickly, just skip it.
         if self.session_title.is_none() {
-            self.generate_session_title(prompt).await;
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                self.generate_session_title(prompt),
+            )
+            .await;
         }
 
         self.save().await.map_err(ProviderError::Other)?;
@@ -766,6 +773,9 @@ impl Supervisor {
                     summary.push_str(&delta);
                 }
                 nca_core::provider::StreamChunk::Done => break,
+                nca_core::provider::StreamChunk::Error(err) => {
+                    return Err(err.to_string());
+                }
                 _ => {}
             }
         }

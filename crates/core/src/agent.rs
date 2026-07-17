@@ -271,6 +271,13 @@ impl AgentLoop {
                         })
                         .await;
                     }
+                    StreamChunk::Error(err) => {
+                        self.emit(AgentEvent::Error {
+                            message: err.to_string(),
+                        })
+                        .await;
+                        return Err(err);
+                    }
                     StreamChunk::Done => break,
                 }
             }

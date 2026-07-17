@@ -91,11 +91,11 @@ pub fn spawn_openai_stream(
                         "stream_idle_timeout"
                     );
                     let _ = tx
-                        .send(StreamChunk::TextDelta(format!(
-                            "\n[{provider_name} stream error: {chain}\nBuffered data before error: {buffer_preview}]"
-                        )))
+                        .send(StreamChunk::Error(ProviderError::RequestFailed(format!(
+                            "{provider_name} stream error: {chain}\nBuffered data before error: {buffer_preview}"
+                        ))))
                         .await;
-                    break;
+                    return;
                 }
             };
 
@@ -126,11 +126,11 @@ pub fn spawn_openai_stream(
                     );
 
                     let _ = tx
-                        .send(StreamChunk::TextDelta(format!(
-                            "\n[{provider_name} stream error: {chain}\nBuffered data before error: {buffer_preview}]"
-                        )))
+                        .send(StreamChunk::Error(ProviderError::RequestFailed(format!(
+                            "{provider_name} stream error: {chain}\nBuffered data before error: {buffer_preview}"
+                        ))))
                         .await;
-                    break;
+                    return;
                 }
             };
 
