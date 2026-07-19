@@ -2,6 +2,7 @@ pub mod anthropic;
 pub mod anthropic_compat;
 pub mod deepseek;
 pub mod factory;
+pub mod kimi;
 pub mod minimax;
 pub mod minimax_vlm;
 pub mod openai;

@@ -1097,6 +1097,7 @@ impl Repl {
                     format!("  OpenRouter:  {}", config.provider.base_url_for(ProviderKind::OpenRouter)),
                     format!("  ZhipuAI:     {}", config.provider.base_url_for(ProviderKind::ZhipuAI)),
                     format!("  DeepSeek:    {}", config.provider.base_url_for(ProviderKind::DeepSeek)),
+                    format!("  Kimi:        {}", config.provider.base_url_for(ProviderKind::Kimi)),
                 ];
                 if let ReplOutput::Tui(st) = &out {
                     st.open_info_modal("config".to_string(), lines);

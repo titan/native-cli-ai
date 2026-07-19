@@ -296,6 +296,18 @@ impl NcaConfig {
             self.provider.deepseek.model = model;
         }
 
+        if let Ok(api_key) = env::var("KIMI_API_KEY") {
+            self.provider.kimi.api_key = Some(api_key);
+        }
+
+        if let Ok(base_url) = env::var("KIMI_BASE_URL") {
+            self.provider.kimi.base_url = base_url;
+        }
+
+        if let Ok(model) = env::var("KIMI_MODEL") {
+            self.provider.kimi.model = model;
+        }
+
         if let Ok(memory_path) = env::var("NCA_MEMORY_PATH") {
             self.memory.file_path = PathBuf::from(memory_path);
         }
@@ -327,7 +339,9 @@ impl NcaConfig {
     pub fn provider_hint_for_alias(alias: &str) -> Option<ProviderKind> {
         match alias.trim().to_ascii_lowercase().as_str() {
             "minimax" | "m2.7" | "m3" => Some(ProviderKind::MiniMax),
-            "kimi" | "kimi-k2" | "moonshot" | "moonshot-v1" => Some(ProviderKind::OpenAi),
+            "kimi" | "kimi-k2" | "kimi-k3" | "k3" | "moonshot" | "moonshot-v1" => {
+                Some(ProviderKind::Kimi)
+            }
             "openai" | "gpt" | "gpt4o" | "gpt4omini" => Some(ProviderKind::OpenAi),
             "claude" | "claude-sonnet" => Some(ProviderKind::Anthropic),
             "openrouter" => Some(ProviderKind::OpenRouter),
@@ -364,6 +378,7 @@ impl NcaConfig {
             ProviderKind::OpenRouter => self.provider.openrouter.api_key = Some(key),
             ProviderKind::ZhipuAI => self.provider.zhipuai.api_key = Some(key),
             ProviderKind::DeepSeek => self.provider.deepseek.api_key = Some(key),
+            ProviderKind::Kimi => self.provider.kimi.api_key = Some(key),
         }
     }
 
@@ -772,6 +787,7 @@ pub struct ProviderConfig {
     pub openrouter: OpenRouterConfig,
     pub zhipuai: ZhipuAIConfig,
     pub deepseek: DeepSeekConfig,
+    pub kimi: KimiConfig,
 }
 
 impl Default for ProviderConfig {
@@ -784,6 +800,7 @@ impl Default for ProviderConfig {
             openrouter: OpenRouterConfig::default(),
             zhipuai: ZhipuAIConfig::default(),
             deepseek: DeepSeekConfig::default(),
+            kimi: KimiConfig::default(),
         }
     }
 }
@@ -812,6 +829,9 @@ impl ProviderConfig {
         if let Some(deepseek) = partial.deepseek {
             self.deepseek.merge(deepseek);
         }
+        if let Some(kimi) = partial.kimi {
+            self.kimi.merge(kimi);
+        }
     }
 
     pub fn active_model(&self) -> &str {
@@ -822,6 +842,7 @@ impl ProviderConfig {
             ProviderKind::OpenAi => &self.openai.model,
             ProviderKind::ZhipuAI => &self.zhipuai.model,
             ProviderKind::DeepSeek => &self.deepseek.model,
+            ProviderKind::Kimi => &self.kimi.model,
         }
     }
 
@@ -838,6 +859,7 @@ impl ProviderConfig {
             ProviderKind::OpenAi => self.openai.model = model,
             ProviderKind::ZhipuAI => self.zhipuai.model = model,
             ProviderKind::DeepSeek => self.deepseek.model = model,
+            ProviderKind::Kimi => self.kimi.model = model,
         }
     }
 
@@ -849,6 +871,7 @@ impl ProviderConfig {
             ProviderKind::OpenAi => &self.openai.model,
             ProviderKind::ZhipuAI => &self.zhipuai.model,
             ProviderKind::DeepSeek => &self.deepseek.model,
+            ProviderKind::Kimi => &self.kimi.model,
         }
     }
 
@@ -860,6 +883,7 @@ impl ProviderConfig {
             ProviderKind::OpenAi => &self.openai.base_url,
             ProviderKind::ZhipuAI => &self.zhipuai.base_url,
             ProviderKind::DeepSeek => &self.deepseek.base_url,
+            ProviderKind::Kimi => &self.kimi.base_url,
         }
     }
 
@@ -871,6 +895,7 @@ impl ProviderConfig {
             ProviderKind::OpenAi => &self.openai.api_key_env,
             ProviderKind::ZhipuAI => &self.zhipuai.api_key_env,
             ProviderKind::DeepSeek => &self.deepseek.api_key_env,
+            ProviderKind::Kimi => &self.kimi.api_key_env,
         }
     }
 
@@ -882,6 +907,7 @@ impl ProviderConfig {
             ProviderKind::OpenAi => self.openai.resolve_api_key().is_some(),
             ProviderKind::ZhipuAI => self.zhipuai.resolve_api_key().is_some(),
             ProviderKind::DeepSeek => self.deepseek.resolve_api_key().is_some(),
+            ProviderKind::Kimi => self.kimi.resolve_api_key().is_some(),
         }
     }
 
@@ -903,16 +929,18 @@ pub enum ProviderKind {
     OpenAi,
     ZhipuAI,
     DeepSeek,
+    Kimi,
 }
 
 impl ProviderKind {
-    pub const ALL: [ProviderKind; 6] = [
+    pub const ALL: [ProviderKind; 7] = [
         ProviderKind::MiniMax,
         ProviderKind::OpenAi,
         ProviderKind::Anthropic,
         ProviderKind::OpenRouter,
         ProviderKind::ZhipuAI,
         ProviderKind::DeepSeek,
+        ProviderKind::Kimi,
     ];
 
     /// Parse user/CLI input (slash commands, TUI pickers).
@@ -924,6 +952,7 @@ impl ProviderKind {
             "openrouter" | "open-router" => Some(Self::OpenRouter),
             "zhipuai" | "zhipu" | "glm" | "glm-5" | "glm-5.2" => Some(Self::ZhipuAI),
             "deepseek" => Some(Self::DeepSeek),
+            "kimi" | "k3" | "kimi-k3" => Some(Self::Kimi),
             _ => None,
         }
     }
@@ -935,6 +964,7 @@ impl ProviderKind {
             "openai" => Self::OpenAi,
             "zhipuai" | "zhipu" | "glm" => Self::ZhipuAI,
             "deepseek" => Self::DeepSeek,
+            "kimi" => Self::Kimi,
             _ => Self::MiniMax,
         }
     }
@@ -947,6 +977,7 @@ impl ProviderKind {
             ProviderKind::OpenAi => "OpenAI",
             ProviderKind::ZhipuAI => "ZhipuAI",
             ProviderKind::DeepSeek => "DeepSeek",
+            ProviderKind::Kimi => "Kimi",
         }
     }
 
@@ -1226,6 +1257,54 @@ impl DeepSeekConfig {
     }
 
     fn merge(&mut self, partial: PartialDeepSeekConfig) {
+        if let Some(api_key_env) = partial.api_key_env {
+            self.api_key_env = api_key_env;
+        }
+        if let Some(api_key) = partial.api_key {
+            self.api_key = Some(api_key);
+        }
+        if let Some(base_url) = partial.base_url {
+            self.base_url = base_url;
+        }
+        if let Some(model) = partial.model {
+            self.model = model;
+        }
+        if let Some(temperature) = partial.temperature {
+            self.temperature = temperature;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KimiConfig {
+    pub api_key_env: String,
+    pub api_key: Option<String>,
+    pub base_url: String,
+    pub model: String,
+    pub temperature: f32,
+}
+
+impl Default for KimiConfig {
+    fn default() -> Self {
+        Self {
+            api_key_env: "KIMI_API_KEY".into(),
+            api_key: None,
+            // Kimi for Coding serves an Anthropic-compatible API.
+            // Endpoint is `{base_url}/v1/messages` → https://api.kimi.com/coding/v1/messages
+            base_url: "https://api.kimi.com/coding".into(),
+            // Kimi K3 flagship: 1M context, 131K output, reasoning + tool use.
+            model: "k3".into(),
+            temperature: 0.7,
+        }
+    }
+}
+
+impl KimiConfig {
+    pub fn resolve_api_key(&self) -> Option<String> {
+        resolve_api_key_value(&self.api_key, &self.api_key_env)
+    }
+
+    fn merge(&mut self, partial: PartialKimiConfig) {
         if let Some(api_key_env) = partial.api_key_env {
             self.api_key_env = api_key_env;
         }
@@ -1861,6 +1940,7 @@ struct PartialProviderConfig {
     openrouter: Option<PartialOpenRouterConfig>,
     zhipuai: Option<PartialZhipuAIConfig>,
     deepseek: Option<PartialDeepSeekConfig>,
+    kimi: Option<PartialKimiConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -1912,6 +1992,15 @@ struct PartialZhipuAIConfig {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 struct PartialDeepSeekConfig {
+    api_key_env: Option<String>,
+    api_key: Option<String>,
+    base_url: Option<String>,
+    model: Option<String>,
+    temperature: Option<f32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PartialKimiConfig {
     api_key_env: Option<String>,
     api_key: Option<String>,
     base_url: Option<String>,
@@ -2032,9 +2121,11 @@ fn default_model_aliases() -> BTreeMap<String, String> {
         ("glm".into(), "glm-5.2".into()),
         ("glm5".into(), "glm-5.2".into()),
         ("glm-5.2".into(), "glm-5.2".into()),
-        // Kimi (via OpenAI-compatible endpoint)
-        ("kimi".into(), "kimi-k2.6".into()),
-        ("moonshot".into(), "kimi-k2.6".into()),
+        // Kimi (via Anthropic-compatible Kimi for Coding endpoint)
+        ("kimi".into(), "k3".into()),
+        ("moonshot".into(), "k3".into()),
+        ("k3".into(), "k3".into()),
+        ("kimi-k3".into(), "k3".into()),
         // OpenAI
         ("openai".into(), "gpt-4o-mini".into()),
         ("gpt4o".into(), "gpt-4o".into()),
@@ -2357,6 +2448,7 @@ onboarding_completed = true
         config.provider.openrouter.api_key_env = "__NCA_TEST_NONE__".into();
         config.provider.zhipuai.api_key_env = "__NCA_TEST_NONE__".into();
         config.provider.deepseek.api_key_env = "__NCA_TEST_NONE__".into();
+        config.provider.kimi.api_key_env = "__NCA_TEST_NONE__".into();
         config
     }
 

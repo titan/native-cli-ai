@@ -2,6 +2,7 @@ use nca_common::config::{NcaConfig, ProviderKind};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
 use super::anthropic::AnthropicProvider;
+use super::kimi::KimiProvider;
 use super::minimax::MiniMaxProvider;
 use super::openai_compat::{CompatProfile, OpenAiCompatProvider};
 use super::{Provider, ProviderError};
@@ -94,6 +95,7 @@ pub fn build_provider_for(
                 extra,
             )?))
         }
+        ProviderKind::Kimi => Ok(Box::new(KimiProvider::from_config(config)?)),
     }
 }
 
@@ -124,6 +126,9 @@ mod tests {
                 }
                 ProviderKind::DeepSeek => {
                     config.provider.deepseek.api_key = Some("deepseek-key".into());
+                }
+                ProviderKind::Kimi => {
+                    config.provider.kimi.api_key = Some("kimi-key".into());
                 }
             }
 

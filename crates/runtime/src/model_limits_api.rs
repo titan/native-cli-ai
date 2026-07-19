@@ -134,6 +134,7 @@ pub async fn resolve_model_limits(config: &NcaConfig, model: &str) -> ModelLimit
         ProviderKind::MiniMax => None,
         ProviderKind::ZhipuAI => None,
         ProviderKind::DeepSeek => None,
+        ProviderKind::Kimi => None,
     };
 
     match from_api {
@@ -463,6 +464,11 @@ pub async fn fetch_provider_model_ids(config: &NcaConfig) -> Vec<String> {
             "deepseek-v4-pro".into(),
             "deepseek-chat".into(),
             "deepseek-reasoner".into(),
+        ],
+        ProviderKind::Kimi => vec![
+            "k3".into(),
+            "kimi-for-coding".into(),
+            "kimi-for-coding-highspeed".into(),
         ],
     }
 }

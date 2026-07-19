@@ -204,6 +204,19 @@ pub const MODEL_CONTEXT_LIMITS: &[ModelContextLimits] = &[
         context_window: 8_192,
         max_output_tokens: 2048,
     },
+    // Kimi K3 (Moonshot AI) — 1M context, 131K output.
+    // Reached via Kimi for Coding (model id "k3") or OpenRouter ("moonshotai/kimi-k3").
+    ModelContextLimits {
+        pattern: "kimi-k3",
+        context_window: 1_048_576,
+        max_output_tokens: 131_072,
+    },
+    // Kimi K2.7 Code (256K context, 32K output) — Highspeed variant shares specs.
+    ModelContextLimits {
+        pattern: "kimi-for-coding",
+        context_window: 262_144,
+        max_output_tokens: 32_768,
+    },
     // Default for unknown models
     ModelContextLimits {
         pattern: "*",

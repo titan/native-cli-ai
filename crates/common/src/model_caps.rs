@@ -37,6 +37,7 @@ pub fn model_accepts_native_images(kind: ProviderKind, model: &str) -> bool {
         }
         ProviderKind::ZhipuAI => m.contains("glm-5") || m.contains("glm-4v") || m.contains("glm-4"),
         ProviderKind::DeepSeek => false, // DeepSeek does not support native image inputs
+        ProviderKind::Kimi => false,     // Kimi for Coding: k3 specs don't list native image input
     }
 }
 

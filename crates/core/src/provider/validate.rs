@@ -43,7 +43,7 @@ pub async fn validate_api_key(
                 .send()
                 .await
         }
-        ProviderKind::Anthropic | ProviderKind::MiniMax => {
+        ProviderKind::Anthropic | ProviderKind::MiniMax | ProviderKind::Kimi => {
             // Send a minimal POST with an intentionally empty body.
             // A valid key returns 400 (bad request); an invalid key returns 401/403.
             // This avoids coupling validation to any specific model ID.
