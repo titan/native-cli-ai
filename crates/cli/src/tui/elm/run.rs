@@ -10,7 +10,7 @@ use ratatui::backend::CrosstermBackend;
 use super::feedback::TuiFeedbackMsg;
 use super::model::{NcaModel, SideEffectChannels};
 use super::msg::Msg;
-use crate::tui::app::{ApprovalAnswer, restore_terminal, setup_terminal};
+use crate::tui::app::{ApprovalAnswer, TerminalGuard, setup_terminal};
 use nca_common::event::{InteractiveQuestionPayload, QuestionSelection};
 
 /// Parameters for initializing the NcaModel event loop.
@@ -44,6 +44,10 @@ pub(crate) fn run_nca_model(
 ) -> anyhow::Result<()> {
     // Setup terminal
     let mut terminal = setup_terminal()?;
+    // RAII: restore on ANY exit path (normal, `?` error, panic-unwind). The
+    // previous explicit `restore_terminal()` after the loop was bypassed by
+    // `tick()?`, leaving the terminal in raw mode + bracketed paste on error.
+    let _restore_guard = TerminalGuard;
 
     // Create NcaModel
     let mut nca_model = NcaModel::new(
@@ -91,15 +95,12 @@ pub(crate) fn run_nca_model(
         .update_permission_mode(&params.permission_mode);
 
     // Main event loop
-    let result = loop {
+    loop {
         nca_model.tick(&mut terminal)?;
         if nca_model.quit {
-            break Ok(());
+            break;
         }
-    };
+    }
 
-    // Restore terminal (always, even on error)
-    restore_terminal();
-
-    result
+    Ok(())
 }

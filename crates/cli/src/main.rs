@@ -382,8 +382,25 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Install a panic hook that restores the terminal before the panic is
+/// reported. The restore is idempotent (harmless when the TUI was never set
+/// up), so it can be installed unconditionally.
+fn install_tui_panic_hook() {
+    let original = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        crate::tui::app::restore_terminal();
+        original(info);
+    }));
+}
+
 async fn try_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // Restore the terminal before a panic message is printed, so the message
+    // is readable and the terminal is not left in raw mode / bracketed paste /
+    // alt-screen. Under `panic = "abort"` (release) RAII drop does not run, so
+    // this hook is the only safety net for panic-induced exits.
+    install_tui_panic_hook();
 
     // In TUI mode, redirect tracing to a log file to avoid corrupting the
     // full-screen display (花屏). User-visible errors already flow through

@@ -155,3 +155,18 @@ pub fn restore_terminal() {
     let _ = execute!(out, LeaveAlternateScreen);
     let _ = disable_raw_mode();
 }
+
+/// RAII guard guaranteeing [`restore_terminal`] runs on drop.
+///
+/// Covers early-return (`?`) and panic-unwind exit paths from the TUI loop
+/// that would otherwise leave the terminal in raw mode with bracketed paste
+/// enabled — the cause of "terminal stays laggy for ~10s after exit". Under
+/// `panic = "abort"` (release) RAII drop does not run on panic, so the panic
+/// hook installed in `main.rs` is the complementary safety net.
+pub(crate) struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
