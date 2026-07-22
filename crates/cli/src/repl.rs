@@ -1020,10 +1020,10 @@ impl Repl {
                     }
                 }
             }
-            "/unmount" => {
+            "/unmount" | "/umount" => {
                 let rest_trim = rest.trim();
                 if rest_trim.is_empty() {
-                    out.println("Usage: /unmount <path>");
+                    out.println("Usage: /unmount <path>   (alias: /umount)");
                 } else {
                     let path = std::path::Path::new(rest_trim);
                     match self.runtime.unmount_path(path) {

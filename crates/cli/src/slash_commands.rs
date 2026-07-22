@@ -19,6 +19,7 @@ pub const SLASH_COMMANDS: &[&str] = &[
     "/image",
     "/mount",
     "/unmount",
+    "/umount",
     "/config",
     "/connect",
     "/doctor",
