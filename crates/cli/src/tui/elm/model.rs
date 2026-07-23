@@ -678,6 +678,9 @@ impl NcaModel {
                     .status_bar
                     .update_session(&session_id, &model);
                 self.components.status_bar.update_cost(0, 0, 0.0);
+                // Reset context usage too — without this the previous session's
+                // ctx% lingers until the next ContextStatsUpdated event arrives.
+                self.components.status_bar.update_context(0, 0);
             }
             TuiFeedbackMsg::SetOnboardingMode(onboarding) => {
                 // Stored for future onboarding flow; no visual effect in Elm yet.
