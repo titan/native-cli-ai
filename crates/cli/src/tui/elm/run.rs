@@ -94,6 +94,21 @@ pub(crate) fn run_nca_model(
         .status_bar
         .update_permission_mode(&params.permission_mode);
 
+    // Set version and workspace dir on status bar
+    let dir_name = params
+        .workspace_root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| params.workspace_root.display().to_string());
+    nca_model
+        .components
+        .status_bar
+        .update_version(env!("CARGO_PKG_VERSION"));
+    nca_model
+        .components
+        .status_bar
+        .update_workspace_dir(&dir_name);
+
     // Main event loop
     loop {
         nca_model.tick(&mut terminal)?;

@@ -20,6 +20,8 @@ use super::searchable_list::theme;
 /// In Phase 3, NcaModel will populate this from TuiFeedbackMsg updates.
 #[derive(Debug, Clone)]
 pub(crate) struct StatusBarData {
+    pub version: String,
+    pub workspace_dir: String,
     pub model: String,
     pub agent_profile: String,
     pub current_branch: String,
@@ -41,6 +43,8 @@ pub(crate) struct StatusBarData {
 impl Default for StatusBarData {
     fn default() -> Self {
         Self {
+            version: String::new(),
+            workspace_dir: String::new(),
             model: String::from("unknown"),
             agent_profile: String::from("@orchestrator"),
             current_branch: String::new(),
@@ -138,6 +142,14 @@ impl StatusBar {
         self.data.active_approval = active;
     }
 
+    pub(crate) fn update_version(&mut self, version: &str) {
+        self.data.version = version.to_string();
+    }
+
+    pub(crate) fn update_workspace_dir(&mut self, dir: &str) {
+        self.data.workspace_dir = dir.to_string();
+    }
+
     pub(crate) fn set_active_question(&mut self, active: bool) {
         self.data.active_question = active;
     }
@@ -182,17 +194,6 @@ impl StatusBar {
             )
         };
 
-        // Turn Timer: elapsed in the current busy period; 00:00 while idle.
-        let elapsed = if d.current_busy_state == BusyState::Idle {
-            0
-        } else {
-            d.busy_since.elapsed().as_secs()
-        };
-        let time_span = Span::styled(
-            format!("{:02}:{:02}", elapsed / 60, elapsed % 60),
-            Style::default().fg(theme::MUTED),
-        );
-
         // Cancel hint (when busy, Esc cancels)
         let cancel_hint_text = " Esc cancel ";
         let cancel_visible = matches!(
@@ -232,20 +233,38 @@ impl StatusBar {
             .fg(theme::TOOL)
             .add_modifier(Modifier::UNDERLINED);
 
+        // Workspace dir (truncated to fit, Unicode-aware)
+        let dir_display = if d.workspace_dir.is_empty() {
+            String::new()
+        } else {
+            let max_dir_w = (area.width as usize).saturating_sub(50);
+            let dir = &d.workspace_dir;
+            if dir.chars().count() > max_dir_w {
+                let mut t: String = dir.chars().take(max_dir_w.saturating_sub(1)).collect();
+                t.push('…');
+                t
+            } else {
+                dir.clone()
+            }
+        };
+
         // Build status spans
-        let mut status_spans = vec![
-            busy,
-            approval_hint,
-            q_hint,
-            Span::raw(" │ "),
-            Span::styled(&d.model, Style::default().fg(theme::USER)),
-            Span::raw(" │ "),
-            Span::styled(&d.agent_profile, Style::default().fg(theme::ASSISTANT)),
-            Span::raw(" │ "),
-            Span::styled(branch_text, branch_span_style),
-            Span::raw(" │ "),
-            perm_span,
-        ];
+        let mut status_spans = vec![busy, approval_hint, q_hint];
+        status_spans.push(Span::raw(" │ "));
+        status_spans.push(Span::styled(&d.model, Style::default().fg(theme::USER)));
+        status_spans.push(Span::raw(" │ "));
+        status_spans.push(Span::styled(
+            &d.agent_profile,
+            Style::default().fg(theme::ASSISTANT),
+        ));
+        if !dir_display.is_empty() {
+            status_spans.push(Span::raw(" │ "));
+            status_spans.push(Span::styled(dir_display, Style::default().fg(theme::MUTED)));
+        }
+        status_spans.push(Span::raw(" │ "));
+        status_spans.push(Span::styled(branch_text, branch_span_style));
+        status_spans.push(Span::raw(" │ "));
+        status_spans.push(perm_span);
 
         // Tokens/cost/session: show on bar only when sidebar is hidden
         if !self.sidebar_visible {
@@ -286,8 +305,13 @@ impl StatusBar {
             format!("{}%", d.context_usage_percent),
             Style::default().fg(ctx_pct_color),
         ));
-        status_spans.push(Span::raw(" │ "));
-        status_spans.push(time_span);
+        if !d.version.is_empty() {
+            status_spans.push(Span::raw(" │ "));
+            status_spans.push(Span::styled(
+                format!("nca v{}", d.version),
+                Style::default().fg(theme::MUTED),
+            ));
+        }
 
         // Render main bar
         let status = Line::from(status_spans);
