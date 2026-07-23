@@ -27,6 +27,7 @@ pub use ask_question::AskQuestionTool;
 pub use invoke_skill::InvokeSkillTool;
 
 use nca_common::config::WebConfig;
+use nca_common::event::AgentEvent;
 use nca_common::tool::{ToolCall, ToolDefinition, ToolResult};
 use std::sync::Arc;
 
@@ -117,6 +118,22 @@ impl ToolRegistry {
             error: Some(format!("Unknown tool: {}", call.name)),
         }
     }
+
+    /// Streaming dispatch: like [`execute`](Self::execute) but forwards the
+    /// `progress` handle so streaming tools can emit incremental output.
+    pub async fn execute_streaming(&self, call: &ToolCall, progress: &ToolProgress) -> ToolResult {
+        for tool in &self.tools {
+            if tool.definition().name == call.name {
+                return tool.execute_streaming(call, progress).await;
+            }
+        }
+        ToolResult {
+            call_id: call.id.clone(),
+            success: false,
+            output: String::new(),
+            error: Some(format!("Unknown tool: {}", call.name)),
+        }
+    }
 }
 
 impl Default for ToolRegistry {
@@ -125,11 +142,48 @@ impl Default for ToolRegistry {
     }
 }
 
+/// Handle given to a tool so it can stream incremental output to the UI.
+///
+/// Cheap to clone (clones the channel sender). Tools that do not stream
+/// output simply ignore this; their default `execute_streaming` delegates
+/// to [`ToolExecutor::execute`].
+#[derive(Clone)]
+pub struct ToolProgress {
+    call_id: String,
+    sender: tokio::sync::mpsc::Sender<AgentEvent>,
+}
+
+impl ToolProgress {
+    pub fn new(call_id: impl Into<String>, sender: tokio::sync::mpsc::Sender<AgentEvent>) -> Self {
+        Self {
+            call_id: call_id.into(),
+            sender,
+        }
+    }
+
+    /// Emit a chunk of streamed output. Best-effort and non-blocking: if the
+    /// event channel is full the chunk is dropped (never blocks tool execution).
+    pub fn emit_chunk(&self, delta: &str) {
+        let _ = self.sender.try_send(AgentEvent::ToolOutputChunk {
+            call_id: self.call_id.clone(),
+            delta: delta.to_string(),
+        });
+    }
+}
+
 /// Trait implemented by each tool.
 #[async_trait::async_trait]
 pub trait ToolExecutor: Send + Sync {
     fn definition(&self) -> ToolDefinition;
     async fn execute(&self, call: &ToolCall) -> ToolResult;
+
+    /// Streaming variant. The default implementation ignores `progress` and
+    /// delegates to [`execute`](Self::execute). Override this to emit
+    /// incremental output via `progress.emit_chunk(...)` while running.
+    async fn execute_streaming(&self, call: &ToolCall, progress: &ToolProgress) -> ToolResult {
+        let _ = progress;
+        self.execute(call).await
+    }
 }
 
 // ---------------------------------------------------------------------------

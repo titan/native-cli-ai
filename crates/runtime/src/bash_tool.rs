@@ -1,6 +1,7 @@
 use crate::pty::PtyManager;
+use nca_common::event::AgentEvent;
 use nca_common::tool::{ToolCall, ToolDefinition, ToolResult};
-use nca_core::tools::ToolExecutor;
+use nca_core::tools::{ToolExecutor, ToolProgress};
 use std::sync::Arc;
 
 /// Runtime-backed bash tool that executes shell commands via PTY.
@@ -41,10 +42,20 @@ impl ToolExecutor for RuntimeBashTool {
     }
 
     async fn execute(&self, call: &ToolCall) -> ToolResult {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<AgentEvent>(8);
+        let progress = ToolProgress::new(call.id.clone(), tx);
+        self.execute_streaming(call, &progress).await
+    }
+
+    async fn execute_streaming(&self, call: &ToolCall, progress: &ToolProgress) -> ToolResult {
         let command = call.input["command"].as_str().unwrap_or("");
         let timeout_secs = call.input["timeout_secs"].as_u64().unwrap_or(30);
 
-        match self.pty.exec(command, timeout_secs).await {
+        match self
+            .pty
+            .exec_streaming(command, timeout_secs, progress)
+            .await
+        {
             Ok(out) => ToolResult {
                 call_id: call.id.clone(),
                 success: out.exit_code == 0,

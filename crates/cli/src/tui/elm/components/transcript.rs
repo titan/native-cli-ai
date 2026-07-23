@@ -227,7 +227,23 @@ impl TranscriptState {
                     name: tool.clone(),
                     call_id: call_id.clone(),
                     input: format_tool_input_for_display(tool, input),
+                    streamed_output: String::new(),
                 });
+            }
+            AgentEvent::ToolOutputChunk { call_id, delta } => {
+                if let Some(DisplayBlock::ToolRunning {
+                    streamed_output, ..
+                }) = self.blocks.iter_mut().rev().find(
+                    |b| matches!(b, DisplayBlock::ToolRunning { call_id: id, .. } if id == call_id),
+                ) {
+                    streamed_output.push_str(delta);
+                }
+                // CRITICAL: do NOT bump blocks_generation or return a
+                // cache-invalidating action. Streaming chunks are
+                // high-frequency; rebuilding the line-height cache per
+                // chunk would starve the input loop (same rationale as
+                // TokensStreamed above).
+                return TranscriptAction::None;
             }
             AgentEvent::ToolCallCompleted {
                 call_id,

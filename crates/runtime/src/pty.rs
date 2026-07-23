@@ -1,9 +1,16 @@
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Mutex;
-use tokio::time::{Duration, timeout};
+use tokio::io::AsyncReadExt;
+use tokio::time::{Duration, Instant};
 
-/// Manages PTY sessions for sandboxed command execution.
+use nca_common::event::AgentEvent;
+use nca_core::tools::ToolProgress;
+
+/// Runs shell commands in their own process group: streams stdout, and on
+/// completion or timeout kills the entire process group (clearing any
+/// backgrounded survivors) so a lingering child can never pin a worker or
+/// starve the TUI input loop.
 pub struct PtyManager {
     workspace_root: Mutex<std::path::PathBuf>,
 }
@@ -31,55 +38,150 @@ impl PtyManager {
             .expect("workspace_root lock poisoned") = path.to_path_buf();
     }
 
-    /// Spawn a command in a new PTY, capture output, and return it.
-    pub async fn exec(&self, command: &str, timeout_secs: u64) -> Result<PtyOutput, PtyError> {
-        let root = self
-            .workspace_root
-            .lock()
-            .expect("workspace_root lock poisoned")
-            .clone();
+    /// Spawn a command in its own process group, stream stdout via `progress`,
+    /// and on completion or timeout kill the entire process group (clearing any
+    /// backgrounded survivors). This replaces the old wait-then-read_to_end model
+    /// that deadlocked when a command backgrounded a long-running process.
+    pub async fn exec_streaming(
+        &self,
+        command: &str,
+        timeout_secs: u64,
+        progress: &ToolProgress,
+    ) -> Result<PtyOutput, PtyError> {
+        let root = self.workspace_root();
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-lc")
             .arg(command)
             .current_dir(&root)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // Make the child the leader of a NEW process group (pgid == child pid),
+            // so we can kill the whole group via libc::kill(-pid, SIGKILL).
+            .process_group(0);
 
         let mut child = cmd
             .spawn()
             .map_err(|e| PtyError::SpawnFailed(e.to_string()))?;
+        let pid = child.id();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
 
-        let status = match timeout(Duration::from_secs(timeout_secs), child.wait()).await {
-            Ok(Ok(status)) => status,
-            Ok(Err(e)) => {
-                // Child exited with an error; ensure it's reaped.
-                std::mem::drop(child.kill());
-                return Err(PtyError::SpawnFailed(e.to_string()));
-            }
-            Err(_) => {
-                // Timeout — kill the child process.
-                std::mem::drop(child.kill());
-                std::mem::drop(child.wait());
-                return Err(PtyError::Timeout(timeout_secs));
-            }
+        // Reader task for stdout: streams chunks to `progress` AND returns the
+        // full buffer (authoritative). Uses try_send so it never blocks if the
+        // display channel is full/dropped.
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let stdout_task = if let Some(mut out) = stdout {
+            let chunk_tx = chunk_tx;
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let mut total: Vec<u8> = Vec::new();
+                loop {
+                    match out.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let _ = chunk_tx.try_send(buf[..n].to_vec());
+                            total.extend_from_slice(&buf[..n]);
+                        }
+                        Err(_) => break,
+                    }
+                }
+                total
+            })
+        } else {
+            drop(chunk_tx);
+            tokio::spawn(async { Vec::new() })
         };
 
-        // Collect stdout/stderr from the piped handles.
-        let mut stdout = String::new();
-        let mut stderr = String::new();
-        if let Some(mut out) = child.stdout.take() {
-            use tokio::io::AsyncReadExt;
-            let mut buf = Vec::new();
-            let _ = out.read_to_end(&mut buf).await;
-            stdout = String::from_utf8_lossy(&buf).into_owned();
-        }
-        if let Some(mut err) = child.stderr.take() {
-            use tokio::io::AsyncReadExt;
-            let mut buf = Vec::new();
-            let _ = err.read_to_end(&mut buf).await;
-            stderr = String::from_utf8_lossy(&buf).into_owned();
+        // Reader task for stderr: collect only (not streamed to UI).
+        let stderr_task = if let Some(mut err) = stderr {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let mut total: Vec<u8> = Vec::new();
+                loop {
+                    match err.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => total.extend_from_slice(&buf[..n]),
+                        Err(_) => break,
+                    }
+                }
+                total
+            })
+        } else {
+            tokio::spawn(async { Vec::new() })
+        };
+
+        // Drive: stream chunks while waiting for the child to exit OR the overall
+        // timeout. We do NOT wait for pipe EOF (that would re-introduce the
+        // deadlock when survivors hold the pipe).
+        //
+        // Once the stdout reader ends (chunk channel closed) we stop polling
+        // it: a closed `mpsc::Receiver::recv()` returns `None` on every poll,
+        // which would busy-spin and starve `child.wait()` / the timeout (a real
+        // bug caught by the regression suite for fast-exiting foreground
+        // commands whose stdout closes before the child is reaped).
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        let mut timed_out = false;
+        let mut exit_code: Option<i32> = None;
+        let mut reader_done = false;
+        loop {
+            if reader_done {
+                tokio::select! {
+                    status = child.wait() => {
+                        if let Ok(s) = status {
+                            exit_code = s.code();
+                        }
+                        break;
+                    }
+                    _ = tokio::time::sleep_until(deadline) => {
+                        timed_out = true;
+                        break;
+                    }
+                }
+            } else {
+                tokio::select! {
+                    chunk = chunk_rx.recv() => match chunk {
+                        Some(c) => progress.emit_chunk(&String::from_utf8_lossy(&c)),
+                        None => reader_done = true,
+                    },
+                    status = child.wait() => {
+                        if let Ok(s) = status {
+                            exit_code = s.code();
+                        }
+                        break;
+                    }
+                    _ = tokio::time::sleep_until(deadline) => {
+                        timed_out = true;
+                        break;
+                    }
+                }
+            }
         }
 
+        // Kill the ENTIRE process group to clear any backgrounded survivors.
+        // process_group made child the group leader so pid == pgid.
+        if let Some(pid) = pid {
+            // SAFETY: libc::kill on a process group is a standard POSIX operation.
+            // Returns ESRCH (harmless) if the group already exited.
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+        }
+        // Reap to avoid a zombie. On timeout, reap the now-killed child.
+        if timed_out {
+            let _ = child.wait().await;
+        }
+
+        // Drain reader tasks (they terminate on EOF after the group kill).
+        let stdout_buf = stdout_task.await.unwrap_or_default();
+        let stderr_buf = stderr_task.await.unwrap_or_default();
+
+        if timed_out {
+            return Err(PtyError::Timeout(timeout_secs));
+        }
+
+        // Merge stderr into stdout, matching the original logic exactly.
+        let mut stdout = String::from_utf8_lossy(&stdout_buf).into_owned();
+        let stderr = String::from_utf8_lossy(&stderr_buf).into_owned();
         if !stderr.is_empty() && !stdout.is_empty() {
             stdout.push('\n');
             stdout.push_str(&stderr);
@@ -89,8 +191,16 @@ impl PtyManager {
 
         Ok(PtyOutput {
             stdout,
-            exit_code: status.code().unwrap_or(-1),
+            exit_code: exit_code.unwrap_or(-1),
         })
+    }
+
+    /// Run a command without streaming its output (backward-compatible wrapper
+    /// around [`Self::exec_streaming`]).
+    pub async fn exec(&self, command: &str, timeout_secs: u64) -> Result<PtyOutput, PtyError> {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<AgentEvent>(8);
+        let progress = ToolProgress::new(String::new(), tx);
+        self.exec_streaming(command, timeout_secs, &progress).await
     }
 }
 
@@ -106,4 +216,102 @@ pub enum PtyError {
     Timeout(u64),
     #[error("Spawn failed: {0}")]
     SpawnFailed(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn mgr() -> PtyManager {
+        PtyManager::new(".")
+    }
+
+    fn progress(name: &str) -> ToolProgress {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<AgentEvent>(8);
+        ToolProgress::new(name, tx)
+    }
+
+    /// Regression suite for the shell execution backend. Covers: no deadlock
+    /// on backgrounded processes (the original input-lag/worker-block bug),
+    /// process-group cleanup on return (policy: 结束即清整组), exit-code
+    /// reporting for foreground commands, and concurrent calls on one runtime
+    /// (the production tool-pipeline shape).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exec_streaming_regression_suite() {
+        let m = mgr();
+
+        // (1) A backgrounded long-running process must NOT deadlock. The old
+        //     wait-then-read_to_end model blocked forever here because the
+        //     backgrounded `sleep` kept the stdout pipe open.
+        let res = tokio::time::timeout(
+            Duration::from_secs(10),
+            m.exec_streaming("sleep 30 & echo started", 60, &progress("no-deadlock")),
+        )
+        .await;
+        assert!(res.is_ok(), "exec_streaming hung (deadlock not fixed)");
+        let out = res.unwrap().expect("command should succeed");
+        assert!(out.stdout.contains("started"), "stdout: {:?}", out.stdout);
+        assert_eq!(out.exit_code, 0);
+
+        // (2) The backgrounded survivor must be killed with its process group
+        //     on return. Returning at all requires its inherited pipe
+        //     write-end to close, i.e. it was reaped; verify with `kill -0`.
+        let out = m
+            .exec_streaming("sleep 30 & echo $!", 60, &progress("kill-group"))
+            .await
+            .expect("command should succeed");
+        let pid: i32 = out
+            .stdout
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("expected a pid, got: {:?}", out.stdout));
+        let probe = std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .output()
+            .expect("probe `kill -0` should run");
+        assert!(
+            !probe.status.success(),
+            "backgrounded pid={pid} still alive; process group was not killed"
+        );
+
+        // (3) Foreground commands report their exit code. This also guards
+        //     against the closed-channel busy-spin regression: a fast-exiting
+        //     command whose stdout closes before the child is reaped must not
+        //     wedge the drive loop (once `chunk_rx` returns `None` forever we
+        //     stop polling it).
+        let ok = m
+            .exec_streaming("printf hello", 30, &progress("fg-ok"))
+            .await
+            .expect("command should succeed");
+        assert_eq!(ok.stdout, "hello");
+        assert_eq!(ok.exit_code, 0);
+
+        let fail = m
+            .exec_streaming("exit 7", 30, &progress("fg-fail"))
+            .await
+            .expect("spawn should succeed");
+        assert_eq!(fail.exit_code, 7);
+
+        // (4) Concurrent tool calls on a single runtime (the production shape:
+        //     the tool pipeline runs tools concurrently via join_all). Each
+        //     call gets its own process group; neither deadlocks.
+        let prog_a = progress("conc-a");
+        let prog_b = progress("conc-b");
+        let (a, b) = tokio::join!(
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                m.exec_streaming("sleep 30 & echo a", 60, &prog_a),
+            ),
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                m.exec_streaming("sleep 30 & echo b", 60, &prog_b),
+            ),
+        );
+        let a = a.expect("concurrent A hung").expect("A should succeed");
+        let b = b.expect("concurrent B hung").expect("B should succeed");
+        assert!(a.stdout.contains('a'), "A stdout: {:?}", a.stdout);
+        assert!(b.stdout.contains('b'), "B stdout: {:?}", b.stdout);
+    }
 }

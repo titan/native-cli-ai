@@ -211,8 +211,14 @@ pub async fn run_tool_pipeline(
         // the user can interrupt long-running tools (e.g. cargo build).
         let exec_fut = async {
             let futs = to_execute.iter().map(|(i, call)| {
-                let fut = tools.execute(call);
-                async move { (*i, fut.await) }
+                let call_id = call.id.clone();
+                let tx = event_tx.clone();
+                let call = call.clone();
+                async move {
+                    let progress = crate::tools::ToolProgress::new(call_id, tx);
+                    let res = tools.execute_streaming(&call, &progress).await;
+                    (*i, res)
+                }
             });
             futures_util::future::join_all(futs).await
         };

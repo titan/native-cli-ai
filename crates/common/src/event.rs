@@ -89,6 +89,11 @@ pub enum AgentEvent {
         #[serde(default)]
         duration_ms: u64,
     },
+    /// Incremental streamed output from a tool (e.g. live shell output).
+    ToolOutputChunk {
+        call_id: String,
+        delta: String,
+    },
     ApprovalRequested {
         call_id: String,
         tool: String,

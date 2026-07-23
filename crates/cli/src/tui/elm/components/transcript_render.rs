@@ -129,6 +129,39 @@ pub(super) fn parse_md_line(line: &str) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Take the tail of `s` that fits within approximately `max_chars` characters.
+/// Preserves line boundaries — never cuts mid-line at the start.
+pub(super) fn tail_lines(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let lines: Vec<&str> = s.lines().collect();
+    let mut result = Vec::new();
+    let mut budget = max_chars;
+    for line in lines.iter().rev() {
+        let line_len = line.chars().count();
+        if result.is_empty() {
+            if line_len > budget {
+                let start = line_len.saturating_sub(budget);
+                result.push(line.chars().skip(start).collect::<String>());
+                break;
+            }
+            budget = budget.saturating_sub(line_len + 1);
+            result.push(line.to_string());
+        } else if line_len < budget {
+            budget = budget.saturating_sub(line_len + 1);
+            result.push(line.to_string());
+        } else {
+            break;
+        }
+    }
+    result.reverse();
+    result.join(
+        "
+",
+    )
+}
+
 pub(super) fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -202,14 +235,23 @@ pub(super) fn block_line_count(block: &DisplayBlock, width: usize) -> usize {
             }
             n
         }
-        DisplayBlock::ToolRunning { input, .. } => {
+        DisplayBlock::ToolRunning {
+            input,
+            streamed_output,
+            ..
+        } => {
             let cmd = serde_json::from_str::<serde_json::Value>(input)
                 .ok()
                 .and_then(|v| v.get("command").and_then(|v| v.as_str().map(String::from)));
-            match cmd {
+            let mut n = match cmd {
                 Some(c) if !c.is_empty() => 1 + wrap_text(&c, w.saturating_sub(3)).len(),
                 _ => 1,
+            };
+            if !streamed_output.is_empty() {
+                let tail = tail_lines(streamed_output, 1000);
+                n += wrap_text(&tail, w.saturating_sub(3)).len();
             }
+            n
         }
         DisplayBlock::ApprovalPending(req) => {
             2 + wrap_text(&req.description, w).len()
@@ -575,7 +617,12 @@ pub(super) fn emit_block_lines(
             }
             push(Line::default(), None);
         }
-        DisplayBlock::ToolRunning { name, input, .. } => {
+        DisplayBlock::ToolRunning {
+            name,
+            input,
+            streamed_output,
+            ..
+        } => {
             let name_budget = w.saturating_sub(5); // " ⚡ " + " …"
             push(
                 Line::from(vec![
@@ -596,6 +643,18 @@ pub(super) fn emit_block_lines(
                 .unwrap_or_default();
             if !cmd.is_empty() {
                 for tl in wrap_text(&cmd, w.saturating_sub(3)) {
+                    push(
+                        Line::from(Span::styled(
+                            format!("   {tl}"),
+                            Style::default().fg(theme::MUTED),
+                        )),
+                        None,
+                    );
+                }
+            }
+            if !streamed_output.is_empty() {
+                let tail = tail_lines(streamed_output, 1000);
+                for tl in wrap_text(&tail, w.saturating_sub(3)) {
                     push(
                         Line::from(Span::styled(
                             format!("   {tl}"),

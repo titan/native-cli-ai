@@ -19,6 +19,8 @@ pub enum DisplayBlock {
         name: String,
         call_id: String,
         input: String,
+        /// Incremental streamed output accumulated from ToolOutputChunk events.
+        streamed_output: String,
     },
     ApprovalPending(ApprovalRequest),
     ApprovalResolved {
