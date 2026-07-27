@@ -325,12 +325,12 @@ impl SessionRuntime {
     // ── Mount management ─────────────────────────────────────────────
 
     /// Mount an additional directory so tools can access files outside the workspace root.
-    pub fn mount_path(&self, path: &std::path::Path) -> Result<(), String> {
+    pub fn mount_path(&mut self, path: &std::path::Path) -> Result<(), String> {
         self.supervisor.mount_path(path)
     }
 
     /// Unmount a previously mounted directory.
-    pub fn unmount_path(&self, path: &std::path::Path) -> Result<(), String> {
+    pub fn unmount_path(&mut self, path: &std::path::Path) -> Result<(), String> {
         self.supervisor.unmount_path(path)
     }
 

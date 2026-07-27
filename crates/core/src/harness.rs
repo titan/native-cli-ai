@@ -1,6 +1,6 @@
 use nca_common::config::{AgentProfileConfig, NcaConfig, PermissionMode};
 use nca_common::session::OrchestrationContext;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::plugin::PluginRegistry;
 use crate::skills::SkillCatalog;
@@ -204,7 +204,15 @@ pub fn build_system_prompt(
     plugins: &PluginRegistry,
     orchestration: Option<&OrchestrationContext>,
 ) -> String {
-    build_system_prompt_with_agent(config, workspace_root, plugins, orchestration, None)
+    let no_mounts: Vec<PathBuf> = Vec::new();
+    build_system_prompt_with_agent(
+        config,
+        workspace_root,
+        plugins,
+        orchestration,
+        None,
+        &no_mounts,
+    )
 }
 
 /// Build the layered system prompt with an optional agent profile.
@@ -221,6 +229,7 @@ pub fn build_system_prompt_with_agent(
     plugins: &PluginRegistry,
     orchestration: Option<&OrchestrationContext>,
     agent_profile: Option<&AgentProfileConfig>,
+    mounted_paths: &[PathBuf],
 ) -> String {
     let mut sections = Vec::new();
 
@@ -234,6 +243,19 @@ pub fn build_system_prompt_with_agent(
         if let Some(mode_section) = permission_mode_section(config.permissions.mode) {
             sections.push(mode_section);
         }
+    }
+
+    // Mounted extra directories: the agent must know these exist and that it
+    // must use absolute paths (relative paths resolve under the workspace root).
+    if !mounted_paths.is_empty() {
+        let list = mounted_paths
+            .iter()
+            .map(|p| format!("- {}", p.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        sections.push(format!(
+            "Mounted directories — accessible to file tools. Use ABSOLUTE paths to read/edit/search them (relative paths resolve under the workspace root):\n{list}"
+        ));
     }
 
     // Global instructions (e.g. ~/.nca/AGENTS.md) — shared across all projects.
@@ -544,6 +566,7 @@ mod tests {
             &PluginRegistry::new(),
             None,
             Some(&profile),
+            &Vec::new(),
         );
 
         // Built-in prompt should be replaced
@@ -567,6 +590,7 @@ mod tests {
             &PluginRegistry::new(),
             None,
             Some(&profile),
+            &Vec::new(),
         );
 
         // Built-in prompt is preserved
@@ -594,6 +618,7 @@ mod tests {
             &PluginRegistry::new(),
             None,
             Some(&profile),
+            &Vec::new(),
         );
 
         // Specialist system_prompt replaces built-in
@@ -617,6 +642,7 @@ mod tests {
             &PluginRegistry::new(),
             None,
             None,
+            &Vec::new(),
         );
 
         assert_eq!(via_wrapper, via_with_agent);

@@ -247,7 +247,7 @@ impl Supervisor {
         let mut tools = if cfg.safe_mode {
             ToolRegistry::with_default_readonly_tools(fs.clone(), config.web.clone())
         } else {
-            ToolRegistry::with_default_full_tools(fs, config.web.clone())
+            ToolRegistry::with_default_full_tools(fs.clone(), config.web.clone())
         };
         if !config.mcp.servers.is_empty() && (!cfg.safe_mode || config.mcp.expose_in_safe_mode) {
             match load_mcp_tools(&workspace_root, &config.mcp.servers).await {
@@ -385,6 +385,7 @@ impl Supervisor {
             &plugins,
             cfg.orchestration_context.as_ref(),
             agent_profile.as_ref(),
+            &fs.mounted_paths(),
         );
         agent.set_system_prompt(system_prompt);
 
@@ -982,14 +983,7 @@ impl Supervisor {
 
         // Store profile and rebuild system prompt.
         self.agent_profile = profile;
-        let system_prompt = build_system_prompt_with_agent(
-            &self.config,
-            &self.workspace_root,
-            &self.plugins,
-            self.orchestration.as_ref(),
-            self.agent_profile.as_ref(),
-        );
-        self.agent.set_system_prompt(system_prompt);
+        self.rebuild_system_prompt();
         self.rebuild_context_manager_sync();
         Ok(())
     }
@@ -998,14 +992,7 @@ impl Supervisor {
     pub fn reset_for_new_session(&mut self) {
         self.session_id = generate_session_id();
         self.agent.messages.clear();
-        let system_prompt = build_system_prompt_with_agent(
-            &self.config,
-            &self.workspace_root,
-            &self.plugins,
-            self.orchestration.as_ref(),
-            self.agent_profile.as_ref(),
-        );
-        self.agent.set_system_prompt(system_prompt);
+        self.rebuild_system_prompt();
         self.child_session_ids.clear();
         self.parent_session_id = None;
         self.inherited_summary = None;
@@ -1073,19 +1060,36 @@ impl Supervisor {
         self.context_manager = ContextManager::new(context_config, self.model.clone());
     }
 
+    /// Rebuild the system prompt from the current config/profile/mounts and
+    /// apply it to the agent. Called on profile switch, new session, and mount.
+    fn rebuild_system_prompt(&mut self) {
+        let mounted = self.fs.mounted_paths();
+        let system_prompt = build_system_prompt_with_agent(
+            &self.config,
+            &self.workspace_root,
+            &self.plugins,
+            self.orchestration.as_ref(),
+            self.agent_profile.as_ref(),
+            &mounted,
+        );
+        self.agent.set_system_prompt(system_prompt);
+    }
+
     // ── Mount management ─────────────────────────────────────────────
 
     /// Mount an additional directory so tools can access files outside the workspace root.
-    pub fn mount_path(&self, path: &Path) -> Result<(), String> {
+    pub fn mount_path(&mut self, path: &Path) -> Result<(), String> {
         self.fs.mount_path(path).map_err(|e| e.to_string())?;
         persist_mounted_paths(&self.workspace_root, self.fs.mounted_paths());
+        self.rebuild_system_prompt();
         Ok(())
     }
 
     /// Unmount a previously mounted directory.
-    pub fn unmount_path(&self, path: &Path) -> Result<(), String> {
+    pub fn unmount_path(&mut self, path: &Path) -> Result<(), String> {
         self.fs.unmount_path(path).map_err(|e| e.to_string())?;
         persist_mounted_paths(&self.workspace_root, self.fs.mounted_paths());
+        self.rebuild_system_prompt();
         Ok(())
     }
 
