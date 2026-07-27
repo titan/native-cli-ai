@@ -379,6 +379,7 @@ impl NcaConfig {
             ProviderKind::ZhipuAI => self.provider.zhipuai.api_key = Some(key),
             ProviderKind::DeepSeek => self.provider.deepseek.api_key = Some(key),
             ProviderKind::Kimi => self.provider.kimi.api_key = Some(key),
+            ProviderKind::Custom => self.provider.custom.api_key = Some(key),
         }
     }
 
@@ -788,6 +789,8 @@ pub struct ProviderConfig {
     pub zhipuai: ZhipuAIConfig,
     pub deepseek: DeepSeekConfig,
     pub kimi: KimiConfig,
+    #[serde(default)]
+    pub custom: CustomProviderConfig,
 }
 
 impl Default for ProviderConfig {
@@ -801,6 +804,7 @@ impl Default for ProviderConfig {
             zhipuai: ZhipuAIConfig::default(),
             deepseek: DeepSeekConfig::default(),
             kimi: KimiConfig::default(),
+            custom: CustomProviderConfig::default(),
         }
     }
 }
@@ -832,6 +836,9 @@ impl ProviderConfig {
         if let Some(kimi) = partial.kimi {
             self.kimi.merge(kimi);
         }
+        if let Some(custom) = partial.custom {
+            self.custom.merge(custom);
+        }
     }
 
     pub fn active_model(&self) -> &str {
@@ -843,6 +850,7 @@ impl ProviderConfig {
             ProviderKind::ZhipuAI => &self.zhipuai.model,
             ProviderKind::DeepSeek => &self.deepseek.model,
             ProviderKind::Kimi => &self.kimi.model,
+            ProviderKind::Custom => &self.custom.model,
         }
     }
 
@@ -860,6 +868,7 @@ impl ProviderConfig {
             ProviderKind::ZhipuAI => self.zhipuai.model = model,
             ProviderKind::DeepSeek => self.deepseek.model = model,
             ProviderKind::Kimi => self.kimi.model = model,
+            ProviderKind::Custom => self.custom.model = model,
         }
     }
 
@@ -872,6 +881,7 @@ impl ProviderConfig {
             ProviderKind::ZhipuAI => &self.zhipuai.model,
             ProviderKind::DeepSeek => &self.deepseek.model,
             ProviderKind::Kimi => &self.kimi.model,
+            ProviderKind::Custom => &self.custom.model,
         }
     }
 
@@ -884,6 +894,7 @@ impl ProviderConfig {
             ProviderKind::ZhipuAI => &self.zhipuai.base_url,
             ProviderKind::DeepSeek => &self.deepseek.base_url,
             ProviderKind::Kimi => &self.kimi.base_url,
+            ProviderKind::Custom => &self.custom.base_url,
         }
     }
 
@@ -896,6 +907,7 @@ impl ProviderConfig {
             ProviderKind::ZhipuAI => &self.zhipuai.api_key_env,
             ProviderKind::DeepSeek => &self.deepseek.api_key_env,
             ProviderKind::Kimi => &self.kimi.api_key_env,
+            ProviderKind::Custom => &self.custom.api_key_env,
         }
     }
 
@@ -908,6 +920,7 @@ impl ProviderConfig {
             ProviderKind::ZhipuAI => self.zhipuai.resolve_api_key().is_some(),
             ProviderKind::DeepSeek => self.deepseek.resolve_api_key().is_some(),
             ProviderKind::Kimi => self.kimi.resolve_api_key().is_some(),
+            ProviderKind::Custom => self.custom.resolve_api_key().is_some(),
         }
     }
 
@@ -922,6 +935,30 @@ impl ProviderConfig {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+pub enum ProviderCompatibility {
+    OpenAi,
+    Anthropic,
+}
+
+impl ProviderCompatibility {
+    pub fn from_cli_name(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "openai" | "open-ai" => Some(Self::OpenAi),
+            "anthropic" | "claude" => Some(Self::Anthropic),
+            _ => None,
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::OpenAi => "OpenAI-compatible",
+            Self::Anthropic => "Anthropic-compatible",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
 pub enum ProviderKind {
     MiniMax,
     OpenRouter,
@@ -930,10 +967,11 @@ pub enum ProviderKind {
     ZhipuAI,
     DeepSeek,
     Kimi,
+    Custom,
 }
 
 impl ProviderKind {
-    pub const ALL: [ProviderKind; 7] = [
+    pub const ALL: [ProviderKind; 8] = [
         ProviderKind::MiniMax,
         ProviderKind::OpenAi,
         ProviderKind::Anthropic,
@@ -941,6 +979,7 @@ impl ProviderKind {
         ProviderKind::ZhipuAI,
         ProviderKind::DeepSeek,
         ProviderKind::Kimi,
+        ProviderKind::Custom,
     ];
 
     /// Parse user/CLI input (slash commands, TUI pickers).
@@ -953,6 +992,7 @@ impl ProviderKind {
             "zhipuai" | "zhipu" | "glm" | "glm-5" | "glm-5.2" => Some(Self::ZhipuAI),
             "deepseek" => Some(Self::DeepSeek),
             "kimi" | "k3" | "kimi-k3" => Some(Self::Kimi),
+            "custom" => Some(Self::Custom),
             _ => None,
         }
     }
@@ -965,6 +1005,7 @@ impl ProviderKind {
             "zhipuai" | "zhipu" | "glm" => Self::ZhipuAI,
             "deepseek" => Self::DeepSeek,
             "kimi" => Self::Kimi,
+            "custom" => Self::Custom,
             _ => Self::MiniMax,
         }
     }
@@ -978,6 +1019,7 @@ impl ProviderKind {
             ProviderKind::ZhipuAI => "ZhipuAI",
             ProviderKind::DeepSeek => "DeepSeek",
             ProviderKind::Kimi => "Kimi",
+            ProviderKind::Custom => "Custom",
         }
     }
 
@@ -1323,6 +1365,56 @@ impl KimiConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomProviderConfig {
+    pub api_key_env: String,
+    pub api_key: Option<String>,
+    pub base_url: String,
+    pub model: String,
+    pub temperature: f32,
+    pub compatibility: ProviderCompatibility,
+}
+
+impl Default for CustomProviderConfig {
+    fn default() -> Self {
+        Self {
+            api_key_env: "CUSTOM_PROVIDER_API_KEY".into(),
+            api_key: None,
+            base_url: String::new(),
+            model: "custom-model".into(),
+            temperature: 0.7,
+            compatibility: ProviderCompatibility::OpenAi,
+        }
+    }
+}
+
+impl CustomProviderConfig {
+    pub fn resolve_api_key(&self) -> Option<String> {
+        resolve_api_key_value(&self.api_key, &self.api_key_env)
+    }
+
+    fn merge(&mut self, partial: PartialCustomProviderConfig) {
+        if let Some(api_key_env) = partial.api_key_env {
+            self.api_key_env = api_key_env;
+        }
+        if let Some(api_key) = partial.api_key {
+            self.api_key = Some(api_key);
+        }
+        if let Some(base_url) = partial.base_url {
+            self.base_url = base_url;
+        }
+        if let Some(model) = partial.model {
+            self.model = model;
+        }
+        if let Some(temperature) = partial.temperature {
+            self.temperature = temperature;
+        }
+        if let Some(compatibility) = partial.compatibility {
+            self.compatibility = compatibility;
+        }
+    }
+}
+
 /// Common interface for OpenAI-compatible provider configs.
 /// Shared by OpenAiConfig, OpenRouterConfig, ZhipuAIConfig, DeepSeekConfig.
 pub trait OpenAiCompatConfig {
@@ -1650,6 +1742,36 @@ pub struct ContextConfig {
     /// Enable automatic context summarization.
     #[serde(default = "default_true")]
     pub enable_auto_summarize: bool,
+    /// Opt-in deterministic provider-request compaction.
+    /// `off` (default) sends canonical history unchanged.
+    /// `dry_run` computes savings diagnostics but still sends the full history.
+    /// `on` sends a compact cloned view while persisting canonical history.
+    #[serde(default)]
+    pub smart_compaction_mode: SmartCompactionMode,
+}
+
+/// Provider-request smart compaction mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SmartCompactionMode {
+    #[default]
+    Off,
+    DryRun,
+    On,
+}
+
+impl SmartCompactionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::DryRun => "dry_run",
+            Self::On => "on",
+        }
+    }
+
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
 }
 
 impl Default for ContextConfig {
@@ -1661,6 +1783,7 @@ impl Default for ContextConfig {
             max_retained_messages: default_max_retained_messages(),
             auto_summarize_threshold: default_summarize_threshold(),
             enable_auto_summarize: default_true(),
+            smart_compaction_mode: SmartCompactionMode::Off,
         }
     }
 }
@@ -1848,6 +1971,9 @@ impl ContextConfig {
         if let Some(query_provider_models_api) = partial.query_provider_models_api {
             self.query_provider_models_api = query_provider_models_api;
         }
+        if let Some(smart_compaction_mode) = partial.smart_compaction_mode {
+            self.smart_compaction_mode = smart_compaction_mode;
+        }
     }
 }
 
@@ -1941,6 +2067,7 @@ struct PartialProviderConfig {
     zhipuai: Option<PartialZhipuAIConfig>,
     deepseek: Option<PartialDeepSeekConfig>,
     kimi: Option<PartialKimiConfig>,
+    custom: Option<PartialCustomProviderConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -2009,6 +2136,16 @@ struct PartialKimiConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+struct PartialCustomProviderConfig {
+    api_key_env: Option<String>,
+    api_key: Option<String>,
+    base_url: Option<String>,
+    model: Option<String>,
+    temperature: Option<f32>,
+    compatibility: Option<ProviderCompatibility>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
 struct PartialModelConfig {
     max_tokens: Option<u32>,
     enable_thinking: Option<bool>,
@@ -2067,6 +2204,7 @@ struct PartialContextConfig {
     max_retained_messages: Option<usize>,
     auto_summarize_threshold: Option<u8>,
     enable_auto_summarize: Option<bool>,
+    smart_compaction_mode: Option<SmartCompactionMode>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

@@ -1915,7 +1915,11 @@ impl Repl {
                             .base_url_for(provider)
                             .to_string();
                         let result = nca_core::provider::validate::validate_api_key(
-                            provider, &api_key, &base_url,
+                            provider,
+                            &api_key,
+                            &base_url,
+                            (provider == nca_common::config::ProviderKind::Custom)
+                                .then_some(self.runtime.config().provider.custom.compatibility),
                         )
                         .await;
                         match &result {

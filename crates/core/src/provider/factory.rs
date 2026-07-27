@@ -96,6 +96,9 @@ pub fn build_provider_for(
             )?))
         }
         ProviderKind::Kimi => Ok(Box::new(KimiProvider::from_config(config)?)),
+        ProviderKind::Custom => Ok(Box::new(super::custom::CustomProvider::from_config(
+            config,
+        )?)),
     }
 }
 
@@ -129,6 +132,10 @@ mod tests {
                 }
                 ProviderKind::Kimi => {
                     config.provider.kimi.api_key = Some("kimi-key".into());
+                }
+                ProviderKind::Custom => {
+                    config.provider.custom.api_key = Some("custom-key".into());
+                    config.provider.custom.base_url = "http://localhost:9".into();
                 }
             }
 

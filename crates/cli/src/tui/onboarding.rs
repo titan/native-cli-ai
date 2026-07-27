@@ -145,10 +145,16 @@ async fn run_onboarding_inner(
 
                                 // Spawn background validation task
                                 let base_url = config.provider.base_url_for(provider).to_string();
+                                let compatibility = (provider
+                                    == nca_common::config::ProviderKind::Custom)
+                                    .then_some(config.provider.custom.compatibility);
                                 let vs = validation_state.clone();
                                 tokio::spawn(async move {
                                     let result = nca_core::provider::validate::validate_api_key(
-                                        provider, &key_str, &base_url,
+                                        provider,
+                                        &key_str,
+                                        &base_url,
+                                        compatibility,
                                     )
                                     .await;
                                     if let Ok(mut g) = vs.lock() {

@@ -135,6 +135,8 @@ pub async fn resolve_model_limits(config: &NcaConfig, model: &str) -> ModelLimit
         ProviderKind::ZhipuAI => None,
         ProviderKind::DeepSeek => None,
         ProviderKind::Kimi => None,
+        // ponytail: custom endpoints have no known models API contract; use static limits
+        ProviderKind::Custom => None,
     };
 
     match from_api {
@@ -470,6 +472,8 @@ pub async fn fetch_provider_model_ids(config: &NcaConfig) -> Vec<String> {
             "kimi-for-coding".into(),
             "kimi-for-coding-highspeed".into(),
         ],
+        // ponytail: unknown custom endpoint; expose only the configured model id
+        ProviderKind::Custom => vec![config.provider.custom.model.clone()],
     }
 }
 

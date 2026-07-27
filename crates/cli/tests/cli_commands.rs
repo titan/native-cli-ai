@@ -1,5 +1,6 @@
 use assert_cmd::Command;
 use chrono::{Duration, Utc};
+use nca_common::config::ProviderKind;
 use nca_common::message::Message;
 use nca_common::session::{SessionMeta, SessionState, SessionStatus};
 use serde_json::Value;
@@ -378,7 +379,7 @@ model = "openai/gpt-4o-mini"
     let provider_models = payload["provider_models"]
         .as_array()
         .expect("provider_models array");
-    assert_eq!(provider_models.len(), 7);
+    assert_eq!(provider_models.len(), ProviderKind::ALL.len());
     assert!(provider_models.iter().any(|entry| {
         entry["provider"] == "OpenAI" && entry["model"] == "gpt-4o" && entry["selected"] == true
     }));
@@ -418,7 +419,7 @@ model = "claude-3-7-sonnet-latest"
     assert_eq!(payload["provider"], "Anthropic");
     assert_eq!(payload["default_model"], "claude-3-7-sonnet-latest");
     let providers = payload["providers"].as_array().expect("providers array");
-    assert_eq!(providers.len(), 7);
+    assert_eq!(providers.len(), ProviderKind::ALL.len());
     assert!(providers.iter().any(|entry| {
         entry["provider"] == "Anthropic"
             && entry["selected"] == true

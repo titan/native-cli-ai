@@ -1,5 +1,6 @@
 pub mod anthropic;
 pub mod anthropic_compat;
+pub mod custom;
 pub mod deepseek;
 pub mod factory;
 pub mod kimi;
