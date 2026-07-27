@@ -37,6 +37,7 @@ use nca_core::tools::InvokeSkillTool;
 use nca_core::tools::ToolRegistry;
 use nca_core::tools::mcp::load_mcp_tools;
 use nca_core::tools::spawn_subagent::{SpawnRequest, SpawnSubagentTool};
+use nca_core::tools::{TodoStore, UpdateTodosTool};
 use nca_core::workspace_fs::{RealFs, WorkspaceFs};
 use serde_json::json;
 use std::collections::HashMap;
@@ -314,6 +315,9 @@ impl Supervisor {
             config.harness.skill_directories.clone(),
         )));
 
+        let todo_store: TodoStore = Arc::new(Mutex::new(Vec::new()));
+        tools.register(Box::new(UpdateTodosTool::new(event_tx.clone(), todo_store)));
+
         // Apply tool gating from the agent profile (if any).
         if let Some(ref profile) = agent_profile
             && let Some(ref allowed) = profile.allowed_tools
@@ -388,6 +392,7 @@ impl Supervisor {
             &fs.mounted_paths(),
         );
         agent.set_system_prompt(system_prompt);
+        agent.set_smart_compaction_mode(config.memory.context.smart_compaction_mode);
 
         let context_manager =
             Self::make_context_manager(&config, &config.model.default_model).await;
@@ -631,6 +636,10 @@ impl Supervisor {
                         "Auto-summarizing context before turn ({}% full, {} tokens)",
                         stats.usage_percent, stats.estimated_tokens
                     ),
+                    tokens_before: None,
+                    tokens_after: None,
+                    retained_groups: None,
+                    dropped_groups: None,
                 })
                 .await;
         }
@@ -665,6 +674,10 @@ impl Supervisor {
                             "Auto-summarizing context ({}% full, {} tokens)",
                             stats.usage_percent, stats.estimated_tokens
                         ),
+                        tokens_before: None,
+                        tokens_after: None,
+                        retained_groups: None,
+                        dropped_groups: None,
                     })
                     .await;
             }
@@ -732,6 +745,10 @@ impl Supervisor {
                                 messages_to_summarize.len() * 100, // rough estimate
                                 self.last_summary_at_tokens
                             ),
+                            tokens_before: None,
+                            tokens_after: None,
+                            retained_groups: None,
+                            dropped_groups: None,
                         })
                         .await;
                 }
