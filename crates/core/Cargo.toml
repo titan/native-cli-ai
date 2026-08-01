@@ -20,7 +20,6 @@ async-trait = "0.1"
 base64 = "0.22"
 scraper = "0.23"
 futures-util = "0.3"
-serde_yaml = "0.9.34"
 rmcp = { version = "1.7", default-features = false, features = ["client", "transport-async-rw"] }
 regex = "1"
 chrono = { version = "0.4", features = ["serde", "clock"] }

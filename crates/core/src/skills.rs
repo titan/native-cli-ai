@@ -1,5 +1,4 @@
 use nca_common::config::{PermissionMode, ProviderKind};
-use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -252,13 +251,209 @@ fn split_frontmatter(raw: &str) -> Result<(SkillFrontmatter, String), String> {
     if let Some(rest) = raw.strip_prefix("---\n")
         && let Some(end) = rest.find("\n---\n")
     {
-        let yaml = &rest[..end];
+        let frontmatter = &rest[..end];
         let body = &rest[end + 5..];
-        let fm = serde_yaml::from_str::<SkillFrontmatter>(yaml)
-            .map_err(|err| format!("failed to parse skill frontmatter: {err}"))?;
-        return Ok((fm, body.to_string()));
+        return Ok((parse_frontmatter(frontmatter), body.to_string()));
     }
     Ok((SkillFrontmatter::default(), raw.to_string()))
+}
+
+/// Parse frontmatter into a `SkillFrontmatter` using a lenient single-line parser.
+///
+/// Unlike a full YAML parser, single-line values extend to end-of-line, so a
+/// plain `:` inside a `description` (e.g. `macOS): light grey`) is treated as
+/// text rather than a mapping separator. Block scalars (`|`, `>`) and quoted
+/// strings are still supported so existing multi-line skills keep working.
+fn parse_frontmatter(frontmatter: &str) -> SkillFrontmatter {
+    let mut fm = SkillFrontmatter::default();
+    for (key, value) in parse_kv_pairs(frontmatter) {
+        match key.as_str() {
+            "name" => fm.name = Some(value),
+            "description" => fm.description = Some(value),
+            "command" => fm.command = Some(value),
+            "model" => fm.model = Some(value),
+            "provider" => fm.provider = ProviderKind::from_cli_name(&value),
+            "permission_mode" => fm.permission_mode = value.parse::<PermissionMode>().ok(),
+            "context" => {
+                fm.context = if value.trim().eq_ignore_ascii_case("fork") {
+                    Some(SkillContextMode::Fork)
+                } else {
+                    Some(SkillContextMode::Inline)
+                };
+            }
+            "agent" => fm.agent = Some(value.trim().eq_ignore_ascii_case("true")),
+            // Unknown keys (triggers, scope, role, license, ...) are ignored.
+            _ => {}
+        }
+    }
+    fm
+}
+
+/// Parse `key: value` lines, returning `(key, value)` pairs.
+///
+/// Handles single-line values (to EOL), quoted strings, and block scalars
+/// (`|`, `>`, `|-`, `>-`, `|+`, `>+`).
+fn parse_kv_pairs(raw: &str) -> Vec<(String, String)> {
+    let lines: Vec<&str> = raw.lines().collect();
+    let mut pairs = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            i += 1;
+            continue;
+        }
+        let Some(colon) = find_kv_colon(line) else {
+            i += 1;
+            continue;
+        };
+        let key = line[..colon].trim().to_string();
+        if key.is_empty() || key.chars().any(char::is_whitespace) {
+            // Not a simple scalar key (nested structure); skip.
+            i += 1;
+            continue;
+        }
+        let rest = line[colon + 1..].trim();
+
+        if let Some(block) = parse_block_indicator(rest) {
+            let (content, next_i) = collect_indented_block(&lines, i + 1);
+            let value = if block.folded {
+                fold_lines(&content)
+            } else {
+                content.join("\n")
+            };
+            pairs.push((key, value.trim().to_string()));
+            i = next_i;
+        } else {
+            pairs.push((key, unquote(rest).to_string()));
+            i += 1;
+        }
+    }
+    pairs
+}
+
+/// Find the byte position of the first YAML key-value separator colon in a line.
+///
+/// A separator is `:` followed by whitespace or end-of-line, and must be
+/// outside quotes. This means `description: see macOS): light` splits at the
+/// first `: ` (after `description`), not the one inside the value.
+fn find_kv_colon(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b':' if !in_single && !in_double => {
+                let after = bytes.get(i + 1).copied();
+                if after.is_none() || after == Some(b' ') || after == Some(b'\t') {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+struct BlockScalar {
+    folded: bool,
+}
+
+/// If `rest` is a YAML block scalar indicator (`|`, `>`, with optional
+/// chomping/indent markers), classify it.
+fn parse_block_indicator(rest: &str) -> Option<BlockScalar> {
+    let rest = rest.trim();
+    let folded = match rest.chars().next() {
+        Some('|') => false,
+        Some('>') => true,
+        _ => return None,
+    };
+    // The remainder may only contain chomping (`+`/`-`) or indent (digits).
+    let tail = &rest[1..];
+    if tail
+        .chars()
+        .all(|c| c == '+' || c == '-' || c.is_ascii_digit())
+    {
+        Some(BlockScalar { folded })
+    } else {
+        None
+    }
+}
+
+/// Collect indented continuation lines following a block scalar indicator.
+///
+/// The first non-empty line establishes the base indent; lines at or deeper
+/// than it belong to the block, shallower non-empty lines end it. Returns the
+/// dedented block lines and the index of the next unprocessed line.
+fn collect_indented_block(lines: &[&str], start: usize) -> (Vec<String>, usize) {
+    let mut block = Vec::new();
+    let mut base_indent: Option<usize> = None;
+    let mut i = start;
+    while i < lines.len() {
+        let line = lines[i];
+        if line.trim().is_empty() {
+            block.push(String::new());
+            i += 1;
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        match base_indent {
+            Some(base) if indent < base => break,
+            Some(base) => block.push(line.get(base..).unwrap_or(line.trim_start()).to_string()),
+            None => {
+                base_indent = Some(indent);
+                block.push(line.trim_start().to_string());
+            }
+        }
+        i += 1;
+    }
+    // Drop trailing blank lines so joins/folds stay clean.
+    while block.last().is_some_and(String::is_empty) {
+        block.pop();
+    }
+    (block, i)
+}
+
+/// Fold block lines (YAML `>` semantics): non-empty lines join with spaces,
+/// blank lines become paragraph breaks.
+fn fold_lines(lines: &[String]) -> String {
+    let mut result = String::new();
+    let mut prev_blank = false;
+    for line in lines {
+        if line.is_empty() {
+            if !result.is_empty() {
+                result.push('\n');
+            }
+            prev_blank = true;
+        } else {
+            if !result.is_empty() && !prev_blank {
+                result.push(' ');
+            }
+            result.push_str(line);
+            prev_blank = false;
+        }
+    }
+    result
+}
+
+/// Strip surrounding quotes from a YAML scalar value.
+/// Handles single-quoted (`'...'`) and double-quoted (`"..."`) forms.
+fn unquote(value: &str) -> &str {
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2 {
+        let (first, last) = (bytes[0], bytes[bytes.len() - 1]);
+        if first == b'\'' && last == b'\'' {
+            return &value[1..value.len() - 1];
+        }
+        if first == b'"' && last == b'"' {
+            return &value[1..value.len() - 1];
+        }
+    }
+    value
 }
 
 fn slugify(value: &str) -> String {
@@ -276,7 +471,7 @@ fn slugify(value: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default)]
 struct SkillFrontmatter {
     name: Option<String>,
     description: Option<String>,
@@ -286,21 +481,7 @@ struct SkillFrontmatter {
     permission_mode: Option<PermissionMode>,
     context: Option<SkillContextMode>,
     /// If `true`, auto-register this skill as a named agent profile.
-    #[serde(default)]
     agent: Option<bool>,
-}
-
-impl<'de> Deserialize<'de> for SkillContextMode {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        match value.trim().to_ascii_lowercase().as_str() {
-            "fork" => Ok(Self::Fork),
-            _ => Ok(Self::Inline),
-        }
-    }
 }
 
 /// Parse AGENTS.md as a skill manifest.
@@ -622,6 +803,69 @@ mod tests {
         assert_eq!(skill.context, SkillContextMode::Fork);
         assert_eq!(skill.permission_mode, Some(PermissionMode::Plan));
         assert!(skill.body.contains("Inspect diffs"));
+    }
+
+    // === lenient frontmatter parser tests ===
+
+    #[test]
+    fn parses_description_with_colon_space() {
+        // Regression: a plain `: ` inside a single-line description (e.g. the
+        // apple-liquid-glass skill: "...macOS): light grey ground...") must NOT
+        // be treated as a YAML mapping separator.
+        let raw = "---\nname: apple-liquid-glass\ndescription: Build Apple-grade web UI (see macOS): light grey ground\n---\nBody.\n";
+        let (fm, body) = split_frontmatter(raw).unwrap();
+        assert_eq!(fm.name.as_deref(), Some("apple-liquid-glass"));
+        assert_eq!(
+            fm.description.as_deref(),
+            Some("Build Apple-grade web UI (see macOS): light grey ground")
+        );
+        assert!(body.contains("Body."));
+    }
+
+    #[test]
+    fn parses_literal_block_description() {
+        let raw = "---\nname: multi\ndescription: |\n  First line.\n  Second line.\n---\nBody.\n";
+        let (fm, _) = split_frontmatter(raw).unwrap();
+        assert_eq!(fm.description.as_deref(), Some("First line.\nSecond line."));
+    }
+
+    #[test]
+    fn parses_folded_block_description() {
+        let raw = "---\nname: multi\ndescription: >\n  First line.\n  Second line.\n---\nBody.\n";
+        let (fm, _) = split_frontmatter(raw).unwrap();
+        assert_eq!(fm.description.as_deref(), Some("First line. Second line."));
+    }
+
+    #[test]
+    fn parses_folded_strip_block_description() {
+        let raw = "---\nname: multi\ndescription: >-\n  Folded text here.\n---\nBody.\n";
+        let (fm, _) = split_frontmatter(raw).unwrap();
+        assert_eq!(fm.description.as_deref(), Some("Folded text here."));
+    }
+
+    #[test]
+    fn parses_single_quoted_description() {
+        let raw = "---\nname: git\ndescription: 'Execute commit: stage and message'\n---\nBody.\n";
+        let (fm, _) = split_frontmatter(raw).unwrap();
+        assert_eq!(
+            fm.description.as_deref(),
+            Some("Execute commit: stage and message")
+        );
+    }
+
+    #[test]
+    fn parses_double_quoted_description() {
+        let raw = "---\nname: impl\ndescription: \"Implement based on a spec\"\n---\nBody.\n";
+        let (fm, _) = split_frontmatter(raw).unwrap();
+        assert_eq!(fm.description.as_deref(), Some("Implement based on a spec"));
+    }
+
+    #[test]
+    fn ignores_unknown_frontmatter_keys() {
+        let raw = "---\nname: test\nlicense: MIT\nversion: 2\n---\nBody.\n";
+        let (fm, body) = split_frontmatter(raw).unwrap();
+        assert_eq!(fm.name.as_deref(), Some("test"));
+        assert!(body.contains("Body."));
     }
 
     #[test]
