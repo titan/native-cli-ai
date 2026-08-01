@@ -152,6 +152,7 @@ impl Repl {
                     self.runtime.config().clone(),
                     self.runtime.messages().to_vec(),
                     event_tx,
+                    self.runtime.fs(),
                 ))
             } else {
                 None
@@ -1603,6 +1604,7 @@ impl Repl {
                     self.runtime.config().clone(),
                     self.runtime.messages().to_vec(),
                     event_tx,
+                    self.runtime.fs(),
                 ))
             } else {
                 None

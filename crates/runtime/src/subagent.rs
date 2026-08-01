@@ -6,6 +6,7 @@ use nca_common::event::{AgentEvent, EndReason};
 use nca_core::approval::ApprovalHandler;
 use nca_core::hooks::{HookEventKind, HookRunner};
 use nca_core::tools::spawn_subagent::SpawnRequest;
+use nca_core::workspace_fs::WorkspaceFs;
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -284,6 +285,7 @@ pub fn spawn_subagent_consumer(
     config: NcaConfig,
     parent_messages: Vec<nca_common::message::Message>,
     event_tx: Option<tokio::sync::mpsc::Sender<AgentEvent>>,
+    parent_fs: Arc<dyn WorkspaceFs>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let parent_sessions_dir = workspace_root.join(&config.session.history_dir);
@@ -292,7 +294,15 @@ pub fn spawn_subagent_consumer(
         while let Some(req) = spawn_rx.recv().await {
             let parent_session_id = parent_session_id.clone();
             let workspace_root = workspace_root.clone();
-            let config = config.clone();
+            // Sync runtime mounts from the parent's live FS state so that
+            // paths added via `/mount` during the session are inherited by
+            // child sessions. The `config` snapshot captured at consumer
+            // creation does not reflect runtime mounts.
+            let mut config = config.clone();
+            let live_mounts = parent_fs.mounted_paths();
+            if config.extra_paths != live_mounts {
+                config.extra_paths = live_mounts;
+            }
             let event_tx = event_tx.clone();
             let parent_store = SessionStore::new(parent_sessions_dir.clone());
             let parent_summary = parent_summary.clone();

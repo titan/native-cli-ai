@@ -1115,6 +1115,13 @@ impl Supervisor {
         self.fs.mounted_paths()
     }
 
+    /// Return the live filesystem adapter. Used by callers (e.g.
+    /// `spawn_subagent_consumer`) to query the current set of mounted paths
+    /// at runtime, so that paths added via `/mount` propagate to child sessions.
+    pub fn fs(&self) -> Arc<dyn WorkspaceFs> {
+        self.fs.clone()
+    }
+
     /// Collect slash commands contributed by plugins (for CLI slash panel).
     pub fn plugin_commands(&self) -> Vec<(String, Vec<String>)> {
         self.plugins.collect_commands()

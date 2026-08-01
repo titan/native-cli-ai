@@ -164,6 +164,7 @@ async fn run_service_session_with_startup(
             request.config.clone(),
             supervisor.agent().messages.clone(),
             supervisor.event_tx(),
+            supervisor.fs(),
         ))
     } else {
         None

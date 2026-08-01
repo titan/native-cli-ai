@@ -901,6 +901,7 @@ async fn run_one_shot(
                 config.clone(),
                 runtime.messages().to_vec(),
                 None,
+                runtime.fs(),
             )
         });
 

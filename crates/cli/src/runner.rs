@@ -339,6 +339,11 @@ impl SessionRuntime {
         self.supervisor.mounted_paths()
     }
 
+    /// Return the live filesystem adapter (for propagating runtime mounts to subagents).
+    pub fn fs(&self) -> Arc<dyn nca_core::workspace_fs::WorkspaceFs> {
+        self.supervisor.fs()
+    }
+
     /// Slash commands contributed by plugins (for CLI slash panel and REPL hinter).
     pub fn plugin_commands(&self) -> Vec<(String, Vec<String>)> {
         self.supervisor.plugin_commands()
