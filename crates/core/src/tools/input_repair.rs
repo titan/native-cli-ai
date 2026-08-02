@@ -42,15 +42,30 @@ pub fn repair_json_string(raw: &str) -> Option<Value> {
     }
     // Attempt 2: trim whitespace
     let trimmed = raw.trim();
+    // Empty or whitespace-only arguments → empty object so the tool can
+    // report missing fields clearly instead of a cryptic _error.
+    if trimmed.is_empty() {
+        return Some(Value::Object(serde_json::Map::new()));
+    }
     if let Ok(v) = serde_json::from_str(trimmed) {
         return Some(v);
     }
-    // Attempt 3: strip trailing commas before } or ]
-    let no_trailing = strip_trailing_commas(trimmed);
+    // Attempt 3: escape unescaped control characters inside JSON string
+    // values.  DeepSeek and similar models frequently emit raw newlines,
+    // tabs, and carriage returns inside string values (especially in
+    // write_file content), which is invalid JSON per RFC 8259.  This is
+    // the single most common cause of the "Received keys: [_error]"
+    // failure for write_file.
+    let escaped = escape_control_chars_in_strings(trimmed);
+    if let Ok(v) = serde_json::from_str(&escaped) {
+        return Some(v);
+    }
+    // Attempt 4: strip trailing commas before } or ]
+    let no_trailing = strip_trailing_commas(&escaped);
     if let Ok(v) = serde_json::from_str(&no_trailing) {
         return Some(v);
     }
-    // Attempt 4: the stream may have truncated — find the last balanced
+    // Attempt 5: the stream may have truncated — find the last balanced
     // brace/bracket and try parsing up to that point.
     if no_trailing.len() <= 64 * 1024
         && let Some(idx) = find_last_balanced_brace(&no_trailing)
@@ -89,6 +104,72 @@ fn strip_trailing_commas(s: &str) -> String {
             }
         }
     }
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Repair: Escape unescaped control characters inside JSON string values
+// ---------------------------------------------------------------------------
+
+/// Escape raw control characters (U+0000–U+001F) that appear inside JSON
+/// string values.
+///
+/// Per RFC 8259 §7, control characters must be escaped inside strings.
+/// However, DeepSeek and similar models frequently emit them raw —
+/// especially literal newlines and tabs inside `write_file` content.  This
+/// is the single most common cause of "Received keys: [_error]" failures.
+///
+/// The function walks the input with a mini state machine that tracks
+/// whether the current position is inside a JSON string value.  Inside a
+/// string, raw control characters are replaced with their escaped
+/// equivalents.  Already-escaped sequences (e.g. `\n`, `\"`, `\\`) are
+/// left untouched.  Characters outside string values (between tokens) are
+/// also left untouched, since raw whitespace there is valid JSON.
+fn escape_control_chars_in_strings(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut in_string = false;
+    let mut prev_backslash = false;
+
+    for ch in s.chars() {
+        if !in_string {
+            if ch == '"' {
+                in_string = true;
+            }
+            result.push(ch);
+            continue;
+        }
+
+        // Inside a JSON string value.
+        if prev_backslash {
+            // This character follows a backslash — it is part of an escape
+            // sequence (valid like \n, or invalid like \x).  Output as-is
+            // so we don't corrupt already-escaped sequences.
+            result.push(ch);
+            prev_backslash = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => {
+                result.push(ch);
+                prev_backslash = true;
+            }
+            '"' => {
+                result.push(ch);
+                in_string = false;
+            }
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            '\t' => result.push_str("\\t"),
+            '\u{08}' => result.push_str("\\b"),
+            '\u{0c}' => result.push_str("\\f"),
+            c if c.is_control() => {
+                result.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            _ => result.push(ch),
+        }
+    }
+
     result
 }
 
@@ -516,5 +597,122 @@ mod tests {
     fn repair_json_string_unparseable_returns_none() {
         let raw = "this is not json at all";
         assert_eq!(repair_json_string(raw), None);
+    }
+
+    // ---- Control-character escaping tests (write_file _error root cause) ----
+
+    #[test]
+    fn repair_raw_newline_in_string_value() {
+        // DeepSeek streams write_file content with literal newlines inside
+        // the JSON string value — invalid JSON per RFC 8259.
+        let raw = "{\"path\":\"main.rs\",\"content\":\"fn main() {\n    println!();\n}\"}";
+        let result = repair_json_string(raw);
+        assert_eq!(
+            result,
+            Some(json!({
+                "path": "main.rs",
+                "content": "fn main() {\n    println!();\n}"
+            }))
+        );
+    }
+
+    #[test]
+    fn repair_raw_tab_in_string_value() {
+        let raw = "{\"path\":\"main.rs\",\"content\":\"hello\tworld\"}";
+        let result = repair_json_string(raw);
+        assert_eq!(
+            result,
+            Some(json!({"path": "main.rs", "content": "hello\tworld"}))
+        );
+    }
+
+    #[test]
+    fn repair_raw_carriage_return_in_string() {
+        let raw = "{\"path\":\"f.txt\",\"content\":\"line1\r\nline2\"}";
+        let result = repair_json_string(raw);
+        assert_eq!(
+            result,
+            Some(json!({"path": "f.txt", "content": "line1\r\nline2"}))
+        );
+    }
+
+    #[test]
+    fn already_escaped_newline_not_double_escaped() {
+        // Properly escaped \n (two chars: backslash + n) must be untouched.
+        let raw = r#"{"path":"f.txt","content":"line1\nline2"}"#;
+        let result = repair_json_string(raw);
+        assert_eq!(
+            result,
+            Some(json!({"path": "f.txt", "content": "line1\nline2"}))
+        );
+    }
+
+    #[test]
+    fn escaped_quote_preserved_with_control_chars() {
+        // Escaped quote \" inside a string that also has raw control chars.
+        let raw = "{\"path\":\"f.txt\",\"content\":\"say \\\"hi\\\"\nbye\"}";
+        let result = repair_json_string(raw);
+        assert_eq!(
+            result,
+            Some(json!({"path": "f.txt", "content": "say \"hi\"\nbye"}))
+        );
+    }
+
+    #[test]
+    fn escaped_backslash_preserved_with_control_chars() {
+        // Escaped backslash \\ followed by a raw newline.
+        let raw = "{\"path\":\"f.txt\",\"content\":\"a\\\\\nb\"}";
+        let result = repair_json_string(raw);
+        assert_eq!(result, Some(json!({"path": "f.txt", "content": "a\\\nb"})));
+    }
+
+    #[test]
+    fn repair_write_file_multiline_content() {
+        // Realistic DeepSeek write_file call with raw newlines in content.
+        let content = "use std::io;\n\nfn main() {\n    println!(\"hello\");\n}\n";
+        let raw = format!(
+            "{{\"path\":\"src/main.rs\",\"content\":\"{}\"}}",
+            content.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+        // The raw string now has escaped backslashes and quotes but raw newlines.
+        let result = repair_json_string(&raw);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap()["content"], json!(content));
+    }
+
+    #[test]
+    fn repair_control_chars_with_trailing_comma() {
+        // Raw newline in content AND trailing comma — both repairs needed.
+        let raw = "{\"path\":\"f.txt\",\"content\":\"hello\nworld\",}";
+        let result = repair_json_string(raw);
+        assert_eq!(
+            result,
+            Some(json!({"path": "f.txt", "content": "hello\nworld"}))
+        );
+    }
+
+    #[test]
+    fn repair_empty_arguments_returns_empty_object() {
+        assert_eq!(repair_json_string(""), Some(json!({})));
+        assert_eq!(repair_json_string("   "), Some(json!({})));
+        assert_eq!(repair_json_string("\n\n"), Some(json!({})));
+    }
+
+    #[test]
+    fn control_chars_outside_strings_untouched() {
+        // Raw newlines between JSON tokens are valid and must be preserved.
+        let raw = "{\n  \"path\": \"f.txt\",\n  \"content\": \"ok\"\n}";
+        let result = repair_json_string(raw);
+        assert_eq!(result, Some(json!({"path": "f.txt", "content": "ok"})));
+    }
+
+    #[test]
+    fn nul_byte_in_string_escaped() {
+        let raw = "{\"path\":\"f.txt\",\"content\":\"a\u{0000}b\"}";
+        let result = repair_json_string(raw);
+        assert_eq!(
+            result,
+            Some(json!({"path": "f.txt", "content": "a\u{0000}b"}))
+        );
     }
 }

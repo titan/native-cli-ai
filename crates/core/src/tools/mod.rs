@@ -241,7 +241,23 @@ impl ToolCallExt for ToolCall {
 ///
 /// Instead of a raw serde error (which models can't recover from), this
 /// surfaces the tool name and the parameter keys that were received.
+///
+/// When the input carries an `_error` key (set by the streaming layer when
+/// the raw arguments could not be parsed as JSON at all), the error value
+/// is surfaced directly so the model can see what went wrong and correct
+/// it on retry.
 fn format_tool_param_error(tool_name: &str, input: &serde_json::Value) -> String {
+    // Special case: the streaming layer could not parse the arguments as
+    // JSON at all and left an _error sentinel.  Surface the parse failure
+    // so the model can self-correct instead of seeing a useless key list.
+    if let Some(err_msg) = input
+        .as_object()
+        .and_then(|m| m.get("_error"))
+        .and_then(|v| v.as_str())
+    {
+        return format!("Invalid parameters for tool `{}`. {err_msg}", tool_name);
+    }
+
     let received_keys = match input.as_object() {
         Some(map) => map.keys().cloned().collect::<Vec<_>>().join(", "),
         None => format!("raw value: {}", input),
@@ -314,5 +330,27 @@ mod tests {
         reg.restrict_to(&["nonexistent".into()]);
 
         assert!(reg.definitions().is_empty());
+    }
+
+    #[test]
+    fn format_error_surfaces_error_sentinel_value() {
+        // When the streaming layer can't parse arguments, it sends an _error
+        // sentinel.  The error message should surface the parse failure so
+        // the model can self-correct, not just show "Received keys: [_error]".
+        let input = serde_json::json!({
+            "_error": "Failed to parse tool arguments as JSON. Raw input: {bad"
+        });
+        let msg = format_tool_param_error("write_file", &input);
+        assert!(msg.contains("Failed to parse tool arguments as JSON"));
+        assert!(!msg.contains("Received keys"));
+    }
+
+    #[test]
+    fn format_error_shows_keys_for_normal_malformed_input() {
+        let input = serde_json::json!({"foo": 1, "bar": 2});
+        let msg = format_tool_param_error("write_file", &input);
+        assert!(msg.contains("foo"));
+        assert!(msg.contains("bar"));
+        assert!(msg.contains("Received keys"));
     }
 }

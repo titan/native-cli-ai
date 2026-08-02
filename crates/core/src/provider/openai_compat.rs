@@ -319,7 +319,7 @@ async fn flush_openai_tool_calls(
                 tool = %call.name,
                 call_id = %call.id,
                 index,
-                arguments_preview = %truncate_bytes_safe(&call.arguments, 200),
+                arguments_preview = %truncate_bytes_safe(&call.arguments, 500),
                 "tool_input_unparseable"
             );
             let _ = tx
