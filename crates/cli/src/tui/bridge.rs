@@ -52,14 +52,19 @@ pub fn spawn_tui_bridge(
                 let _ = fan.tx.send(line);
             }
 
+            // Forward to TUI FIRST, before disk I/O. Disk writes are the
+            // per-event bottleneck (JSON serialize + async write); doing them
+            // before the TUI forward delays every subsequent event in the
+            // bounded(256) channel, which can cause the UI to lag behind the
+            // agent by hundreds of milliseconds during high-frequency streaming.
+            let _ = feedback_tx.send(TuiFeedbackMsg::Agent(event));
+
             if let Some(file) = log_file.as_mut()
                 && let Ok(line) = serde_json::to_string(&envelope)
             {
                 let _ = file.write_all(line.as_bytes()).await;
                 let _ = file.write_all(b"\n").await;
             }
-
-            let _ = feedback_tx.send(TuiFeedbackMsg::Agent(event));
         }
     })
 }

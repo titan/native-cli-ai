@@ -12,7 +12,7 @@ use crate::tui::{
     git_list_branches, git_switch_branch, replay_events_to_feedback, spawn_tui_bridge,
 };
 use nca_common::config::{PermissionMode, ProviderKind};
-use nca_common::event::{BusyState, EndReason, QuestionSelection};
+use nca_common::event::{EndReason, QuestionSelection};
 use nca_core::skills::SkillCatalog;
 use nca_runtime::memory_store::MemoryStore;
 use reedline::{
@@ -2023,8 +2023,15 @@ impl Repl {
                             );
                             tui_feedback.push_error(e.to_string());
                         }
-                        tui_feedback.set_busy(false);
-                        tui_feedback.set_busy_state(BusyState::Idle);
+                        // NOTE: Do NOT send set_busy(false)/set_busy_state(Idle)
+                        // here. The agent already emits BusyStateChanged(Idle) at
+                        // the end of run_turn(). Sending a direct idle signal here
+                        // races with the bridge's delayed forwarding of earlier
+                        // agent events (e.g. BusyStateChanged(Thinking) from a
+                        // turn iteration). The direct idle arrives first, then
+                        // the delayed Thinking event flips the state back, causing
+                        // the status bar to get stuck on "thinking" until the next
+                        // input event forces a redraw.
                     }
                 },
                 Msg::Quit => {
