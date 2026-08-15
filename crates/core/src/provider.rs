@@ -14,6 +14,7 @@ pub mod test_support;
 pub mod validate;
 pub mod zhipuai;
 
+use crate::cache_keepalive::{KeepaliveSnapshot, PingUsage};
 use std::path::Path;
 
 use async_trait::async_trait;
@@ -82,6 +83,20 @@ pub trait Provider: Send + Sync {
         model: &str,
         workspace_root: &Path,
     ) -> Result<tokio::sync::mpsc::Receiver<StreamChunk>, ProviderError>;
+    /// Send the snapshot prefix with `max_tokens=1` to refresh the provider's
+    /// prompt cache during a tool-execution pause. Returns observed usage for
+    /// cost tracking.
+    ///
+    /// The default implementation returns an error — providers that support
+    /// keepalive override this with a direct HTTP request at minimal cost.
+    async fn keepalive_ping(
+        &self,
+        _snapshot: &KeepaliveSnapshot,
+    ) -> Result<PingUsage, ProviderError> {
+        Err(ProviderError::Other(
+            "keepalive_ping not implemented for this provider".into(),
+        ))
+    }
 }
 
 #[derive(Debug, Clone, thiserror::Error)]

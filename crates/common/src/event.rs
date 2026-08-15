@@ -192,6 +192,35 @@ pub enum AgentEvent {
     BusyStateChanged {
         state: BusyState,
     },
+    /// Prompt-cache keepalive started during a tool-execution pause.
+    CacheKeepaliveStarted {
+        #[serde(default)]
+        interval_secs: u64,
+        #[serde(default)]
+        benefit: String,
+    },
+    /// A keepalive ping fired and refreshed the cache.
+    CacheKeepalivePing {
+        #[serde(default)]
+        pings: u32,
+        #[serde(default)]
+        cache_read_tokens: u64,
+        #[serde(default)]
+        cache_creation_tokens: u64,
+        #[serde(default)]
+        elapsed_secs: u64,
+    },
+    /// Keepalive task stopped (pause ended, break-even exceeded, or disabled).
+    CacheKeepaliveStopped {
+        #[serde(default)]
+        reason: String,
+        #[serde(default)]
+        pings: u32,
+        #[serde(default)]
+        total_cache_read_tokens: u64,
+        #[serde(default)]
+        total_cache_creation_tokens: u64,
+    },
     /// A full turn completed — emitted once at the end of `run_turn` with the
     /// total wall-clock duration (user input → final reply) in milliseconds.
     TurnCompleted {

@@ -16,6 +16,22 @@ use super::{ProviderError, StreamChunk};
 /// 总耗时常超过 120s）；仅在连接静默超过该阈值时才报错。
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// Build the Anthropic Messages API request body with prompt-cache breakpoints.
+///
+/// Anthropic's prompt caching requires explicit `cache_control` markers to opt
+/// the prefix into caching. We place two breakpoints (out of the 4 max):
+///
+/// 1. **System prompt** — the largest stable block. Wrapping it in a structured
+///    text block with `cache_control: { type: "ephemeral" }` makes it
+///    cache-eligible. The TTL is 5 minutes (refreshed on each hit).
+///
+/// 2. **Last tool definition** — the second largest stable block. A breakpoint
+///    here caches `system + tools` as a single prefix unit, which is reused on
+///    every subsequent turn (tools rarely change mid-session).
+///
+/// Conversation history grows after the tools, so those breakpoints cover the
+/// entire stable prefix. Without these markers Anthropic will **never** cache,
+/// even if the prefix is byte-identical — keepalive or not.
 pub fn anthropic_request_body(
     messages: &[Message],
     tools: &[ToolDefinition],
@@ -25,21 +41,36 @@ pub fn anthropic_request_body(
     workspace_root: &Path,
 ) -> Result<Value, ProviderError> {
     let (system, anthropic_messages) = to_anthropic_messages(messages, workspace_root)?;
+
+    // System prompt as a structured text block with cache_control so the
+    // prefix is eligible for Anthropic prompt caching.
+    let system = system.map(|s| {
+        json!([{
+            "type": "text",
+            "text": s,
+            "cache_control": { "type": "ephemeral" }
+        }])
+    });
+
     let tools = if tools.is_empty() {
         None
     } else {
-        Some(
-            tools
-                .iter()
-                .map(|tool| {
-                    json!({
-                        "name": tool.name,
-                        "description": tool.description,
-                        "input_schema": tool.parameters,
-                    })
+        let mut tool_list: Vec<Value> = tools
+            .iter()
+            .map(|tool| {
+                json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": tool.parameters,
                 })
-                .collect::<Vec<_>>(),
-        )
+            })
+            .collect();
+        // Cache breakpoint on the last tool: caches system + all tools as a
+        // single prefix unit reused on every subsequent turn.
+        if let Some(last) = tool_list.last_mut() {
+            last["cache_control"] = json!({ "type": "ephemeral" });
+        }
+        Some(Value::Array(tool_list))
     };
 
     Ok(json!({
@@ -67,6 +98,8 @@ pub fn spawn_anthropic_stream(
         let mut tool_name = String::new();
         let mut tool_input = String::new();
         let mut input_tokens: u64 = 0;
+        let mut cache_creation_tokens: u64 = 0;
+        let mut cache_read_tokens: u64 = 0;
 
         loop {
             // 用单次读取的空闲超时替代 reqwest 全局总超时：只要持续有 token 流出，
@@ -165,9 +198,12 @@ pub fn spawn_anthropic_stream(
 
                 match event_type.as_str() {
                     "message_start" => {
-                        input_tokens = event["message"]["usage"]["input_tokens"]
-                            .as_u64()
-                            .unwrap_or(0);
+                        let usage = &event["message"]["usage"];
+                        input_tokens = usage["input_tokens"].as_u64().unwrap_or(0);
+                        // Anthropic reports cache tokens in message_start usage.
+                        cache_creation_tokens =
+                            usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                        cache_read_tokens = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
                     }
                     "content_block_start" => {
                         let block = &event["content_block"];
@@ -221,11 +257,13 @@ pub fn spawn_anthropic_stream(
                                 .send(StreamChunk::Usage {
                                     input_tokens,
                                     output_tokens,
-                                    cache_creation_tokens: 0,
-                                    cache_read_tokens: 0,
+                                    cache_creation_tokens,
+                                    cache_read_tokens,
                                 })
                                 .await;
                             input_tokens = 0;
+                            cache_creation_tokens = 0;
+                            cache_read_tokens = 0;
                         }
                     }
                     _ => {}

@@ -8,6 +8,7 @@ use reqwest::header::{HeaderMap, HeaderValue};
 
 use super::anthropic_compat::{anthropic_request_body, map_provider_error, spawn_anthropic_stream};
 use super::{Provider, ProviderError, StreamChunk};
+use crate::cache_keepalive::{KeepaliveSnapshot, PingUsage};
 
 pub struct AnthropicProvider {
     client: reqwest::Client,
@@ -109,6 +110,61 @@ impl Provider for AnthropicProvider {
         }
 
         Ok(spawn_anthropic_stream(response, "anthropic"))
+    }
+
+    async fn keepalive_ping(
+        &self,
+        snapshot: &KeepaliveSnapshot,
+    ) -> Result<PingUsage, ProviderError> {
+        let body = anthropic_request_body(
+            &snapshot.messages,
+            &snapshot.tools,
+            &snapshot.model,
+            1, // max_tokens = 1
+            self.config.temperature,
+            &snapshot.workspace_root,
+        )?;
+
+        let response = self
+            .client
+            .post(self.endpoint())
+            .json(&body)
+            .send()
+            .await
+            .map_err(|err| {
+                let chain = super::format_error_chain(&err);
+                ProviderError::RequestFailed(format!("anthropic keepalive error: {chain}"))
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body_text = response.text().await.unwrap_or_default();
+            return Err(map_provider_error(status, body_text));
+        }
+
+        // Drain the stream, discard all output, extract usage only.
+        let mut stream = spawn_anthropic_stream(response, "anthropic");
+        let mut result = PingUsage::default();
+
+        while let Some(chunk) = stream.recv().await {
+            match chunk {
+                StreamChunk::Usage {
+                    input_tokens,
+                    cache_read_tokens,
+                    cache_creation_tokens,
+                    ..
+                } => {
+                    result.input_tokens = input_tokens;
+                    result.cache_read_tokens = cache_read_tokens;
+                    result.cache_creation_tokens = cache_creation_tokens;
+                }
+                StreamChunk::Error(e) => return Err(e),
+                StreamChunk::Done => break,
+                _ => {} // discard text, tool calls, reasoning
+            }
+        }
+
+        Ok(result)
     }
 }
 

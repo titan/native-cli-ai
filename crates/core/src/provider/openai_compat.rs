@@ -1,4 +1,5 @@
 use super::{Provider, ProviderError, StreamChunk};
+use crate::cache_keepalive::{KeepaliveSnapshot, PingUsage};
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -622,6 +623,63 @@ impl Provider for OpenAiCompatProvider {
         }
 
         Ok(spawn_openai_stream(response, self.name))
+    }
+
+    async fn keepalive_ping(
+        &self,
+        snapshot: &KeepaliveSnapshot,
+    ) -> Result<PingUsage, ProviderError> {
+        // Build the request with max_tokens=1 to minimise output cost.
+        // The input prefix is what we're paying for — it refreshes the cache.
+        let body = openai_request_body(
+            &snapshot.messages,
+            &snapshot.tools,
+            &snapshot.model,
+            1, // max_tokens = 1
+            self.temperature,
+            &snapshot.workspace_root,
+        )?;
+
+        let response = self
+            .client
+            .post(self.endpoint())
+            .json(&body)
+            .send()
+            .await
+            .map_err(|err| {
+                let chain = super::format_error_chain(&err);
+                ProviderError::RequestFailed(format!("{} keepalive error: {}", self.name, chain))
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body_text = response.text().await.unwrap_or_default();
+            return Err(map_provider_error(status, body_text));
+        }
+
+        // Drain the stream, discard all output, extract usage only.
+        let mut stream = spawn_openai_stream(response, self.name);
+        let mut result = PingUsage::default();
+
+        while let Some(chunk) = stream.recv().await {
+            match chunk {
+                StreamChunk::Usage {
+                    input_tokens,
+                    cache_read_tokens,
+                    cache_creation_tokens,
+                    ..
+                } => {
+                    result.input_tokens = input_tokens;
+                    result.cache_read_tokens = cache_read_tokens;
+                    result.cache_creation_tokens = cache_creation_tokens;
+                }
+                StreamChunk::Error(e) => return Err(e),
+                StreamChunk::Done => break,
+                _ => {} // discard text, tool calls, reasoning
+            }
+        }
+
+        Ok(result)
     }
 }
 

@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::approval::ApprovalPolicy;
+use crate::cache_keepalive::{CacheKeepalive, KeepaliveProfile, KeepaliveSnapshot};
 use crate::context_view::plan_context_view;
 use crate::cost::CostTracker;
 use crate::hooks::{HookEventKind, HookRunner};
@@ -19,7 +20,7 @@ use crate::tools::ToolRegistry;
 
 /// Drives the multi-turn conversation and tool-use loop.
 pub struct AgentLoop {
-    pub provider: Box<dyn Provider>,
+    pub provider: Arc<dyn Provider>,
     pub tools: ToolRegistry,
     pub approval: ApprovalPolicy,
     pub messages: Vec<Message>,
@@ -35,12 +36,14 @@ pub struct AgentLoop {
     smart_compaction_mode: SmartCompactionMode,
     /// Start instant per pending tool call_id, for duration tracking.
     tool_start_times: HashMap<String, Instant>,
+    /// Prompt-cache keepalive profile (per-provider economics).
+    keepalive_profile: KeepaliveProfile,
 }
 
 impl AgentLoop {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        provider: Box<dyn Provider>,
+        provider: Arc<dyn Provider>,
         tools: ToolRegistry,
         approval: ApprovalPolicy,
         model: String,
@@ -65,6 +68,7 @@ impl AgentLoop {
             hooks,
             smart_compaction_mode: SmartCompactionMode::Off,
             tool_start_times: HashMap::new(),
+            keepalive_profile: KeepaliveProfile::disabled(),
         }
     }
 
@@ -76,13 +80,19 @@ impl AgentLoop {
         self.smart_compaction_mode
     }
 
+    /// Set the prompt-cache keepalive profile (called by supervisor after
+    /// provider construction, using per-provider economics).
+    pub fn set_keepalive_profile(&mut self, profile: KeepaliveProfile) {
+        self.keepalive_profile = profile;
+    }
+
     /// Add a system prompt once at startup.
     pub fn set_system_prompt(&mut self, prompt: impl Into<String>) {
         self.messages.push(Message::system(prompt));
     }
 
     /// Replace the LLM provider (e.g. after user switches provider in-session).
-    pub fn replace_provider(&mut self, provider: Box<dyn Provider>) {
+    pub fn replace_provider(&mut self, provider: Arc<dyn Provider>) {
         self.provider = provider;
     }
 
@@ -388,6 +398,24 @@ impl AgentLoop {
             }
 
             // ── Tool pipeline: permission checks + concurrent execution ──
+            // Start cache keepalive for the tool-execution pause.
+            // self.messages now ends with the assistant's tool_calls — the
+            // exact prefix the next request will re-send. Keeping it warm
+            // avoids a full-price re-prefill when the pause exceeds the
+            // provider's cache TTL (~10 min for DeepSeek).
+            let snapshot = KeepaliveSnapshot {
+                messages: self.messages.clone(),
+                tools: self.tool_definitions(),
+                model: self.model.clone(),
+                workspace_root: workspace_root.to_path_buf(),
+            };
+            let keepalive = CacheKeepalive::start(
+                Arc::clone(&self.provider),
+                snapshot,
+                self.keepalive_profile.clone(),
+                self.event_tx.clone(),
+            );
+
             let pipeline = tool_pipeline::run_tool_pipeline(
                 &self.tools,
                 &mut self.approval,
@@ -398,6 +426,9 @@ impl AgentLoop {
             )
             .await
             .map_err(ProviderError::Other)?;
+
+            // Cancel keepalive — the pause is over, next request is imminent.
+            keepalive.stop().await;
 
             let n = pipeline.results.len();
 

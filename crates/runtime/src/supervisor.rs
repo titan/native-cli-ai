@@ -26,6 +26,7 @@ use nca_common::session::{
 };
 use nca_core::agent::AgentLoop;
 use nca_core::approval::{ApprovalHandler, ApprovalPolicy, ApprovalVerdict};
+use nca_core::cache_keepalive;
 use nca_core::harness::build_system_prompt_with_agent;
 use nca_core::hooks::{HookEventKind, HookRunner};
 use nca_core::plugin::PluginRegistry;
@@ -393,6 +394,7 @@ impl Supervisor {
         );
         agent.set_system_prompt(system_prompt);
         agent.set_smart_compaction_mode(config.memory.context.smart_compaction_mode);
+        agent.set_keepalive_profile(cache_keepalive::resolve_profile(config.provider.default));
 
         let context_manager =
             Self::make_context_manager(&config, &config.model.default_model).await;
@@ -996,6 +998,10 @@ impl Supervisor {
         let m = self.model.clone();
         self.agent.model = m;
         self.agent.replace_provider(provider);
+        self.agent
+            .set_keepalive_profile(cache_keepalive::resolve_profile(
+                self.config.provider.default,
+            ));
         self.agent.approval.set_mode(self.config.permissions.mode);
 
         // Store profile and rebuild system prompt.
@@ -1051,10 +1057,12 @@ impl Supervisor {
         self.base_config = config.clone();
         self.config = config;
         self.model = self.config.provider.active_model().to_string();
+        let provider_kind = self.config.provider.default;
         let m = self.model.clone();
         let agent = self.agent_mut();
         agent.model = m;
         agent.replace_provider(provider);
+        agent.set_keepalive_profile(cache_keepalive::resolve_profile(provider_kind));
         self.rebuild_context_manager_sync();
         Ok(())
     }

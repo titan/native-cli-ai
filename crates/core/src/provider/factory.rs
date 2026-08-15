@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use nca_common::config::{NcaConfig, ProviderKind};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
@@ -32,7 +34,7 @@ const DEEPSEEK_PROFILE: CompatProfile = CompatProfile {
 };
 
 /// Build the configured provider for the current workspace (uses `config.provider.default`).
-pub fn build_provider(config: &NcaConfig) -> Result<Box<dyn Provider>, ProviderError> {
+pub fn build_provider(config: &NcaConfig) -> Result<Arc<dyn Provider>, ProviderError> {
     build_provider_for(config, config.provider.default)
 }
 
@@ -43,9 +45,9 @@ pub fn build_provider(config: &NcaConfig) -> Result<Box<dyn Provider>, ProviderE
 pub fn build_provider_for(
     config: &NcaConfig,
     kind: ProviderKind,
-) -> Result<Box<dyn Provider>, ProviderError> {
+) -> Result<Arc<dyn Provider>, ProviderError> {
     match kind {
-        ProviderKind::MiniMax => Ok(Box::new(MiniMaxProvider::from_config(config)?)),
+        ProviderKind::MiniMax => Ok(Arc::new(MiniMaxProvider::from_config(config)?)),
         ProviderKind::OpenRouter => {
             let mut extra = HeaderMap::new();
             if let Some(url) = &config.provider.openrouter.site_url {
@@ -60,17 +62,17 @@ pub fn build_provider_for(
                     HeaderValue::from_str(name).unwrap(),
                 );
             }
-            Ok(Box::new(OpenAiCompatProvider::from_config(
+            Ok(Arc::new(OpenAiCompatProvider::from_config(
                 &config.provider.openrouter,
                 config.model.max_tokens,
                 OPENROUTER_PROFILE,
                 extra,
             )?))
         }
-        ProviderKind::Anthropic => Ok(Box::new(AnthropicProvider::from_config(config)?)),
+        ProviderKind::Anthropic => Ok(Arc::new(AnthropicProvider::from_config(config)?)),
         ProviderKind::OpenAi => {
             let extra = HeaderMap::new();
-            Ok(Box::new(OpenAiCompatProvider::from_config(
+            Ok(Arc::new(OpenAiCompatProvider::from_config(
                 &config.provider.openai,
                 config.model.max_tokens,
                 OPENAI_PROFILE,
@@ -79,7 +81,7 @@ pub fn build_provider_for(
         }
         ProviderKind::ZhipuAI => {
             let extra = HeaderMap::new();
-            Ok(Box::new(OpenAiCompatProvider::from_config(
+            Ok(Arc::new(OpenAiCompatProvider::from_config(
                 &config.provider.zhipuai,
                 config.model.max_tokens,
                 ZHIPUAI_PROFILE,
@@ -88,15 +90,15 @@ pub fn build_provider_for(
         }
         ProviderKind::DeepSeek => {
             let extra = HeaderMap::new();
-            Ok(Box::new(OpenAiCompatProvider::from_config(
+            Ok(Arc::new(OpenAiCompatProvider::from_config(
                 &config.provider.deepseek,
                 config.model.max_tokens,
                 DEEPSEEK_PROFILE,
                 extra,
             )?))
         }
-        ProviderKind::Kimi => Ok(Box::new(KimiProvider::from_config(config)?)),
-        ProviderKind::Custom => Ok(Box::new(super::custom::CustomProvider::from_config(
+        ProviderKind::Kimi => Ok(Arc::new(KimiProvider::from_config(config)?)),
+        ProviderKind::Custom => Ok(Arc::new(super::custom::CustomProvider::from_config(
             config,
         )?)),
     }

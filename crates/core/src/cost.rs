@@ -15,9 +15,27 @@ impl CostTracker {
         self.cache_read_tokens += cache_read;
     }
 
+    /// Fraction of cached input tokens served from cache (cache reads vs all
+    /// cached tokens). For DeepSeek this is `hit / (hit + miss)`. For Anthropic
+    /// this is `read / (read + creation)`.
+    ///
+    /// A ratio trending toward 1.0 means the prompt prefix is stable and the
+    /// provider is successfully reusing cached content. A drop signals prefix
+    /// instability or cache eviction — investigate prefix changes.
+    pub fn cache_hit_ratio(&self) -> f64 {
+        let cached = self.cache_read_tokens + self.cache_creation_tokens;
+        if cached == 0 {
+            return 0.0;
+        }
+        self.cache_read_tokens as f64 / cached as f64
+    }
+
     /// Rough cost estimate in USD based on Claude Sonnet pricing.
-    /// Real implementation should look up per-model pricing.
-    /// cache_read_tokens are priced at 1/50 of normal input rate.
+    ///
+    /// NOTE: `input_tokens` from OpenAI-compatible providers (DeepSeek,
+    /// OpenAI) includes cached tokens, so they are double-counted here (full
+    /// input rate + cache_read rate). A per-model pricing lookup would fix
+    /// this, but for now this is a rough estimate only.
     pub fn estimated_cost_usd(&self) -> f64 {
         let input_cost = self.input_tokens as f64 * 3.0 / 1_000_000.0;
         let output_cost = self.output_tokens as f64 * 15.0 / 1_000_000.0;
