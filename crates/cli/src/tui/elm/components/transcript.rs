@@ -921,6 +921,17 @@ impl TranscriptState {
 
         // Clamp scroll position
         let max_scroll = total.saturating_sub(transcript_h);
+        // Self-heal follow-tail: whenever the viewport already shows the tail,
+        // re-arm following. The wheel/PageDown handlers only re-arm when an
+        // event lands exactly at the bottom *at event time* — but the user
+        // typically stops scrolling as soon as the newest content is visible,
+        // which can sit one or more notches above the absolute bottom while
+        // content keeps streaming. Without this, `transcript_follow_tail`
+        // stays disarmed and the view freezes at that offset while new
+        // messages arrive below the fold.
+        if self.scroll_lines >= max_scroll {
+            self.transcript_follow_tail = true;
+        }
         if self.transcript_follow_tail || self.scroll_lines > max_scroll {
             self.scroll_lines = max_scroll;
         }
@@ -948,6 +959,121 @@ impl TranscriptState {
 mod tests {
     use super::*;
     use nca_common::event::{AgentEvent, BusyState};
+
+    // ── Follow-tail self-heal ────────────────────────────────────
+    // Regression: users who scroll back up and then return to the newest
+    // message expect the view to keep following new output. The wheel handler
+    // only re-arms `transcript_follow_tail` when an event lands exactly at
+    // the bottom *at event time*; while content streams, the bottom keeps
+    // moving and that landing is easily missed. Render must therefore re-arm
+    // whenever the viewport already shows the tail.
+    #[test]
+    fn render_rearms_follow_when_viewport_shows_tail() {
+        let mut t = TranscriptState::new();
+        for i in 0..12 {
+            t.apply_event(&AgentEvent::MessageReceived {
+                role: "assistant".into(),
+                content: format!("message number {i} with some text"),
+            });
+        }
+        let area = Rect::new(0, 1, 80, 12); // content viewport: 78 wide, 10 tall
+        let max_scroll = t.total_line_count(78) - 10;
+        assert!(max_scroll > 0, "fixture: transcript must overflow viewport");
+
+        // User scrolled up (follow disarmed), then returned to the newest
+        // message: viewport sits at the bottom, but the last wheel event did
+        // not land exactly at the (streaming) bottom, so `transcript_follow_tail`
+        // is still false. Render at this position must re-arm follow.
+        t.transcript_follow_tail = false;
+        t.scroll_lines = max_scroll;
+        let _ = t.render(area);
+        assert!(
+            t.transcript_follow_tail,
+            "render must re-arm follow when the viewport shows the tail"
+        );
+
+        // New message arrives below the fold → view must follow it.
+        t.apply_event(&AgentEvent::MessageReceived {
+            role: "assistant".into(),
+            content: "a brand new message".into(),
+        });
+
+        let _ = t.render(area);
+        let new_max = t.total_line_count(78) - 10;
+        assert_eq!(
+            t.scroll_lines, new_max,
+            "view must follow the tail once the viewport shows it"
+        );
+        assert!(t.transcript_follow_tail);
+    }
+
+    #[test]
+    fn render_keeps_position_when_reading_older_content() {
+        let mut t = TranscriptState::new();
+        for i in 0..12 {
+            t.apply_event(&AgentEvent::MessageReceived {
+                role: "assistant".into(),
+                content: format!("message number {i} with some text"),
+            });
+        }
+        let area = Rect::new(0, 1, 80, 12);
+        let max_scroll = t.total_line_count(78) - 10;
+
+        // User is reading older content, far above the tail.
+        t.transcript_follow_tail = false;
+        t.scroll_lines = max_scroll.saturating_sub(20);
+
+        t.apply_event(&AgentEvent::MessageReceived {
+            role: "assistant".into(),
+            content: "another new message".into(),
+        });
+        let before = t.scroll_lines;
+        let _ = t.render(area);
+        assert_eq!(t.scroll_lines, before, "reading position must not jump");
+        assert!(
+            !t.transcript_follow_tail,
+            "must stay disarmed away from tail"
+        );
+    }
+
+    #[test]
+    fn wheel_down_to_bottom_rearms_follow() {
+        use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+
+        let mut t = TranscriptState::new();
+        for i in 0..12 {
+            t.apply_event(&AgentEvent::MessageReceived {
+                role: "assistant".into(),
+                content: format!("message number {i} with some text"),
+            });
+        }
+        let area = Rect::new(0, 1, 80, 12);
+        let total = t.total_line_count(78);
+
+        // Pin the viewport to the bottom first (as the app does while
+        // following), then scroll up one wheel notch.
+        let _ = t.render(area);
+        let up = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        t.handle_mouse(&up, area, total);
+        assert!(!t.transcript_follow_tail, "wheel up disarms follow");
+
+        let down = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        t.handle_mouse(&down, area, total);
+        assert!(
+            t.transcript_follow_tail,
+            "wheel down landing at bottom re-arms follow"
+        );
+    }
 
     // The BlockLineCache rebuild is O(total committed transcript text). During
     // streaming the agent emits one TokensStreamed/ReasoningStreamed per token,
