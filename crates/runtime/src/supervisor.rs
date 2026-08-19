@@ -144,6 +144,30 @@ impl SupervisorHandle {
     }
 }
 
+/// Decide which workspace root a resumed session should use.
+///
+/// `SessionMeta.workspace` records the canonical path captured at
+/// session-create time. When the project directory has since been renamed or
+/// moved, that path no longer exists; blindly adopting it makes every later
+/// persistence write (`create_dir_all` in `save_workspace_file`, allow-pattern
+/// and mount persistence) silently *resurrect the old directory tree* — the
+/// "config saved under the old directory" bug. The freshly canonicalized root
+/// the session was just loaded from is authoritative: sessions live in
+/// `<workspace>/.nca/sessions`, so a successful load proves ownership. The
+/// stored path is kept only when it still exists and differs for a real
+/// reason (e.g. worktree-linked sessions resumed from another root).
+fn resolve_resume_workspace_root(current_root: &Path, stored_root: &Path) -> PathBuf {
+    if stored_root != current_root && !stored_root.exists() {
+        tracing::info!(
+            stale = %stored_root.display(),
+            current = %current_root.display(),
+            "session workspace path is stale (renamed/moved); adopting current root"
+        );
+        return current_root.to_path_buf();
+    }
+    stored_root.to_path_buf()
+}
+
 /// Persist an approved allow pattern to the workspace config file.
 fn persist_allow_pattern(workspace_root: &Path, pattern: String) {
     let root = workspace_root.to_path_buf();
@@ -476,7 +500,8 @@ impl Supervisor {
         .await?;
 
         sup.session_id = loaded.meta.id.clone();
-        sup.workspace_root = loaded.meta.workspace.clone();
+        sup.workspace_root =
+            resolve_resume_workspace_root(&sup.workspace_root, &loaded.meta.workspace);
         sup.model = loaded.meta.model.clone();
         sup.agent.model = loaded.meta.model.clone();
         sup.created_at = loaded.meta.created_at;
@@ -1360,6 +1385,27 @@ pub(crate) fn register_skill_agents(config: &mut NcaConfig, workspace_root: &Pat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_resume_workspace_root_adopts_current_when_stored_path_vanished() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old = dir.path().join("project-old");
+        std::fs::create_dir_all(&old).expect("mkdir");
+        let current = dir.path().canonicalize().expect("canonicalize current");
+
+        // Stored path still exists and differs → legacy behavior keeps it
+        // (e.g. worktree-linked sessions resumed from another root).
+        assert_eq!(resolve_resume_workspace_root(&current, &old), old);
+
+        // Directory renamed: stored path is gone → adopt the current root so
+        // later config saves do not resurrect the old tree.
+        let renamed = dir.path().join("project-new");
+        std::fs::rename(&old, &renamed).expect("rename");
+        assert_eq!(resolve_resume_workspace_root(&current, &old), current);
+
+        // Equal paths are a no-op.
+        assert_eq!(resolve_resume_workspace_root(&current, &current), current);
+    }
 
     #[test]
     fn is_specialist_skill_recognizes_known_names() {
