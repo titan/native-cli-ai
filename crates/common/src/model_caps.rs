@@ -35,7 +35,12 @@ pub fn model_accepts_native_images(kind: ProviderKind, model: &str) -> bool {
                 || m.contains("vision")
                 || m.contains("qwen-vl")
         }
-        ProviderKind::ZhipuAI => m.contains("glm-5") || m.contains("glm-4v") || m.contains("glm-4"),
+        // GLM-5.3 is text-only; glm-5.2 and glm-4v/glm-4 models accept native images.
+        ProviderKind::ZhipuAI => {
+            (m.contains("glm-5") && !m.contains("glm-5.3"))
+                || m.contains("glm-4v")
+                || m.contains("glm-4")
+        }
         ProviderKind::DeepSeek => false, // DeepSeek does not support native image inputs
         ProviderKind::Kimi => false,     // Kimi for Coding: k3 specs don't list native image input
         // ponytail: custom endpoints vary; assume no native image input until configured otherwise
@@ -60,6 +65,22 @@ mod tests {
         assert!(!model_accepts_native_images(
             ProviderKind::OpenAi,
             "gpt-3.5-turbo"
+        ));
+    }
+
+    #[test]
+    fn glm_5_3_is_text_only() {
+        assert!(!model_accepts_native_images(
+            ProviderKind::ZhipuAI,
+            "glm-5.3"
+        ));
+        assert!(model_accepts_native_images(
+            ProviderKind::ZhipuAI,
+            "glm-5.2"
+        ));
+        assert!(model_accepts_native_images(
+            ProviderKind::ZhipuAI,
+            "glm-4v-flash"
         ));
     }
 }

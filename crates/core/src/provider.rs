@@ -57,6 +57,18 @@ pub enum StreamChunk {
     /// The stream terminates after this chunk. Consumers MUST propagate it as an
     /// error rather than treating any buffered text as a successful assistant reply.
     Error(ProviderError),
+    /// Terminal finish reason for the generation (e.g. `"stop"`, `"length"`,
+    /// `"tool_calls"`), when the provider reports one. Emitted at most once,
+    /// just before [`StreamChunk::Done`].
+    ///
+    /// Lets consumers distinguish truncation from a clean stop. Critical for
+    /// thinking models (e.g. ZhipuAI GLM-5.3, whose thinking cannot be disabled):
+    /// they can exhaust the entire `max_tokens` budget on `reasoning_content`
+    /// and end with an empty `content` and `finish_reason: "length"` — a
+    /// deterministic outcome that retrying with identical parameters cannot fix.
+    Finish {
+        reason: String,
+    },
     Done,
 }
 

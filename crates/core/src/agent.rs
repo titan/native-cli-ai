@@ -258,6 +258,7 @@ impl AgentLoop {
             let mut reasoning_text = String::new();
             let mut tool_calls: Vec<ToolCall> = Vec::new();
             let mut got_usage = false;
+            let mut finish_reason: Option<String> = None;
 
             let mut cancel_poll = tokio::time::interval(Duration::from_millis(25));
             cancel_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -332,6 +333,9 @@ impl AgentLoop {
                         .await;
                         return Err(err);
                     }
+                    StreamChunk::Finish { reason } => {
+                        finish_reason = Some(reason);
+                    }
                     StreamChunk::Done => break,
                 }
             }
@@ -343,6 +347,27 @@ impl AgentLoop {
 
             if tool_calls.is_empty() {
                 if assistant_text.trim().is_empty() {
+                    // Thinking-locked models (e.g. ZhipuAI GLM-5.3, whose thinking
+                    // cannot be disabled) can spend the entire max_tokens budget on
+                    // reasoning_content and finish with finish_reason="length" and
+                    // an empty content. Retrying with identical parameters almost
+                    // always reproduces the same truncation while re-billing the
+                    // full prompt — fail fast with an actionable message instead.
+                    if finish_reason.as_deref() == Some("length") {
+                        let msg = format!(
+                            "Provider returned empty response: generation hit the max_tokens cap \
+                             while thinking (finish_reason=length, {} chars of reasoning produced, \
+                             no content). Raise [model] max_tokens — GLM-5.x thinking models cannot \
+                             disable thinking and ZhipuAI coding examples use 65536 — or lower the \
+                             reasoning effort.",
+                            reasoning_text.chars().count()
+                        );
+                        self.emit(AgentEvent::Error {
+                            message: msg.clone(),
+                        })
+                        .await;
+                        return Err(ProviderError::Other(msg));
+                    }
                     empty_retries += 1;
                     if empty_retries <= MAX_EMPTY_RETRIES && got_usage {
                         self.emit(AgentEvent::Error {
@@ -353,13 +378,17 @@ impl AgentLoop {
                         .await;
                         continue;
                     }
+                    let diag = format!(
+                        "Provider returned empty response with no tool calls ({} chars of \
+                         reasoning produced, finish_reason={})",
+                        reasoning_text.chars().count(),
+                        finish_reason.as_deref().unwrap_or("unknown"),
+                    );
                     self.emit(AgentEvent::Error {
-                        message: "Provider returned empty response with no tool calls".into(),
+                        message: diag.clone(),
                     })
                     .await;
-                    return Err(ProviderError::Other(
-                        "Provider returned empty response with no tool calls after retries".into(),
-                    ));
+                    return Err(ProviderError::Other(format!("{diag} after retries",)));
                 }
                 let mut msg = Message::assistant(assistant_text.clone());
                 if !reasoning_text.is_empty() {
@@ -733,6 +762,162 @@ fn format_tool_result(result: &nca_common::tool::ToolResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approval::ApprovalPolicy;
+    use crate::provider::{Provider, ProviderError, StreamChunk};
+    use crate::tools::ToolRegistry;
+    use nca_common::config::PermissionConfig;
+    use nca_common::tool::ToolDefinition;
+    use std::sync::atomic::AtomicU32;
+
+    /// Scripted provider: each `chat()` call replays the next round of chunks,
+    /// then closes the channel (the agent loop treats channel close as end of
+    /// stream). Counts calls so tests can assert retry behavior.
+    struct ScriptedProvider {
+        rounds: Vec<Vec<StreamChunk>>,
+        calls: Arc<AtomicU32>,
+    }
+
+    impl ScriptedProvider {
+        fn new(rounds: Vec<Vec<StreamChunk>>) -> (Self, Arc<AtomicU32>) {
+            let calls = Arc::new(AtomicU32::new(0));
+            (
+                Self {
+                    rounds,
+                    calls: Arc::clone(&calls),
+                },
+                calls,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for ScriptedProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _model: &str,
+            _workspace_root: &Path,
+        ) -> Result<tokio::sync::mpsc::Receiver<StreamChunk>, ProviderError> {
+            let index = self.calls.fetch_add(1, Ordering::SeqCst) as usize;
+            let round = self.rounds.get(index).cloned().unwrap_or_default();
+            let (tx, rx) = tokio::sync::mpsc::channel(64);
+            tokio::spawn(async move {
+                for chunk in round {
+                    let _ = tx.send(chunk).await;
+                }
+            });
+            Ok(rx)
+        }
+    }
+
+    fn test_agent(provider: Arc<dyn Provider>) -> AgentLoop {
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(256);
+        AgentLoop::new(
+            provider,
+            ToolRegistry::new(),
+            ApprovalPolicy::new(PermissionConfig::default()),
+            "glm-5.3".into(),
+            event_tx,
+            10,
+            16,
+            0,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn reasoning_only_length_truncation_fails_fast_without_retry() {
+        // GLM-5.3 with max_tokens exhausted mid-thinking: reasoning deltas +
+        // usage + finish_reason="length", no content, no tool calls. This is a
+        // deterministic truncation — retrying with identical parameters would
+        // re-bill the full prompt for the same outcome, so the loop must fail
+        // fast (exactly one provider call) with a message pointing at the cap.
+        let (provider, calls) = ScriptedProvider::new(vec![vec![
+            StreamChunk::ReasoningDelta("thinking very hard".into()),
+            StreamChunk::Usage {
+                input_tokens: 9_000,
+                output_tokens: 8_192,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+            },
+            StreamChunk::Finish {
+                reason: "length".into(),
+            },
+        ]]);
+        let mut agent = test_agent(Arc::new(provider));
+
+        let err = agent
+            .run_turn("do the thing", Path::new("."), &[])
+            .await
+            .expect_err("must fail fast");
+        let message = err.to_string();
+        assert!(
+            message.contains("max_tokens"),
+            "error must point at the token cap: {message}"
+        );
+        assert!(
+            message.contains("length"),
+            "error must name the finish reason: {message}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "length-truncation is deterministic; blind retries must be skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_only_clean_stop_still_retries_then_reports_diagnostics() {
+        // Empty content with finish_reason="stop" is NOT deterministic — the
+        // existing bounded retry behavior applies (initial attempt + 2 retries).
+        // The final error must now include reasoning diagnostics.
+        let round = vec![
+            StreamChunk::ReasoningDelta("hmm".into()),
+            StreamChunk::Usage {
+                input_tokens: 100,
+                output_tokens: 5,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+            },
+            StreamChunk::Finish {
+                reason: "stop".into(),
+            },
+        ];
+        let (provider, calls) = ScriptedProvider::new(vec![round.clone(), round.clone(), round]);
+        let mut agent = test_agent(Arc::new(provider));
+
+        let err = agent
+            .run_turn("do the thing", Path::new("."), &[])
+            .await
+            .expect_err("empty response after retries");
+        let message = err.to_string();
+        assert!(message.contains("after retries"), "got: {message}");
+        assert!(
+            message.contains("chars of reasoning"),
+            "error must surface reasoning diagnostics: {message}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn finish_chunk_does_not_disturb_normal_text_turn() {
+        let (provider, _calls) = ScriptedProvider::new(vec![vec![
+            StreamChunk::TextDelta("all ".into()),
+            StreamChunk::TextDelta("done".into()),
+            StreamChunk::Finish {
+                reason: "stop".into(),
+            },
+        ]]);
+        let mut agent = test_agent(Arc::new(provider));
+
+        let text = agent
+            .run_turn("hi", Path::new("."), &[])
+            .await
+            .expect("normal turn");
+        assert_eq!(text, "all done");
+        assert_eq!(agent.messages.len(), 2, "user + assistant messages");
+    }
 
     fn tc(id: &str) -> MessageToolCall {
         MessageToolCall {

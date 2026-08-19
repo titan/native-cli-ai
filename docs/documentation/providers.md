@@ -128,6 +128,52 @@ google/gemini-2.0-flash
 meta-llama/llama-3.1-70b-instruct
 ```
 
+## ZhipuAI (GLM)
+
+ZhipuAI's GLM models via the OpenAI-compatible chat completions endpoint (including the Coding Plan endpoint).
+
+### Setup
+
+```bash
+export ZHIPUAI_API_KEY="your-zhipuai-key"
+```
+
+```toml
+[provider]
+default = "zhipuai"
+
+[provider.zhipuai]
+api_key_env = "ZHIPUAI_API_KEY"
+# Standard API (default) or the Coding Plan endpoint:
+#   standard:  https://open.bigmodel.cn/api/paas/v4
+#   coding:    https://open.bigmodel.cn/api/coding/paas/v5
+base_url = "https://open.bigmodel.cn/api/coding/paas/v5"
+model = "glm-5.3"
+```
+
+### Thinking Models and `max_tokens`
+
+GLM-5.3 **cannot disable thinking** — the API rejects `thinking.type: "disabled"` —
+and the reasoning budget shares the `max_tokens` output cap. With a small cap
+(the global default is 8192) the model can exhaust the budget mid-reasoning and
+return an empty `content` with `finish_reason: "length"`.
+
+nca handles this in two ways:
+
+- For thinking-locked models (`glm-5.3`), `max_tokens` is floored to 65536
+  (matching ZhipuAI's own coding examples) unless you set a larger value.
+- A truncation (`finish_reason: "length"`) with no content fails fast with a
+diagnostic pointing at the cap, instead of being misread as a retryable
+  "empty response" (which would re-bill the full prompt for the same outcome).
+
+```toml
+[model]
+max_tokens = 65536   # or higher; glm-5.3 supports up to 131072 output tokens
+```
+
+Note: `--max-tokens` on the CLI overrides the config value; when omitted, the
+config value applies.
+
 ## Switching Providers
 
 ### Via CLI Flag

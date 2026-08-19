@@ -69,6 +69,11 @@ pub fn spawn_openai_stream(
     tokio::spawn(async move {
         let mut buffer = String::new();
         let mut tool_calls: BTreeMap<u64, ToolCallAccumulator> = BTreeMap::new();
+        // Last non-null finish_reason seen across chunks (OpenAI-compatible
+        // streams repeat it on the final chunk of each choice). Surfaced via
+        // `StreamChunk::Finish` so the agent loop can distinguish a truncated
+        // generation ("length") from a clean stop.
+        let mut finish_reason: Option<String> = None;
 
         loop {
             // 用单次读取的空闲超时替代 reqwest 全局总超时：只要持续有 token 流出，
@@ -153,6 +158,9 @@ pub fn spawn_openai_stream(
                 let data = line["data:".len()..].trim();
                 if data == "[DONE]" {
                     flush_openai_tool_calls(&tx, &mut tool_calls).await;
+                    if let Some(reason) = finish_reason.take() {
+                        let _ = tx.send(StreamChunk::Finish { reason }).await;
+                    }
                     let _ = tx.send(StreamChunk::Done).await;
                     return;
                 }
@@ -237,6 +245,12 @@ pub fn spawn_openai_stream(
                         }
                     }
 
+                    if let Some(reason) = choice["finish_reason"].as_str()
+                        && !reason.is_empty()
+                    {
+                        finish_reason = Some(reason.to_string());
+                    }
+
                     if choice["finish_reason"].as_str() == Some("tool_calls") {
                         flush_openai_tool_calls(&tx, &mut tool_calls).await;
                     }
@@ -245,6 +259,9 @@ pub fn spawn_openai_stream(
         }
 
         flush_openai_tool_calls(&tx, &mut tool_calls).await;
+        if let Some(reason) = finish_reason.take() {
+            let _ = tx.send(StreamChunk::Finish { reason }).await;
+        }
         let _ = tx.send(StreamChunk::Done).await;
     });
 

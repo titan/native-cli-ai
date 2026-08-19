@@ -201,7 +201,7 @@ Valid `provider` values and their required config sections:
 | OpenAI | `"openai"` | `[provider.openai]` | `gpt-4o`, `gpt-4o-mini` |
 | Anthropic | `"anthropic"` | `[provider.anthropic]` | `claude-3-7-sonnet-latest` |
 | OpenRouter | `"openrouter"` | `[provider.openrouter]` | `openai/gpt-4o` |
-| ZhipuAI | `"zhipuai"` | `[provider.zhipuai]` | `glm-5.2` |
+| ZhipuAI | `"zhipuai"` | `[provider.zhipuai]` | `glm-5.3` |
 | DeepSeek | `"deepseek"` | `[provider.deepseek]` | `deepseek-v4-flash` |
 
 You must have the corresponding API key configured (via `[provider.<name>].api_key` or

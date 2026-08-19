@@ -20,7 +20,7 @@ When invoked without a subcommand, nca starts an interactive session. Behavior d
 | `--model` | — | string | — | Override the default model |
 | `--enable-thinking` | `-t` | flag | false | Enable extended thinking/reasoning |
 | `--thinking-budget` | — | u32 | 5120 | Token budget for extended thinking |
-| `--max-tokens` | — | u32 | 8192 | Max response tokens |
+| `--max-tokens` | — | u32 | config `[model] max_tokens` (8192) | Max response tokens (overrides config) |
 | `--verbose` | `-v` | flag | false | Verbose debug logging |
 | `--json` | — | flag | false | Output structured JSON (for CI) |
 | `--stream` | — | enum | `human` | Stream format: `human`, `ndjson`, or `off` |

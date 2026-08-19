@@ -345,7 +345,7 @@ impl NcaConfig {
             "openai" | "gpt" | "gpt4o" | "gpt4omini" => Some(ProviderKind::OpenAi),
             "claude" | "claude-sonnet" => Some(ProviderKind::Anthropic),
             "openrouter" => Some(ProviderKind::OpenRouter),
-            "zhipuai" | "glm" | "glm5" | "glm-5.2" => Some(ProviderKind::ZhipuAI),
+            "zhipuai" | "glm" | "glm5" | "glm-5.2" | "glm-5.3" => Some(ProviderKind::ZhipuAI),
             "default" | "deepseek" | "ds" | "deepseek-v4" | "dsv4" | "dsv4p" | "deepseek-v3"
             | "dsv3" | "deepseek-r1" | "dsr1" => Some(ProviderKind::DeepSeek),
             _ => None,
@@ -989,7 +989,7 @@ impl ProviderKind {
             "openai" | "open-ai" | "gpt" => Some(Self::OpenAi),
             "anthropic" | "claude" => Some(Self::Anthropic),
             "openrouter" | "open-router" => Some(Self::OpenRouter),
-            "zhipuai" | "zhipu" | "glm" | "glm-5" | "glm-5.2" => Some(Self::ZhipuAI),
+            "zhipuai" | "zhipu" | "glm" | "glm-5" | "glm-5.2" | "glm-5.3" => Some(Self::ZhipuAI),
             "deepseek" => Some(Self::DeepSeek),
             "kimi" | "k3" | "kimi-k3" => Some(Self::Kimi),
             "custom" => Some(Self::Custom),
@@ -1242,7 +1242,7 @@ impl Default for ZhipuAIConfig {
             api_key_env: "ZHIPUAI_API_KEY".into(),
             api_key: None,
             base_url: "https://open.bigmodel.cn/api/coding/paas/v4".into(),
-            model: "glm-5.2".into(),
+            model: "glm-5.3".into(),
             temperature: 0.7,
         }
     }
@@ -2255,9 +2255,10 @@ fn default_model_aliases() -> BTreeMap<String, String> {
         ("m2.7".into(), "MiniMax-M2.7".into()),
         ("m3".into(), "MiniMax-M3".into()),
         // ZhipuAI (GLM)
-        ("zhipuai".into(), "glm-5.2".into()),
-        ("glm".into(), "glm-5.2".into()),
-        ("glm5".into(), "glm-5.2".into()),
+        ("zhipuai".into(), "glm-5.3".into()),
+        ("glm".into(), "glm-5.3".into()),
+        ("glm5".into(), "glm-5.3".into()),
+        ("glm-5.3".into(), "glm-5.3".into()),
         ("glm-5.2".into(), "glm-5.2".into()),
         // Kimi (via Anthropic-compatible Kimi for Coding endpoint)
         ("kimi".into(), "k3".into()),
@@ -2335,7 +2336,7 @@ mod tests {
     #[test]
     fn apply_model_override_switches_provider_for_cross_provider_alias() {
         // Regression: selecting "glm" while DeepSeek is active must switch to
-        // ZhipuAI instead of setting DeepSeek's model to glm-5.2.
+        // ZhipuAI instead of setting DeepSeek's model to glm-5.3.
         let mut config = NcaConfig::default();
         config.provider.default = ProviderKind::DeepSeek;
         config.sync_default_model_from_provider();
@@ -2344,8 +2345,8 @@ mod tests {
         config.apply_model_override("glm");
 
         assert_eq!(config.provider.default, ProviderKind::ZhipuAI);
-        assert_eq!(config.provider.zhipuai.model, "glm-5.2");
-        assert_eq!(config.model.default_model, "glm-5.2");
+        assert_eq!(config.provider.zhipuai.model, "glm-5.3");
+        assert_eq!(config.model.default_model, "glm-5.3");
         // DeepSeek model must NOT have been polluted
         assert_eq!(config.provider.deepseek.model, "deepseek-v4-flash");
     }
@@ -2891,7 +2892,7 @@ default_model = "glm-5.2"
         // DeepSeek model must remain the deepseek default — NOT polluted by glm-5.2
         assert_eq!(config.provider.deepseek.model, "deepseek-v4-flash");
         // ZhipuAI model must remain the zhipuai default
-        assert_eq!(config.provider.zhipuai.model, "glm-5.2");
+        assert_eq!(config.provider.zhipuai.model, "glm-5.3");
         // In-memory default_model is derived from the active provider
         assert_eq!(config.model.default_model, "deepseek-v4-flash");
     }

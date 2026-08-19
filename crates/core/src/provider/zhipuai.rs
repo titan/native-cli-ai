@@ -68,4 +68,56 @@ mod tests {
         ));
         assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
     }
+
+    #[tokio::test]
+    async fn zhipuai_reasoning_only_truncation_surfaces_finish_reason() {
+        // GLM-5.3 cannot disable thinking: when max_tokens is exhausted
+        // mid-reasoning the stream carries only reasoning_content deltas and
+        // ends with finish_reason="length" and an empty content. The stream
+        // must surface Finish{reason:"length"} so the agent loop can fail fast
+        // instead of misreading this as a retryable "empty response".
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"let me think\"},\"index\":0,\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"... and think\"},\"index\":0,\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"length\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9000,\"completion_tokens\":8192}}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .to_string();
+        let base_url = spawn_sse_server(body, 200, |_| {});
+
+        let mut config = NcaConfig::default();
+        config.provider.zhipuai.api_key = Some("zhipuai-test-key".into());
+        config.provider.zhipuai.base_url = base_url;
+
+        let provider = OpenAiCompatProvider::from_config(
+            &config.provider.zhipuai,
+            config.model.max_tokens,
+            ZHIPUAI_PROFILE,
+            reqwest::header::HeaderMap::new(),
+        )
+        .expect("provider");
+        let stream = provider
+            .chat(
+                &[Message::user("refactor this module")],
+                &[],
+                "",
+                std::path::Path::new("."),
+            )
+            .await
+            .expect("chat stream");
+
+        let chunks = collect_chunks(stream).await;
+        assert!(
+            !chunks
+                .iter()
+                .any(|c| matches!(c, StreamChunk::TextDelta(_))),
+            "truncated reasoning-only stream must carry no content deltas"
+        );
+        assert!(matches!(
+            &chunks[chunks.len() - 2],
+            StreamChunk::Finish { reason } if reason == "length"
+        ));
+        assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
+    }
 }

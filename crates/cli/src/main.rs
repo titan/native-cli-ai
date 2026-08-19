@@ -70,9 +70,9 @@ struct Cli {
     #[arg(long, default_value = "5120")]
     thinking_budget: u32,
 
-    /// Max response tokens
-    #[arg(long, default_value = "8192")]
-    max_tokens: u32,
+    /// Max response tokens (overrides [model] max_tokens; config value is used when omitted)
+    #[arg(long)]
+    max_tokens: Option<u32>,
 
     /// Verbose debug logging
     #[arg(short, long)]
@@ -447,7 +447,13 @@ async fn try_main() -> anyhow::Result<()> {
         config.apply_model_override(model);
     }
 
-    config.model.max_tokens = cli.max_tokens;
+    // Only override the config value when --max-tokens is passed explicitly.
+    // The previous unconditional assignment let the clap default (8192) silently
+    // clobber a larger [model] max_tokens from config — fatal for thinking-locked
+    // models (ZhipuAI GLM-5.3) whose reasoning shares the output budget.
+    if let Some(max_tokens) = cli.max_tokens {
+        config.model.max_tokens = max_tokens;
+    }
     if cli.enable_thinking {
         config.model.enable_thinking = true;
         config.model.thinking_budget = cli.thinking_budget;

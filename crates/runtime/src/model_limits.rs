@@ -108,6 +108,12 @@ pub const MODEL_CONTEXT_LIMITS: &[ModelContextLimits] = &[
         context_window: 32_000,
         max_output_tokens: 8192,
     },
+    // ZhipuAI GLM-5.3 (text-only, 1M context, 128K output; thinking always enabled)
+    ModelContextLimits {
+        pattern: "glm-5.3",
+        context_window: 1_000_000,
+        max_output_tokens: 131_072,
+    },
     // ZhipuAI GLM-5.2 (1M context, 128K output)
     ModelContextLimits {
         pattern: "glm-5.2",
@@ -293,6 +299,15 @@ mod tests {
         assert_eq!(detect_context_window("minimax/minimax-m2.7"), 204_800);
         assert_eq!(detect_context_window("MiniMax-M2.5"), 100_000);
         assert_eq!(detect_context_window("minimax-m2"), 32_000);
+    }
+
+    #[test]
+    fn test_detect_glm() {
+        assert_eq!(detect_context_window("glm-5.3"), 1_000_000);
+        assert_eq!(detect_max_output_tokens("glm-5.3"), 131_072);
+        assert_eq!(detect_context_window("glm-5.2"), 1_000_000);
+        assert_eq!(detect_context_window("glm-5-turbo"), 200_000);
+        assert_eq!(detect_max_output_tokens("glm-5-turbo"), 128_000);
     }
 
     #[test]
