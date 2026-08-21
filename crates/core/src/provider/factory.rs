@@ -393,6 +393,79 @@ mod tests {
     }
 
     #[test]
+    fn glm_thinking_locked_version_scan_edges() {
+        // Adversarial edge table for the hand-rolled `glm-<major>[.<minor>]`
+        // scan. Inputs are already lowercased per the function's contract.
+        let cases: &[(&str, bool)] = &[
+            // Locked: any occurrence >= (5, 3).
+            ("glm-5.3", true),
+            ("glm-5.3-flash", true),
+            ("glm-5.4", true),
+            // Two-digit minor parses as 10, not 1.
+            ("glm-5.10", true),
+            // Missing minor counts as .0 — (6, 0) is still >= (5, 3).
+            ("glm-6", true),
+            // Below the lock.
+            ("glm-5", false),       // missing minor = .0 -> (5, 0)
+            ("glm-5-turbo", false), // missing minor = .0 -> (5, 0)
+            ("glm-5.", false),      // dot with no digits -> minor stays 0
+            ("glm-5.2", false),
+            ("glm-5.2-air", false),
+            ("glm-4.7-flash", false),
+            // No digits after `glm-` -> not a versioned model.
+            ("glm-air", false),
+            ("air", false),
+            // Any occurrence wins, in either order.
+            ("glm-5.2 glm-5.3", true),
+            ("glm-5.3 glm-5.2", true),
+            // Substring scan is intended — no word boundaries.
+            ("xxglm-5.4xx", true),
+            // Pinned actual behavior: leading zeros parse away ("05" -> 5 via
+            // u32::from_str), so "glm-05.3" IS treated as locked.
+            ("glm-05.3", true),
+            // Pinned actual behavior: a digit run that overflows u32 makes
+            // parse_number_prefix return None, so the occurrence is treated as
+            // unversioned and skipped instead of panicking.
+            ("glm-99999999999999999999", false),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                glm_thinking_locked(input),
+                *expected,
+                "glm_thinking_locked({input:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn zhipuai_floor_edges_for_thinking_toggle() {
+        // (models, configured, enable_thinking) -> effective max_tokens.
+        let cases: &[(&str, u32, bool, u32)] = &[
+            // Thinking-locked by version alone (>= 5.3), regardless of toggle.
+            ("glm-5.10", 8_192, false, 131_072),
+            ("glm-6", 8_192, false, 131_072),
+            // Not locked (missing minor = .0), but the enable_thinking flag
+            // triggers the GLM-5 floor on its own.
+            ("glm-5-turbo", 8_192, true, 131_072),
+            ("glm-5-turbo", 8_192, false, 8_192),
+            // Floor never applies below GLM-5, even with thinking on.
+            ("glm-4.7-flash", 4_096, true, 4_096),
+            // Boundary: configured == floor passes through untouched (the
+            // condition is `configured < floor`, not `<=`).
+            ("glm-5.2", 131_072, false, 131_072),
+            // Above the floor: thinking on, but the configured value wins.
+            ("glm-5.2", 262_144, true, 262_144),
+        ];
+        for (models, configured, enable_thinking, expected) in cases {
+            assert_eq!(
+                zhipuai_effective_max_tokens(models, *configured, *enable_thinking),
+                *expected,
+                "zhipuai_effective_max_tokens({models:?}, {configured}, {enable_thinking})"
+            );
+        }
+    }
+
+    #[test]
     fn zhipuai_floor_matches_glm_5_3_via_either_model_string() {
         // build_provider_for concatenates [provider.zhipuai].model and
         // [model].default_model before matching — a divergent manual TOML that
