@@ -1,6 +1,7 @@
 //! Transcript component — renders DisplayBlock items with virtual scrolling,
 //! text selection, streaming text, and collapsible blocks.
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -59,7 +60,10 @@ pub(crate) type LineAnswerHit = Option<TranscriptHit>;
 // ── BlockLineCache ─────────────────────────────────────────────────
 
 /// Cached per-block line counts + cumulative offsets for fast virtualization.
-/// Keyed by (blocks_generation, width) so it auto-invalidates.
+/// Keyed by (blocks_generation, width) so it auto-invalidates. The cache is
+/// also maintained incrementally by `TranscriptState` (append/set one block's
+/// height at a time); a full `rebuild` only happens when validity is lost
+/// (width change, stale generation, or block-count mismatch).
 pub(crate) struct BlockLineCache {
     generation: u64,
     width: u16,
@@ -67,6 +71,11 @@ pub(crate) struct BlockLineCache {
     heights: Vec<usize>,
     /// `cum_offsets[i]` = total lines of blocks[0..i].  Length = heights.len() + 1.
     cum_offsets: Vec<usize>,
+    /// Count of full `rebuild()` calls (test-only metric; upcoming
+    /// incremental-cache invariant tests pin "no rebuild" behavior with it).
+    #[cfg(test)]
+    #[allow(dead_code)] // read by future invariant tests, not by production code
+    rebuild_count: u32,
 }
 
 impl BlockLineCache {
@@ -76,18 +85,30 @@ impl BlockLineCache {
             width: 0,
             heights: Vec::new(),
             cum_offsets: vec![0],
+            #[cfg(test)]
+            rebuild_count: 0,
         }
     }
 
-    /// Returns `true` when the cache is valid for the given generation + width.
-    fn is_valid(&self, g: u64, w: u16) -> bool {
-        self.generation == g && self.width == w && !self.heights.is_empty()
+    /// Returns `true` when the cache is valid for the given generation, width,
+    /// and current number of blocks. The length check hardens incremental
+    /// maintenance: any mutation path that bypassed the helpers (or a
+    /// bulk-extend) makes the cache invalid instead of silently misindexing.
+    fn is_valid(&self, g: u64, w: u16, n_blocks: usize) -> bool {
+        self.generation == g
+            && self.width == w
+            && !self.heights.is_empty()
+            && self.heights.len() == n_blocks
     }
 
     /// Rebuild from `blocks`.  Must be called when `is_valid` returns `false`.
     fn rebuild(&mut self, blocks: &[DisplayBlock], g: u64, w: u16) {
         self.generation = g;
         self.width = w;
+        #[cfg(test)]
+        {
+            self.rebuild_count += 1;
+        }
         self.heights.clear();
         self.cum_offsets.clear();
         let w_usize = w as usize;
@@ -107,6 +128,47 @@ impl BlockLineCache {
     #[inline]
     fn total(&self) -> usize {
         *self.cum_offsets.last().unwrap_or(&0)
+    }
+
+    /// Append the measured height of a newly pushed block.
+    ///
+    /// Only correct when the cache already covered every prior block
+    /// (`is_valid` held before the push). O(1): pushes onto `heights` and
+    /// extends `cum_offsets` with `last + h`.
+    fn append_height(&mut self, h: usize) {
+        self.heights.push(h);
+        self.cum_offsets.push(self.total() + h);
+    }
+
+    /// Replace one block's height, shifting all subsequent cumulative offsets
+    /// by the delta. Integer bookkeeping only — no text re-wrapping of any
+    /// other block.
+    fn set_height(&mut self, idx: usize, h: usize) {
+        if idx >= self.heights.len() {
+            return;
+        }
+        let delta = h as isize - self.heights[idx] as isize;
+        self.heights[idx] = h;
+        if delta != 0 {
+            for off in &mut self.cum_offsets[idx + 1..] {
+                *off = off.wrapping_add_signed(delta);
+            }
+        }
+    }
+
+    /// Reset to the empty (never-built) state. Used by `TranscriptState::clear`.
+    fn reset(&mut self) {
+        self.generation = 0;
+        self.width = 0;
+        self.heights.clear();
+        self.cum_offsets.clear();
+        self.cum_offsets.push(0);
+    }
+
+    /// Re-sync the cached generation after an incremental maintenance step so
+    /// the cache stays valid across the mutation instead of being discarded.
+    fn sync_generation(&mut self, g: u64) {
+        self.generation = g;
     }
 }
 
@@ -132,6 +194,17 @@ pub(crate) struct TranscriptState {
     // ── Cache ──
     pub(crate) line_cache: BlockLineCache,
     pub(crate) last_visible_hits: Vec<LineAnswerHit>,
+    /// Width the line cache was last (re)built/maintained at. Event-time
+    /// incremental maintenance (`blocks_pushed`/`block_mutated_at`) measures
+    /// at this width so appended heights stay consistent with the cache; a
+    /// width change still invalidates via `is_valid` → full rebuild fallback.
+    pub(crate) last_width: u16,
+
+    /// child_session_id → index of that child's rolling activity block.
+    /// Lets `ChildSessionActivity` update one line in place instead of pushing
+    /// a new block per event (which forced O(transcript) cache rebuilds during
+    /// parallel subagent runs).
+    pub(crate) child_activity_blocks: HashMap<String, usize>,
 
     // ── Active question for answer routing ──
     pub(crate) _active_question: Option<InteractiveQuestionPayload>,
@@ -155,6 +228,8 @@ impl TranscriptState {
             transcript_drag_anchor: None,
             line_cache: BlockLineCache::new(),
             last_visible_hits: Vec::new(),
+            last_width: 0,
+            child_activity_blocks: HashMap::new(),
             _active_question: None,
             reasoning_started_at: None,
         }
@@ -175,6 +250,7 @@ impl TranscriptState {
                 if role == "user" {
                     self.streaming_assistant = None;
                     self.blocks.push(DisplayBlock::User(content.clone()));
+                    self.blocks_pushed();
                 } else if role == "assistant" {
                     self.streaming_assistant = None;
                     // Commit any accumulated reasoning before the assistant text.
@@ -190,8 +266,10 @@ impl TranscriptState {
                             expanded: false,
                             duration_ms,
                         });
+                        self.blocks_pushed();
                     }
                     self.blocks.push(DisplayBlock::Assistant(content.clone()));
+                    self.blocks_pushed();
                 }
             }
             AgentEvent::TokensStreamed { delta } => {
@@ -229,6 +307,7 @@ impl TranscriptState {
                     input: format_tool_input_for_display(tool, input),
                     streamed_output: String::new(),
                 });
+                self.blocks_pushed();
             }
             AgentEvent::ToolOutputChunk { call_id, delta } => {
                 if let Some(DisplayBlock::ToolRunning {
@@ -286,6 +365,7 @@ impl TranscriptState {
                         expanded: false,
                         duration_ms: *duration_ms,
                     };
+                    self.block_mutated_at(idx);
                 } else {
                     self.blocks.push(DisplayBlock::ToolDone {
                         name: "?".into(),
@@ -296,6 +376,7 @@ impl TranscriptState {
                         expanded: false,
                         duration_ms: *duration_ms,
                     });
+                    self.blocks_pushed();
                 }
             }
             AgentEvent::ApprovalRequested {
@@ -324,8 +405,10 @@ impl TranscriptState {
                     |b| matches!(b, DisplayBlock::ToolRunning { call_id: id, .. } if id == call_id),
                 ) {
                     self.blocks[idx] = DisplayBlock::ApprovalPending(req);
+                    self.block_mutated_at(idx);
                 } else {
                     self.blocks.push(DisplayBlock::ApprovalPending(req));
+                    self.blocks_pushed();
                 }
             }
             AgentEvent::ApprovalResolved {
@@ -349,15 +432,18 @@ impl TranscriptState {
                         tool,
                         approved: *approved,
                     };
+                    self.block_mutated_at(idx);
                 } else {
                     self.blocks.push(DisplayBlock::ApprovalResolved {
                         tool: "tool".into(),
                         approved: *approved,
                     });
+                    self.blocks_pushed();
                 }
             }
             AgentEvent::QuestionRequested { question } => {
                 self.blocks.push(DisplayBlock::Question(question.clone()));
+                self.blocks_pushed();
                 self.transcript_follow_tail = true;
             }
             AgentEvent::QuestionResolved {
@@ -367,9 +453,11 @@ impl TranscriptState {
                 self.blocks.push(DisplayBlock::System(format!(
                     "Answered question {question_id}: {selection:?}"
                 )));
+                self.blocks_pushed();
             }
             AgentEvent::Error { message } => {
                 self.blocks.push(DisplayBlock::ErrorLine(message.clone()));
+                self.blocks_pushed();
             }
             AgentEvent::ChildSessionSpawned {
                 child_session_id,
@@ -381,16 +469,42 @@ impl TranscriptState {
                     "Sub-agent {short}… — {}",
                     truncate(task, 80)
                 )));
+                let idx = self.blocks.len() - 1;
+                self.blocks_pushed();
+                self.child_activity_blocks
+                    .insert(child_session_id.clone(), idx);
             }
             AgentEvent::ChildSessionActivity {
                 child_session_id,
                 phase,
                 detail,
             } => {
+                // Aggregate into ONE rolling block per child instead of pushing
+                // a new block per activity event. Each pushed block used to
+                // invalidate the whole line-height cache (O(total transcript)
+                // re-wrap); with parallel subagents these events arrive in
+                // bursts and starved the Elm input poll.
                 let short = short_session_prefix(child_session_id);
                 let d = truncate(detail, 120);
-                self.blocks
-                    .push(DisplayBlock::System(format!("↳ {short}… · {phase} · {d}")));
+                let text = format!("↳ {short}… · {phase} · {d}");
+                let marker = format!("↳ {short}… ·");
+                if let Some(&idx) = self.child_activity_blocks.get(child_session_id)
+                    && idx < self.blocks.len()
+                    && matches!(&self.blocks[idx], DisplayBlock::System(s) if s.starts_with(&marker))
+                {
+                    // Still our rolling block → replace in place.
+                    self.blocks[idx] = DisplayBlock::System(text);
+                    self.block_mutated_at(idx);
+                } else {
+                    // First activity for this child (the map points at the
+                    // "Sub-agent …" spawn block) or the rolling block was
+                    // replaced → push a fresh one and (re)register it.
+                    self.blocks.push(DisplayBlock::System(text));
+                    let idx = self.blocks.len() - 1;
+                    self.blocks_pushed();
+                    self.child_activity_blocks
+                        .insert(child_session_id.clone(), idx);
+                }
             }
             AgentEvent::ChildSessionCompleted {
                 child_session_id,
@@ -401,11 +515,14 @@ impl TranscriptState {
                 self.blocks.push(DisplayBlock::System(format!(
                     "Sub-agent {short}… done: {status}"
                 )));
+                self.blocks_pushed();
+                self.child_activity_blocks.remove(child_session_id);
             }
             AgentEvent::TurnCompleted { duration_ms } => {
                 self.blocks.push(DisplayBlock::TurnInfo {
                     duration_ms: *duration_ms,
                 });
+                self.blocks_pushed();
             }
             AgentEvent::CostUpdated { .. }
             | AgentEvent::ContextStatsUpdated { .. }
@@ -416,11 +533,57 @@ impl TranscriptState {
             }
             _ => {}
         }
-        // Reaching here means the matched branch mutated `self.blocks` (the
-        // non-mutating branches early-return above), so invalidate the cached
-        // committed-block line heights.
-        self.blocks_generation = self.blocks_generation.wrapping_add(1);
+        // Every branch that mutates `self.blocks` maintains the line cache
+        // incrementally via `blocks_pushed`/`block_mutated_at` (which also bump
+        // the generation); non-mutating branches early-return above, and the
+        // catch-all does not touch `blocks`. Nothing left to do here.
         TranscriptAction::None
+    }
+
+    /// Maintain the line cache after appending a block to `self.blocks`.
+    ///
+    /// Call immediately after EVERY `self.blocks.push(...)`. If the cache was
+    /// valid for the pre-push block count at `last_width`, the new block's
+    /// height is measured once and appended — no full rebuild. Either way the
+    /// blocks generation advances; an invalid or stale cache simply stays
+    /// invalid and falls back to the lazy full rebuild at next render (the
+    /// pre-existing behavior).
+    fn blocks_pushed(&mut self) {
+        // Pre-push block count (this runs after the push).
+        let was_valid = self.line_cache.is_valid(
+            self.blocks_generation,
+            self.last_width,
+            self.blocks.len() - 1,
+        );
+        if was_valid && let Some(block) = self.blocks.last() {
+            let h = block_line_count(block, self.last_width as usize);
+            self.line_cache.append_height(h);
+        }
+        self.blocks_generation = self.blocks_generation.wrapping_add(1);
+        if was_valid {
+            self.line_cache.sync_generation(self.blocks_generation);
+        }
+    }
+
+    /// Maintain the line cache after an in-place mutation of `blocks[idx]`.
+    ///
+    /// Call immediately after EVERY in-place replacement/mutation of a single
+    /// block. When the cache is valid for the current block count, only that
+    /// block's height is re-measured and subsequent cumulative offsets are
+    /// shifted by the delta — integer ops, no re-wrapping of other blocks.
+    /// Otherwise just bump the generation (lazy full rebuild at next render).
+    fn block_mutated_at(&mut self, idx: usize) {
+        let valid =
+            self.line_cache
+                .is_valid(self.blocks_generation, self.last_width, self.blocks.len());
+        if valid && idx < self.blocks.len() {
+            let h = block_line_count(&self.blocks[idx], self.last_width as usize);
+            self.line_cache.set_height(idx, h);
+        }
+        self.blocks_generation = self.blocks_generation.wrapping_add(1);
+        if valid {
+            self.line_cache.sync_generation(self.blocks_generation);
+        }
     }
 
     fn flush_stream_before_tool(&mut self) {
@@ -436,27 +599,31 @@ impl TranscriptState {
                 expanded: false,
                 duration_ms,
             });
+            self.blocks_pushed();
         }
         if let Some(s) = self.streaming_assistant.take()
             && !s.trim().is_empty()
         {
             self.blocks.push(DisplayBlock::Assistant(s));
+            self.blocks_pushed();
         }
     }
 
     pub(crate) fn push_error(&mut self, msg: String) {
         self.blocks.push(DisplayBlock::ErrorLine(msg));
-        self.blocks_generation = self.blocks_generation.wrapping_add(1);
+        self.blocks_pushed();
     }
 
     pub(crate) fn push_system(&mut self, msg: String) {
         self.blocks.push(DisplayBlock::System(msg));
-        self.blocks_generation = self.blocks_generation.wrapping_add(1);
+        self.blocks_pushed();
     }
 
     pub(crate) fn push_blocks(&mut self, blocks: Vec<DisplayBlock>) {
-        self.blocks.extend(blocks);
-        self.blocks_generation = self.blocks_generation.wrapping_add(1);
+        for block in blocks {
+            self.blocks.push(block);
+            self.blocks_pushed();
+        }
     }
 
     pub(crate) fn set_streaming_assistant(&mut self, text: Option<String>) {
@@ -477,6 +644,8 @@ impl TranscriptState {
         self.transcript_selection = None;
         self.transcript_dragging = false;
         self.transcript_drag_anchor = None;
+        self.child_activity_blocks.clear();
+        self.line_cache.reset();
         self.blocks_generation = self.blocks_generation.wrapping_add(1);
     }
 
@@ -500,9 +669,15 @@ impl TranscriptState {
 
     /// Toggle expanded state of a specific ToolDone block.
     pub(crate) fn toggle_tool_output(&mut self, block_index: usize) {
-        if let Some(DisplayBlock::ToolDone { expanded, .. }) = self.blocks.get_mut(block_index) {
-            *expanded = !*expanded;
-            self.blocks_generation = self.blocks_generation.wrapping_add(1);
+        let toggled = match self.blocks.get_mut(block_index) {
+            Some(DisplayBlock::ToolDone { expanded, .. }) => {
+                *expanded = !*expanded;
+                true
+            }
+            _ => false,
+        };
+        if toggled {
+            self.block_mutated_at(block_index);
         }
     }
 
@@ -517,10 +692,15 @@ impl TranscriptState {
                 }
             )
         });
-        for block in self.blocks.iter_mut() {
+        let mut mutated: Vec<usize> = Vec::new();
+        for (i, block) in self.blocks.iter_mut().enumerate() {
             if let DisplayBlock::ToolDone { expanded, .. } = block {
                 *expanded = any_collapsed;
+                mutated.push(i);
             }
+        }
+        for idx in mutated {
+            self.block_mutated_at(idx);
         }
         let msg = if any_collapsed {
             "tool output expanded"
@@ -529,7 +709,7 @@ impl TranscriptState {
         };
         self.blocks
             .push(DisplayBlock::System(format!("[tool-output] {msg}")));
-        self.blocks_generation = self.blocks_generation.wrapping_add(1);
+        self.blocks_pushed();
     }
 
     // ── Key handling ─────────────────────────────────────────────
@@ -611,11 +791,15 @@ impl TranscriptState {
                 if local_idx < self.last_visible_hits.len() {
                     match &self.last_visible_hits[local_idx] {
                         Some(TranscriptHit::ToggleThinking(block_idx)) => {
-                            if let Some(DisplayBlock::Thinking { expanded, .. }) =
-                                self.blocks.get_mut(*block_idx)
-                            {
-                                *expanded = !*expanded;
-                                self.blocks_generation = self.blocks_generation.wrapping_add(1);
+                            let toggled = match self.blocks.get_mut(*block_idx) {
+                                Some(DisplayBlock::Thinking { expanded, .. }) => {
+                                    *expanded = !*expanded;
+                                    true
+                                }
+                                _ => false,
+                            };
+                            if toggled {
+                                self.block_mutated_at(*block_idx);
                             }
                             self.transcript_selection = None;
                             self.transcript_dragging = false;
@@ -628,11 +812,15 @@ impl TranscriptState {
                             return TranscriptAction::None;
                         }
                         Some(TranscriptHit::ToggleToolOutput(block_idx)) => {
-                            if let Some(DisplayBlock::ToolDone { expanded, .. }) =
-                                self.blocks.get_mut(*block_idx)
-                            {
-                                *expanded = !*expanded;
-                                self.blocks_generation = self.blocks_generation.wrapping_add(1);
+                            let toggled = match self.blocks.get_mut(*block_idx) {
+                                Some(DisplayBlock::ToolDone { expanded, .. }) => {
+                                    *expanded = !*expanded;
+                                    true
+                                }
+                                _ => false,
+                            };
+                            if toggled {
+                                self.block_mutated_at(*block_idx);
                             }
                             self.transcript_selection = None;
                             self.transcript_dragging = false;
@@ -767,8 +955,12 @@ impl TranscriptState {
     }
 
     pub(crate) fn total_line_count(&mut self, width: u16) -> usize {
+        self.last_width = width;
         let w = width.max(20) as usize;
-        let mut n = if self.line_cache.is_valid(self.blocks_generation, width) {
+        let mut n = if self
+            .line_cache
+            .is_valid(self.blocks_generation, width, self.blocks.len())
+        {
             self.line_cache.total()
         } else {
             self.line_cache
@@ -797,9 +989,13 @@ impl TranscriptState {
         width: u16,
         area_height: usize,
     ) -> (Vec<Line<'static>>, Vec<LineAnswerHit>) {
+        self.last_width = width;
         let w = width.max(20) as usize;
         // Ensure cache is up to date.
-        if !self.line_cache.is_valid(self.blocks_generation, width) {
+        if !self
+            .line_cache
+            .is_valid(self.blocks_generation, width, self.blocks.len())
+        {
             self.line_cache
                 .rebuild(&self.blocks, self.blocks_generation, width);
         }
