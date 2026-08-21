@@ -71,10 +71,9 @@ pub(crate) struct BlockLineCache {
     heights: Vec<usize>,
     /// `cum_offsets[i]` = total lines of blocks[0..i].  Length = heights.len() + 1.
     cum_offsets: Vec<usize>,
-    /// Count of full `rebuild()` calls (test-only metric; upcoming
+    /// Count of full `rebuild()` calls (test-only metric; the
     /// incremental-cache invariant tests pin "no rebuild" behavior with it).
     #[cfg(test)]
-    #[allow(dead_code)] // read by future invariant tests, not by production code
     rebuild_count: u32,
 }
 
