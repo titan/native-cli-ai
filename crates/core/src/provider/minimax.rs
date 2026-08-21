@@ -116,11 +116,14 @@ impl Provider for MiniMaxProvider {
             model.to_string()
         };
 
+        // Chat-only capability clamp; MiniMaxProvider has no keepalive path.
+        let max_tokens = nca_common::model_limits::clamp_max_tokens(&model, self.max_tokens);
+
         let body = anthropic_request_body(
             messages,
             tools,
             &model,
-            self.max_tokens,
+            max_tokens,
             // Anthropic requires temperature=1 when extended thinking is active.
             // MiniMax-M2.5 is a reasoning model; using 1.0 avoids API errors.
             1.0,

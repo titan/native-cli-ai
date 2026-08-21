@@ -72,11 +72,15 @@ impl Provider for AnthropicProvider {
             model.to_string()
         };
 
+        // Capability-aware clamp on the final model string (chat only —
+        // keepalive_ping below keeps its hardcoded max_tokens = 1).
+        let max_tokens = nca_common::model_limits::clamp_max_tokens(&model, self.max_tokens);
+
         let body = anthropic_request_body(
             messages,
             tools,
             &model,
-            self.max_tokens,
+            max_tokens,
             self.config.temperature,
             workspace_root,
         )?;
@@ -116,6 +120,8 @@ impl Provider for AnthropicProvider {
         &self,
         snapshot: &KeepaliveSnapshot,
     ) -> Result<PingUsage, ProviderError> {
+        // Deliberately NOT clamped: the capability clamp would raise this to
+        // the 128K floor, billing a full completion just to refresh the cache.
         let body = anthropic_request_body(
             &snapshot.messages,
             &snapshot.tools,

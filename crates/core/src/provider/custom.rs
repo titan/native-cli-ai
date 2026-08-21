@@ -109,13 +109,17 @@ impl Provider for CustomProvider {
             model.to_string()
         };
 
+        // Chat-only capability clamp shared by both compat arms;
+        // CustomProvider has no keepalive path.
+        let max_tokens = nca_common::model_limits::clamp_max_tokens(&model, self.max_tokens);
+
         match self.config.compatibility {
             ProviderCompatibility::OpenAi => {
                 let body = openai_request_body(
                     messages,
                     tools,
                     &model,
-                    self.max_tokens,
+                    max_tokens,
                     self.config.temperature,
                     workspace_root,
                 )?;
@@ -141,7 +145,7 @@ impl Provider for CustomProvider {
                     messages,
                     tools,
                     &model,
-                    self.max_tokens,
+                    max_tokens,
                     self.config.temperature,
                     workspace_root,
                 )?;

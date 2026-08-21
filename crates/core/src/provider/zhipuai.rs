@@ -131,7 +131,7 @@ mod tests {
         // enable_thinking defaults to false: a model that accepts
         // "disabled" must get it on the wire so the GLM server does not
         // apply its own default (thinking ON, which truncates mid-reasoning
-        // under the 8192 default max_tokens).
+        // under small max_tokens values).
         let body = concat!(
             "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"index\":0,\"finish_reason\":null}]}\n\n",
             "data: {\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}]}\n\n",
@@ -147,8 +147,12 @@ mod tests {
                 serde_json::json!({ "type": "disabled" }),
                 "body: {request_body}"
             );
-            // Thinking off + not thinking-locked: configured value stands.
-            assert_eq!(parsed["max_tokens"], 8_192, "body: {request_body}");
+            // Policy layering: the factory's thinking floor leaves 8192
+            // untouched (thinking off, glm-5.2 not thinking-locked), but the
+            // capability clamp in chat() raises it anyway — glm-5.2's output
+            // window is 128K, so the 128K-class floor applies regardless of
+            // the thinking toggle.
+            assert_eq!(parsed["max_tokens"], 131_072, "body: {request_body}");
             assert_eq!(parsed["model"], "glm-5.2", "body: {request_body}");
         });
 
@@ -300,6 +304,47 @@ mod tests {
         // Adversarial: a globally-enabled thinking flag must not leak a
         // `thinking` key into non-ZhipuAI providers.
         config.model.enable_thinking = true;
+
+        let provider =
+            build_provider_for(&config, ProviderKind::OpenAi).expect("build openai provider");
+        let stream = provider
+            .chat(
+                &[Message::user("hello")],
+                &[],
+                "", // fall back to the provider's configured model
+                std::path::Path::new("."),
+            )
+            .await
+            .expect("chat stream");
+
+        let chunks = collect_chunks(stream).await;
+        assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
+    }
+
+    #[tokio::test]
+    async fn openai_wire_caps_max_tokens_to_model_output_window() {
+        // Protective cap end-to-end: gpt-4o's output window is 16384, so a
+        // configured 131072 must be clamped down before it reaches the wire
+        // (the OpenAI API rejects oversize max_tokens with a hard 400).
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"index\":0,\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .to_string();
+        let base_url = spawn_sse_server_with_body(body, 200, |request, request_body| {
+            assert_eq!(request.url(), "/v1/chat/completions");
+            let parsed: serde_json::Value =
+                serde_json::from_str(request_body).expect("request body is JSON");
+            assert_eq!(parsed["model"], "gpt-4o", "body: {request_body}");
+            assert_eq!(parsed["max_tokens"], 16_384, "body: {request_body}");
+        });
+
+        let mut config = NcaConfig::default();
+        config.provider.openai.api_key = Some("openai-test-key".into());
+        config.provider.openai.base_url = base_url;
+        config.provider.openai.model = "gpt-4o".into();
+        config.model.max_tokens = 131_072;
 
         let provider =
             build_provider_for(&config, ProviderKind::OpenAi).expect("build openai provider");

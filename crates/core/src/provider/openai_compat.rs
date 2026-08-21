@@ -612,11 +612,16 @@ impl Provider for OpenAiCompatProvider {
             model.to_string()
         };
 
+        // Capability-aware clamp on the final model string: raise 128K-class
+        // models to the floor, protect smaller output windows from oversize
+        // values (hard 400s). keepalive_ping bypasses this (max_tokens = 1).
+        let max_tokens = nca_common::model_limits::clamp_max_tokens(&model, self.max_tokens);
+
         let mut body = openai_request_body(
             messages,
             tools,
             &model,
-            self.max_tokens,
+            max_tokens,
             self.temperature,
             workspace_root,
         )?;
@@ -668,6 +673,8 @@ impl Provider for OpenAiCompatProvider {
     ) -> Result<PingUsage, ProviderError> {
         // Build the request with max_tokens=1 to minimise output cost.
         // The input prefix is what we're paying for — it refreshes the cache.
+        // Deliberately NOT clamped: the capability clamp would raise this to
+        // the 128K floor, billing a full completion just to refresh the cache.
         let mut body = openai_request_body(
             &snapshot.messages,
             &snapshot.tools,

@@ -79,11 +79,15 @@ impl Provider for KimiProvider {
             model.to_string()
         };
 
+        // Chat-only capability clamp on the final model string; KimiProvider
+        // has no keepalive path. Default model "k3" floors to 131072.
+        let max_tokens = nca_common::model_limits::clamp_max_tokens(&model, self.max_tokens);
+
         let body = anthropic_request_body(
             messages,
             tools,
             &model,
-            self.max_tokens,
+            max_tokens,
             self.config.temperature,
             workspace_root,
         )?;
