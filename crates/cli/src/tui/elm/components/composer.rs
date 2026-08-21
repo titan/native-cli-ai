@@ -1,5 +1,6 @@
 //! Composer component — multi-line text input with cursor, history, slash commands, and @-mentions.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -14,6 +15,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::file_mentions;
 use crate::slash_commands::SLASH_COMMANDS;
 use crate::tui::app::TuiCmd;
+use crate::tui::text_utils::strip_sgr_mouse_residue;
 
 use super::super::msg::Msg;
 
@@ -738,6 +740,16 @@ impl ComposerState {
             cs.insert(idx, c);
             self.input_buffer = cs.into_iter().collect();
             self.cursor_char_idx += 1;
+            // SGR-1006 mouse-tracking residue: after an escape-sequence desync,
+            // crossterm delivers the mouse-report bytes as plain Char keys.
+            // Strip completed sequences and pull the cursor back so it stays
+            // within the shrunken buffer.
+            let before_chars = self.input_buffer.chars().count();
+            if let Cow::Owned(clean) = strip_sgr_mouse_residue(&self.input_buffer) {
+                let n = before_chars - clean.chars().count();
+                self.input_buffer = clean;
+                self.cursor_char_idx = self.cursor_char_idx.saturating_sub(n);
+            }
             if slash_panel_visible(&self.input_buffer) {
                 let f = filter_slash_entries(&self.slash_entries, &self.input_buffer);
                 if !f.is_empty() {
@@ -752,6 +764,10 @@ impl ComposerState {
     /// Handle pasted text.
     pub(crate) fn handle_paste(&mut self, text: &str) {
         self.history_reset();
+        // Strip mouse-tracking residue before insertion so neither the buffer
+        // nor the cursor advance counts desynced SGR bytes.
+        let cleaned = strip_sgr_mouse_residue(text);
+        let text: &str = cleaned.as_ref();
         let idx = self.cursor_char_idx;
         let paste_chars: Vec<char> = text.chars().collect();
         let mut cs: Vec<char> = self.input_buffer.chars().collect();

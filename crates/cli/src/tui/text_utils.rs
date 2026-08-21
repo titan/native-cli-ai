@@ -1,5 +1,7 @@
 //! Shared text formatting utilities used across TUI components.
 
+use std::borrow::Cow;
+
 use serde_json::Value;
 
 /// Truncate a string to at most `max` characters (Unicode-aware), trimming whitespace.
@@ -19,6 +21,75 @@ pub fn truncate(s: &str, max: usize) -> String {
 /// Return the first 8 characters of a session id (or the full id if shorter).
 pub(crate) fn short_session_prefix(id: &str) -> &str {
     if id.len() > 8 { &id[..8] } else { id }
+}
+
+/// Remove SGR-1006 mouse-tracking residue (`[<btn;col;rowM` / `...m`) that
+/// leaks into the input buffer as plain chars after an escape-sequence
+/// desync (the terminal's mouse-report bytes overflow the tty input queue,
+/// crossterm fails to re-sync on the partial sequence, and downgrades the
+/// remaining bytes to plain `Char` key events). Handles multiple occurrences,
+/// including back-to-back ones. Incomplete trailing fragments (e.g. `[<35;72;2`)
+/// are deliberately left in place — they are stripped on a later call once the
+/// terminating `M`/`m` byte arrives.
+///
+/// Returns a borrowed `Cow` when nothing was stripped (the overwhelmingly
+/// common case), so the per-keystroke call site avoids an allocation.
+pub(crate) fn strip_sgr_mouse_residue(s: &str) -> Cow<'_, str> {
+    let bytes = s.as_bytes();
+    // Lazily-built output; `copied_upto` tracks how much of `s` has already
+    // been pushed into it (everything before the last stripped match).
+    let mut out: Option<String> = None;
+    let mut copied_upto = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(end) = match_sgr_residue_at(bytes, i) {
+            let out = out.get_or_insert_with(|| String::with_capacity(s.len()));
+            out.push_str(&s[copied_upto..i]);
+            copied_upto = end;
+            i = end;
+        } else {
+            // Byte-wise advance is safe: match positions always start at an
+            // ASCII `[`, and multi-byte UTF-8 sequences never contain it.
+            i += 1;
+        }
+    }
+    match out {
+        Some(mut out) => {
+            out.push_str(&s[copied_upto..]);
+            Cow::Owned(out)
+        }
+        None => Cow::Borrowed(s),
+    }
+}
+
+/// Match an SGR-1006 mouse residue sequence starting at byte `i`:
+/// literal `[<`, then three groups of 1-3 ASCII digits separated by `;`,
+/// terminated by `M` (press) or `m` (release). Returns the exclusive end
+/// byte index of the match, or `None`.
+fn match_sgr_residue_at(bytes: &[u8], i: usize) -> Option<usize> {
+    if bytes.get(i).copied() != Some(b'[') || bytes.get(i + 1).copied() != Some(b'<') {
+        return None;
+    }
+    let mut j = i + 2;
+    for group in 0..3 {
+        let start = j;
+        while j - start < 3 && bytes.get(j).is_some_and(|b| b.is_ascii_digit()) {
+            j += 1;
+        }
+        if j == start {
+            return None; // each group needs at least one digit
+        }
+        if group < 2 && bytes.get(j).copied() != Some(b';') {
+            return None;
+        }
+        if group < 2 {
+            j += 1; // consume the `;`
+        }
+    }
+    match bytes.get(j).copied() {
+        Some(b'M') | Some(b'm') => Some(j + 1),
+        _ => None,
+    }
 }
 
 /// Format tool input for display in the transcript.
