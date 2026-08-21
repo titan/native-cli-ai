@@ -129,3 +129,44 @@ fn format_tool_input(value: &Value) -> String {
     }
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::borrow::Cow;
+
+    #[test]
+    fn strip_sgr_mouse_residue_table() {
+        // Each case: (input, expected output).
+        let cases: &[(&str, &str)] = &[
+            // Full press/release sequences are stripped completely.
+            ("[<35;72;23M", ""),
+            ("[<0;1;1M[<0;1;1m", ""),
+            // Residue embedded in real text is removed, surrounding text kept.
+            ("keep[<35;72;23Mthis", "keepthis"),
+            // Incomplete trailing fragment is deliberately left in place —
+            // it is stripped on a later call once the terminating M/m arrives.
+            ("partial[<35;72;2", "partial[<35;72;2"),
+            ("[<0;0;0M", ""),
+            // A 4-digit group is NOT an SGR-1006 sequence → left unchanged.
+            ("[<1234;1;1M stays", "[<1234;1;1M stays"),
+            // Clean input round-trips unchanged.
+            ("clean input", "clean input"),
+        ];
+        for (input, expected) in cases {
+            let out = strip_sgr_mouse_residue(input);
+            assert_eq!(
+                out.as_ref(),
+                *expected,
+                "input: {input:?} expected: {expected:?}"
+            );
+        }
+
+        // Borrowing discipline: clean input is returned borrowed (no
+        // allocation on the per-keystroke hot path), stripped input is owned.
+        let borrowed = strip_sgr_mouse_residue("clean input");
+        assert!(matches!(borrowed, Cow::Borrowed(_)));
+        let owned = strip_sgr_mouse_residue("[<35;72;23M");
+        assert!(matches!(owned, Cow::Owned(_)));
+    }
+}

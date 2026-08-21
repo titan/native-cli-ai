@@ -1035,3 +1035,91 @@ impl Components {
         self.composer.state_mut()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    fn test_model() -> (NcaModel, mpsc::UnboundedSender<TuiFeedbackMsg>) {
+        let (bridge_tx, bridge_rx) = mpsc::unbounded_channel::<TuiFeedbackMsg>();
+        let (_cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<Msg>();
+        let side_effects = SideEffectChannels {
+            question_answer_tx: None,
+            approval_answer_tx: None,
+            cancel_flag: None,
+            active_question_id: Arc::new(StdMutex::new(None)),
+            active_question_payload: Arc::new(StdMutex::new(None)),
+            active_approval_payload: Arc::new(StdMutex::new(None)),
+            staged_images: Arc::new(StdMutex::new(Vec::new())),
+        };
+        let model = NcaModel::new(bridge_rx, _cmd_tx, side_effects);
+        (model, bridge_tx)
+    }
+
+    fn assistant_msg(content: &str) -> TuiFeedbackMsg {
+        TuiFeedbackMsg::Agent(AgentEvent::MessageReceived {
+            role: "assistant".into(),
+            content: content.into(),
+        })
+    }
+
+    // The bridge drain must be bounded: during parallel subagent runs the
+    // bridge bursts hundreds of events at once, and an unbounded drain starves
+    // the 40ms crossterm input poll, letting SGR-1006 mouse bytes desync and
+    // leak into the composer as garbage chars. `BRIDGE_DRAIN_BUDGET` caps how
+    // many feedback messages one `drain_bridge()` may process per tick.
+    #[test]
+    fn drain_bridge_respects_budget() {
+        let (mut model, bridge_tx) = test_model();
+        for _ in 0..200 {
+            bridge_tx.send(assistant_msg("m")).expect("bridge send");
+        }
+
+        model.drain_bridge();
+        assert_eq!(
+            model.components.transcript.blocks.len(),
+            BRIDGE_DRAIN_BUDGET,
+            "one drain must consume exactly the budget"
+        );
+
+        model.drain_bridge();
+        assert_eq!(
+            model.components.transcript.blocks.len(),
+            BRIDGE_DRAIN_BUDGET * 2,
+            "a second drain must consume the next budget slice"
+        );
+
+        // Repeated drains eventually consume everything…
+        while model.components.transcript.blocks.len() < 200 {
+            model.drain_bridge();
+        }
+        assert_eq!(model.components.transcript.blocks.len(), 200);
+
+        // …and a further drain on an empty channel is a no-op.
+        model.drain_bridge();
+        assert_eq!(model.components.transcript.blocks.len(), 200);
+    }
+
+    #[test]
+    fn drain_bridge_empties_small_burst() {
+        let (mut model, bridge_tx) = test_model();
+        for _ in 0..10 {
+            bridge_tx.send(assistant_msg("m")).expect("bridge send");
+        }
+
+        model.drain_bridge();
+        assert_eq!(
+            model.components.transcript.blocks.len(),
+            10,
+            "a small burst fits in one drain"
+        );
+
+        model.drain_bridge();
+        assert_eq!(
+            model.components.transcript.blocks.len(),
+            10,
+            "draining an empty bridge must not mutate state"
+        );
+    }
+}

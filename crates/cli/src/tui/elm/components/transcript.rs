@@ -1334,4 +1334,275 @@ mod tests {
             "committed block changes must still invalidate the cache"
         );
     }
+
+    // ── Incremental line-cache maintenance ─────────────────────
+    // `blocks_pushed`/`block_mutated_at` maintain the BlockLineCache one
+    // block at a time (append/replace a single measured height) instead of
+    // forcing the O(total transcript text) full rebuild on every mutation.
+    // These tests pin the invariant that routine transcript growth and
+    // in-place mutations stay fully incremental, that width changes still
+    // rebuild, and that incremental totals agree with a fresh full rebuild.
+
+    fn spawn_child(t: &mut TranscriptState, id: &str) {
+        t.apply_event(&AgentEvent::ChildSessionSpawned {
+            parent_session_id: "parent".into(),
+            child_session_id: id.into(),
+            task: "some task".into(),
+            workspace: std::path::PathBuf::from("/tmp"),
+            branch: None,
+        });
+    }
+
+    fn system_blocks(t: &TranscriptState) -> Vec<&DisplayBlock> {
+        t.blocks
+            .iter()
+            .filter(|b| matches!(b, DisplayBlock::System(_)))
+            .collect()
+    }
+
+    #[test]
+    fn block_pushes_append_cache_without_full_rebuild() {
+        let mut t = TranscriptState::new();
+        t.apply_event(&AgentEvent::MessageReceived {
+            role: "assistant".into(),
+            content: "hello world".into(),
+        });
+        let total_first = t.total_line_count(78);
+        let rebuilt = t.line_cache.rebuild_count;
+        assert_eq!(
+            rebuilt, 1,
+            "first measure must build the cache exactly once"
+        );
+
+        for i in 0..5 {
+            t.apply_event(&AgentEvent::MessageReceived {
+                role: "assistant".into(),
+                content: format!("follow-up message {i}"),
+            });
+        }
+        let total_after = t.total_line_count(78);
+        assert_eq!(
+            t.line_cache.rebuild_count, rebuilt,
+            "appended blocks must not trigger a full cache rebuild"
+        );
+        assert!(
+            total_after > total_first,
+            "new blocks must actually add lines"
+        );
+
+        // Correctness cross-check: a fresh state fed the same events (which
+        // builds the cache through the full-rebuild path) must report the
+        // identical total — proving incremental maintenance tracks the same
+        // heights as a from-scratch measurement.
+        let mut fresh = TranscriptState::new();
+        fresh.apply_event(&AgentEvent::MessageReceived {
+            role: "assistant".into(),
+            content: "hello world".into(),
+        });
+        for i in 0..5 {
+            fresh.apply_event(&AgentEvent::MessageReceived {
+                role: "assistant".into(),
+                content: format!("follow-up message {i}"),
+            });
+        }
+        assert_eq!(
+            fresh.total_line_count(78),
+            total_after,
+            "incrementally maintained cache must agree with a fresh full rebuild"
+        );
+    }
+
+    #[test]
+    fn in_place_mutations_use_targeted_cache_update() {
+        let mut t = TranscriptState::new();
+        t.apply_event(&AgentEvent::ToolCallStarted {
+            call_id: "call-1".into(),
+            tool: "bash".into(),
+            input: serde_json::json!({ "command": "true" }),
+        });
+        t.total_line_count(78);
+        let rebuilt = t.line_cache.rebuild_count;
+
+        // ToolRunning → ToolDone is an in-place replacement of one block.
+        t.apply_event(&AgentEvent::ToolCallCompleted {
+            call_id: "call-1".into(),
+            output: ToolResult {
+                call_id: "call-1".into(),
+                success: true,
+                output: "line1\nline2\nline3\nline4".into(),
+                error: None,
+            },
+            duration_ms: 5,
+        });
+        let total_collapsed = t.total_line_count(78);
+        assert_eq!(
+            t.line_cache.rebuild_count, rebuilt,
+            "ToolRunning → ToolDone swap must not rebuild the cache"
+        );
+
+        // Expanding the ToolDone block is also a single-block mutation.
+        let idx = t
+            .blocks
+            .iter()
+            .position(|b| matches!(b, DisplayBlock::ToolDone { .. }))
+            .expect("ToolCallCompleted must produce a ToolDone block");
+        t.toggle_tool_output(idx);
+        let total_expanded = t.total_line_count(78);
+        assert_eq!(
+            t.line_cache.rebuild_count, rebuilt,
+            "toggle_tool_output must not rebuild the cache"
+        );
+        assert!(
+            total_expanded > total_collapsed,
+            "expanding the tool output must add lines"
+        );
+    }
+
+    #[test]
+    fn width_change_still_full_rebuilds() {
+        let mut t = TranscriptState::new();
+        t.apply_event(&AgentEvent::MessageReceived {
+            role: "assistant".into(),
+            content: "hello world".into(),
+        });
+        t.total_line_count(78);
+        let rebuilt = t.line_cache.rebuild_count;
+
+        t.total_line_count(40);
+        assert_eq!(
+            t.line_cache.rebuild_count,
+            rebuilt + 1,
+            "a width change invalidates the cache and must force a full rebuild"
+        );
+    }
+
+    #[test]
+    fn child_activity_burst_rolls_into_single_block() {
+        let mut t = TranscriptState::new();
+        spawn_child(&mut t, "child-a-0001");
+
+        for (i, phase) in ["plan", "read", "edit", "validate", "commit"]
+            .iter()
+            .enumerate()
+        {
+            t.apply_event(&AgentEvent::ChildSessionActivity {
+                child_session_id: "child-a-0001".into(),
+                phase: (*phase).into(),
+                detail: format!("detail {i}"),
+            });
+        }
+        let systems = system_blocks(&t);
+        assert_eq!(
+            systems.len(),
+            2,
+            "spawn banner + ONE rolling activity block"
+        );
+        assert!(
+            matches!(systems[1], DisplayBlock::System(s) if s.contains("commit")),
+            "rolling block must show the latest phase"
+        );
+
+        // More activities for the same child keep rolling in place.
+        for i in 0..3 {
+            t.apply_event(&AgentEvent::ChildSessionActivity {
+                child_session_id: "child-a-0001".into(),
+                phase: format!("phase-{i}"),
+                detail: "more".into(),
+            });
+        }
+        let systems = system_blocks(&t);
+        assert_eq!(
+            systems.len(),
+            2,
+            "later activities must keep rolling into the single block"
+        );
+        assert!(
+            matches!(systems[1], DisplayBlock::System(s) if s.contains("phase-2")),
+            "rolling block must be updated to the newest phase"
+        );
+        assert_eq!(
+            t.child_activity_blocks.get("child-a-0001"),
+            Some(&1usize),
+            "map must keep pointing at the rolling block"
+        );
+    }
+
+    #[test]
+    fn distinct_children_roll_into_distinct_blocks() {
+        let mut t = TranscriptState::new();
+        spawn_child(&mut t, "child-a-0001");
+        spawn_child(&mut t, "child-b-0002");
+
+        // Interleave activities for the two children.
+        for (phase_a, phase_b) in [("a-1", "b-1"), ("a-2", "b-2")] {
+            t.apply_event(&AgentEvent::ChildSessionActivity {
+                child_session_id: "child-a-0001".into(),
+                phase: phase_a.into(),
+                detail: String::new(),
+            });
+            t.apply_event(&AgentEvent::ChildSessionActivity {
+                child_session_id: "child-b-0002".into(),
+                phase: phase_b.into(),
+                detail: String::new(),
+            });
+        }
+
+        let systems = system_blocks(&t);
+        assert_eq!(
+            systems.len(),
+            4,
+            "2 spawn banners + one rolling block per child"
+        );
+        let a_last = systems
+            .iter()
+            .filter(|b| matches!(b, DisplayBlock::System(s) if s.contains("a-2")))
+            .count();
+        let b_last = systems
+            .iter()
+            .filter(|b| matches!(b, DisplayBlock::System(s) if s.contains("b-2")))
+            .count();
+        assert_eq!(
+            a_last, 1,
+            "child A's last phase appears in exactly one block"
+        );
+        assert_eq!(
+            b_last, 1,
+            "child B's last phase appears in exactly one block"
+        );
+        assert_eq!(t.child_activity_blocks.len(), 2);
+        assert_ne!(
+            t.child_activity_blocks["child-a-0001"], t.child_activity_blocks["child-b-0002"],
+            "each child must have its own rolling block index"
+        );
+    }
+
+    #[test]
+    fn child_activity_burst_no_cache_rebuild() {
+        let mut t = TranscriptState::new();
+        t.apply_event(&AgentEvent::MessageReceived {
+            role: "assistant".into(),
+            content: "seed".into(),
+        });
+        spawn_child(&mut t, "child-a-0001");
+        t.total_line_count(78);
+        let rebuilt = t.line_cache.rebuild_count;
+
+        for i in 0..10 {
+            t.apply_event(&AgentEvent::ChildSessionActivity {
+                child_session_id: "child-a-0001".into(),
+                phase: format!("phase-{i}"),
+                detail: format!("detail {i}"),
+            });
+        }
+        t.total_line_count(78);
+        assert_eq!(
+            t.line_cache.rebuild_count, rebuilt,
+            "a same-child activity burst must stay fully incremental"
+        );
+        assert_eq!(
+            t.blocks.len(),
+            3,
+            "seed message + spawn banner + one rolling block"
+        );
+    }
 }

@@ -1102,4 +1102,32 @@ mod tests {
         assert!(msg.is_none());
         assert_eq!(s.input_buffer, "hello world");
     }
+
+    #[test]
+    fn char_stream_sgr_residue_never_reaches_buffer() {
+        // Regression: after an SGR-1006 escape-sequence desync, crossterm
+        // downgrades mouse-report bytes to plain Char key events. Each
+        // completed sequence must be stripped the moment its terminating M
+        // byte arrives, leaving the buffer and cursor exactly as if the
+        // residue never existed.
+        let mut s = ComposerState::default();
+        for c in "[<35;72;23M".chars() {
+            s.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(
+            s.input_buffer, "",
+            "residue must never persist in the buffer"
+        );
+        assert_eq!(
+            s.cursor_char_idx, 0,
+            "cursor must be pulled back with the stripped chars"
+        );
+
+        // Normal typing still works after residue stripping.
+        for c in "hello".chars() {
+            s.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(s.input_buffer, "hello");
+        assert_eq!(s.cursor_char_idx, 5);
+    }
 }
