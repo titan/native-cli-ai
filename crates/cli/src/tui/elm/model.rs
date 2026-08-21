@@ -27,6 +27,20 @@ use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
 
+// ── Tick drain budget ───────────────────────────────────────────
+
+/// Maximum number of feedback messages drained per `tick` into the Elm model.
+///
+/// The drain must be bounded: during parallel subagent runs the bridge bursts
+/// hundreds of child-session events at once, and an unbounded drain starves
+/// the 40ms crossterm input poll in step 1 of `tick`. A starved input poll
+/// freezes the TUI while mouse SGR-1006 bytes pile up in the ~4KB tty input
+/// queue; once that queue overflows the escape sequences desync and crossterm
+/// downgrades the leftover bytes to plain `Char` keys, which the focused
+/// composer inserts as garbage like `[<35;72;23M`. 48 messages per tick is a
+/// ~1200 msg/s ceiling at the 40ms tick cadence — far above real UI needs.
+const BRIDGE_DRAIN_BUDGET: usize = 48;
+
 // ── Side-effect channels ─────────────────────────────────────────
 
 /// External channels for side-effects from the TUI to the runtime.
@@ -132,10 +146,8 @@ impl NcaModel {
             }
         }
 
-        // 2. Drain bridge events (non-blocking)
-        while let Ok(msg) = self.bridge_rx.try_recv() {
-            self.update_feedback(msg);
-        }
+        // 2. Drain bridge events (non-blocking, budgeted)
+        self.drain_bridge();
 
         // 3. Sync popup_open flag
         self.popup_open = self.components.sync_popup_open();
@@ -415,6 +427,18 @@ impl NcaModel {
     }
 
     // ── Feedback processing ───────────────────────────────────────
+
+    /// Drain at most `BRIDGE_DRAIN_BUDGET` feedback messages per tick so the
+    /// crossterm input poll (step 1) can never starve. Leftover messages are
+    /// drained on subsequent ticks (~40ms later each).
+    fn drain_bridge(&mut self) {
+        for _ in 0..BRIDGE_DRAIN_BUDGET {
+            match self.bridge_rx.try_recv() {
+                Ok(msg) => self.update_feedback(msg),
+                Err(_) => break,
+            }
+        }
+    }
 
     /// Process a single feedback message from the runtime.
     fn update_feedback(&mut self, msg: TuiFeedbackMsg) {
