@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use nca_common::config::{NcaConfig, ProviderKind};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use serde_json::json;
 
 use super::anthropic::AnthropicProvider;
 use super::kimi::KimiProvider;
@@ -85,14 +86,28 @@ pub fn build_provider_for(
             let models = format!(
                 "{} {}",
                 config.provider.zhipuai.model, config.model.default_model
+            )
+            .to_ascii_lowercase();
+            let max_tokens = zhipuai_effective_max_tokens(
+                &models,
+                config.model.max_tokens,
+                config.model.enable_thinking,
             );
-            let max_tokens = zhipuai_effective_max_tokens(&models, config.model.max_tokens);
-            Ok(Arc::new(OpenAiCompatProvider::from_config(
-                &config.provider.zhipuai,
-                max_tokens,
-                ZHIPUAI_PROFILE,
-                extra,
-            )?))
+            // GLM >= 5.3 rejects "disabled"; honor enable_thinking otherwise.
+            let thinking_type = if glm_thinking_locked(&models) || config.model.enable_thinking {
+                "enabled"
+            } else {
+                "disabled"
+            };
+            Ok(Arc::new(
+                OpenAiCompatProvider::from_config(
+                    &config.provider.zhipuai,
+                    max_tokens,
+                    ZHIPUAI_PROFILE,
+                    extra,
+                )?
+                .with_thinking(json!({ "type": thinking_type })),
+            ))
         }
         ProviderKind::DeepSeek => {
             let extra = HeaderMap::new();
@@ -112,36 +127,97 @@ pub fn build_provider_for(
 
 /// Effective `max_tokens` for the ZhipuAI provider.
 ///
-/// GLM-5.3 cannot disable thinking (official docs: `thinking.type` only
-/// supports `"enabled"`; requests with `"disabled"` are rejected), and the
-/// reasoning budget shares the output cap — ZhipuAI's own coding examples use
-/// `max_tokens: 65536`. With nca's global default (8192) the model exhausts the
-/// cap mid-reasoning and returns an empty `content` with
+/// GLM-5.3 and newer cannot disable thinking (official docs: `thinking.type`
+/// only supports `"enabled"`; requests with `"disabled"` are rejected), and
+/// the reasoning budget shares the output cap — the model can exhaust the cap
+/// mid-reasoning and return an empty `content` with
 /// `finish_reason: "length"`, which surfaces as a hard "empty response"
-/// failure. Floor the cap for thinking-locked GLM models so the default
-/// configuration works; explicitly larger values pass through untouched, and
-/// models that allow disabling thinking (GLM-5.2 and earlier) keep the
+/// failure.
+///
+/// The floor equals the documented GLM-5.x output window — 131072 tokens
+/// (128K), consistent with `runtime/src/model_limits.rs`; the previous 65536
+/// was merely the value used in ZhipuAI's own coding examples. The floor
+/// applies when either:
+///
+/// - any GLM model in `models` is version >= 5.3 (thinking-locked), or
+/// - thinking is enabled for any GLM-5.x model (reasoning shares the output
+///   cap — the same mid-reasoning truncation trap even when the model could
+///   technically disable thinking).
+///
+/// Explicitly larger values pass through untouched; GLM models that allow
+/// disabling thinking (GLM-5.2 and earlier) with thinking off keep the
 /// configured value as-is.
-fn zhipuai_effective_max_tokens(model: &str, configured: u32) -> u32 {
-    const THINKING_LOCKED_FLOOR: u32 = 65_536;
+fn zhipuai_effective_max_tokens(models: &str, configured: u32, enable_thinking: bool) -> u32 {
+    const THINKING_LOCKED_FLOOR: u32 = 131_072;
     // Key on every model string that can end up in the request body: the
     // provider-side model ([provider.zhipuai].model) and the session default
     // ([model].default_model) are normally kept in sync, but a manual TOML can
     // diverge them — flooring on either avoids skipping the floor for the
     // model that actually gets sent.
-    let is_thinking_locked = model.to_ascii_lowercase().contains("glm-5.3");
-    if is_thinking_locked && configured < THINKING_LOCKED_FLOOR {
+    let lowered = models.to_ascii_lowercase();
+    let needs_floor =
+        glm_thinking_locked(&lowered) || (enable_thinking && lowered.contains("glm-5"));
+    if needs_floor && configured < THINKING_LOCKED_FLOOR {
         tracing::warn!(
-            model = %model,
+            models = %lowered,
             configured,
             floor = THINKING_LOCKED_FLOOR,
-            "zhipuai model cannot disable thinking; raising max_tokens to avoid \
+            enable_thinking,
+            "zhipuai model spends max_tokens on reasoning; raising max_tokens to avoid \
              mid-reasoning truncation (values >= the floor pass through; lower \
              values are always raised)"
         );
         return THINKING_LOCKED_FLOOR;
     }
     configured
+}
+
+/// Whether any GLM model mentioned in `models` (already lowercased) has
+/// thinking locked on — i.e. rejects `thinking.type: "disabled"`.
+///
+/// GLM-5.3 introduced the lock. Scan every `glm-` occurrence for a
+/// `glm-<major>[.<minor>]` version and report whether any occurrence parses
+/// to at least (5, 3). A missing minor counts as `.0` (`glm-5-turbo` is
+/// (5, 0), `glm-6` is (6, 0)); occurrences without a leading digit
+/// (`glm-air`) are ignored.
+fn glm_thinking_locked(models: &str) -> bool {
+    let mut rest = models;
+    while let Some(pos) = rest.find("glm-") {
+        rest = &rest[pos + "glm-".len()..];
+        let Some((major, after_major)) = parse_number_prefix(rest) else {
+            // Not a versioned model; keep scanning after this occurrence.
+            continue;
+        };
+        let (minor, after) = match after_major.strip_prefix('.') {
+            Some(tail) => match parse_number_prefix(tail) {
+                Some((minor, after)) => (minor, after),
+                // "glm-5." with no digits after the dot: minor stays 0.
+                None => (0, after_major),
+            },
+            None => (0, after_major),
+        };
+        if (major, minor) >= (5, 3) {
+            return true;
+        }
+        rest = after;
+    }
+    false
+}
+
+/// Parse the leading ASCII-digit run of `s` as `u32`, returning the value and
+/// the remainder of the string after the digits.
+///
+/// Returns `None` when `s` does not start with a digit or the digit run
+/// overflows `u32`.
+fn parse_number_prefix(s: &str) -> Option<(u32, &str)> {
+    let end = s
+        .char_indices()
+        .find(|(_, c)| !c.is_ascii_digit())
+        .map_or(s.len(), |(i, _)| i);
+    if end == 0 {
+        return None;
+    }
+    s[..end].parse::<u32>().ok().map(|value| (value, &s[end..]))
 }
 
 #[cfg(test)]
@@ -222,24 +298,98 @@ mod tests {
     }
 
     #[test]
+    fn glm_thinking_locked_detects_versions() {
+        assert!(glm_thinking_locked("glm-5.3"));
+        assert!(glm_thinking_locked("glm-5.3-flash"));
+        assert!(glm_thinking_locked("glm-5.4"));
+        assert!(glm_thinking_locked("glm-6"));
+        assert!(glm_thinking_locked("glm-5.2 glm-5.3"));
+        assert!(!glm_thinking_locked("glm-5.2"));
+        assert!(!glm_thinking_locked("glm-4.7-flash"));
+        // No minor → (5, 0), below the 5.3 lock.
+        assert!(!glm_thinking_locked("glm-5-turbo"));
+        assert!(!glm_thinking_locked("deepseek-v4"));
+        assert!(!glm_thinking_locked(""));
+    }
+
+    #[test]
     fn zhipuai_max_tokens_floored_for_thinking_locked_glm_5_3() {
         // Default 8192 would truncate GLM-5.3 mid-reasoning.
-        assert_eq!(zhipuai_effective_max_tokens("glm-5.3", 8_192), 65_536);
-        assert_eq!(zhipuai_effective_max_tokens("GLM-5.3", 4_096), 65_536);
+        assert_eq!(
+            zhipuai_effective_max_tokens("glm-5.3", 8_192, false),
+            131_072
+        );
+        assert_eq!(
+            zhipuai_effective_max_tokens("GLM-5.3", 4_096, false),
+            131_072
+        );
+        // Values between the old 65_536 floor and the new one are also raised.
+        assert_eq!(
+            zhipuai_effective_max_tokens("glm-5.3", 98_304, false),
+            131_072
+        );
+    }
+
+    #[test]
+    fn zhipuai_max_tokens_floored_for_future_locked_versions() {
+        // Version-aware detection, not a hardcoded "glm-5.3" substring.
+        assert_eq!(
+            zhipuai_effective_max_tokens("glm-5.4", 8_192, false),
+            131_072
+        );
+        assert_eq!(
+            zhipuai_effective_max_tokens("glm-5.3-flash", 8_192, false),
+            131_072
+        );
     }
 
     #[test]
     fn zhipuai_max_tokens_respects_explicit_larger_values() {
-        assert_eq!(zhipuai_effective_max_tokens("glm-5.3", 98_304), 98_304);
-        assert_eq!(zhipuai_effective_max_tokens("glm-5.3", 131_072), 131_072);
+        // 131_072 now equals the floor — values at or above it pass through
+        // (only values strictly below the floor are raised).
+        assert_eq!(
+            zhipuai_effective_max_tokens("glm-5.3", 131_072, false),
+            131_072
+        );
+        assert_eq!(
+            zhipuai_effective_max_tokens("glm-5.3", 262_144, false),
+            262_144
+        );
     }
 
     #[test]
     fn zhipuai_max_tokens_untouched_for_thinking_optional_models() {
-        // GLM-5.2 and earlier can disable thinking; the configured value stands.
-        assert_eq!(zhipuai_effective_max_tokens("glm-5.2", 8_192), 8_192);
-        assert_eq!(zhipuai_effective_max_tokens("glm-5-turbo", 8_192), 8_192);
-        assert_eq!(zhipuai_effective_max_tokens("glm-4.7-flash", 8_192), 8_192);
+        // GLM-5.2 and earlier can disable thinking; with thinking off the
+        // configured value stands.
+        assert_eq!(zhipuai_effective_max_tokens("glm-5.2", 8_192, false), 8_192);
+        assert_eq!(
+            zhipuai_effective_max_tokens("glm-5-turbo", 8_192, false),
+            8_192
+        );
+        assert_eq!(
+            zhipuai_effective_max_tokens("glm-4.7-flash", 8_192, false),
+            8_192
+        );
+    }
+
+    #[test]
+    fn zhipuai_max_tokens_floored_for_glm_5_with_thinking_enabled() {
+        // Any GLM-5.x running with thinking on shares the reasoning budget
+        // through the output cap — same mid-reasoning truncation trap.
+        assert_eq!(
+            zhipuai_effective_max_tokens("glm-5.2", 8_192, true),
+            131_072
+        );
+        assert_eq!(
+            zhipuai_effective_max_tokens("glm-5-turbo", 8_192, true),
+            131_072
+        );
+        // The thinking-on floor is keyed to glm-5 only; older GLM keeps the
+        // configured value.
+        assert_eq!(
+            zhipuai_effective_max_tokens("glm-4.7-flash", 8_192, true),
+            8_192
+        );
     }
 
     #[test]
@@ -248,11 +398,11 @@ mod tests {
         // [model].default_model before matching — a divergent manual TOML that
         // sends glm-5.3 must still get the floor.
         assert_eq!(
-            zhipuai_effective_max_tokens("glm-5.2 glm-5.3", 8_192),
-            65_536
+            zhipuai_effective_max_tokens("glm-5.2 glm-5.3", 8_192, false),
+            131_072
         );
         assert_eq!(
-            zhipuai_effective_max_tokens("glm-5.2 glm-4.7-flash", 8_192),
+            zhipuai_effective_max_tokens("glm-5.2 glm-4.7-flash", 8_192, false),
             8_192
         );
     }

@@ -506,6 +506,13 @@ pub struct OpenAiCompatProvider {
     base_url: String,
     endpoint_suffix: &'static str,
     strip_reasoning: bool,
+    /// Vendor-specific request-body override merged into every
+    /// chat/keepalive request body (e.g. ZhipuAI's
+    /// `thinking: {"type": "enabled" | "disabled"}`).
+    ///
+    /// `None` (the default) emits no `thinking` field, preserving the plain
+    /// OpenAI-compatible wire format.
+    thinking: Option<Value>,
 }
 
 impl OpenAiCompatProvider {
@@ -555,7 +562,17 @@ impl OpenAiCompatProvider {
             base_url: compat.base_url().to_string(),
             endpoint_suffix: profile.endpoint_suffix,
             strip_reasoning: profile.strip_reasoning,
+            thinking: None,
         })
+    }
+
+    /// Attach a vendor-specific `thinking` field merged into every
+    /// chat/keepalive request body.
+    ///
+    /// Consuming builder: `from_config(...)?.with_thinking(json!({ "type": "disabled" }))`.
+    pub fn with_thinking(mut self, thinking: Value) -> Self {
+        self.thinking = Some(thinking);
+        self
     }
 
     fn endpoint(&self) -> String {
@@ -595,7 +612,7 @@ impl Provider for OpenAiCompatProvider {
             model.to_string()
         };
 
-        let body = openai_request_body(
+        let mut body = openai_request_body(
             messages,
             tools,
             &model,
@@ -603,6 +620,9 @@ impl Provider for OpenAiCompatProvider {
             self.temperature,
             workspace_root,
         )?;
+        if let Some(thinking) = &self.thinking {
+            body["thinking"] = thinking.clone();
+        };
 
         let response = self
             .client
@@ -648,7 +668,7 @@ impl Provider for OpenAiCompatProvider {
     ) -> Result<PingUsage, ProviderError> {
         // Build the request with max_tokens=1 to minimise output cost.
         // The input prefix is what we're paying for — it refreshes the cache.
-        let body = openai_request_body(
+        let mut body = openai_request_body(
             &snapshot.messages,
             &snapshot.tools,
             &snapshot.model,
@@ -656,6 +676,9 @@ impl Provider for OpenAiCompatProvider {
             self.temperature,
             &snapshot.workspace_root,
         )?;
+        if let Some(thinking) = &self.thinking {
+            body["thinking"] = thinking.clone();
+        };
 
         let response = self
             .client
