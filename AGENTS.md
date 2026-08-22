@@ -137,6 +137,8 @@ The Elm TUI (`tui/elm/model.rs::NcaModel`) runs inside `spawn_blocking` on a ded
 
 Linux builds require `libssl-dev`, `pkg-config`, and `ripgrep`. macOS builds may need the Homebrew equivalents.
 
+The Landlock command sandbox (P5) needs a Linux kernel with Landlock (5.13+ for basic support; CI's ubuntu 6.8+ is fine). No extra packages required — it is a kernel LSM. On unsupported kernels `sandbox = "auto"` (default) degrades to unconfined with a warn-once notice; `"required"` fails closed.
+
 ## MCP Tools
 
 MCP servers are loaded via `rmcp` crate (v1.7, features: `client`, `transport-async-rw`). `load_mcp_tools()` is async—callers must await. MCP tool results go through the same `truncate_tool_output` guardrail as built-in tools.

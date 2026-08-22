@@ -1572,6 +1572,58 @@ pub struct PermissionConfig {
     pub allow: Vec<String>,
     pub deny: Vec<String>,
     pub ask: Vec<String>,
+    /// P5 sandbox configuration (Landlock backend, resolved at exec time).
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
+}
+
+/// Kernel-sandbox enforcement mode.
+///
+/// - `Auto` (default): confine when the Landlock backend is available, degrade
+///   to unconfined with a warn-once notice when it is not.
+/// - `Required`: fail closed — commands are refused when the backend is
+///   unavailable, never silently run unconfined.
+/// - `Off`: never probe, never confine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxMode {
+    #[default]
+    Auto,
+    Required,
+    Off,
+}
+
+/// Sandboxing configuration under `[permissions.sandbox]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxConfig {
+    /// Enforcement mode (`auto` | `required` | `off`).
+    #[serde(default)]
+    pub mode: SandboxMode,
+    /// Additional read-only roots appended to the built-in system set.
+    #[serde(default)]
+    pub ro_paths: Vec<PathBuf>,
+    /// Additional read-write roots appended to workspace + temp defaults.
+    #[serde(default)]
+    pub rw_paths: Vec<PathBuf>,
+    /// `true` = network stays unrestricted (blocking network is a future item;
+    /// the Landlock `net` scope only covers abstract UNIX sockets).
+    #[serde(default = "default_sandbox_net")]
+    pub net: bool,
+}
+
+fn default_sandbox_net() -> bool {
+    true
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            mode: SandboxMode::Auto,
+            ro_paths: Vec::new(),
+            rw_paths: Vec::new(),
+            net: true,
+        }
+    }
 }
 
 impl PermissionConfig {
@@ -1587,6 +1639,9 @@ impl PermissionConfig {
         }
         if let Some(ask) = partial.ask {
             self.ask = ask;
+        }
+        if let Some(sandbox) = partial.sandbox {
+            self.sandbox.merge(sandbox);
         }
     }
 }
@@ -2154,12 +2209,38 @@ struct PartialModelConfig {
     recent_models: Option<Vec<String>>,
 }
 
+impl SandboxConfig {
+    fn merge(&mut self, partial: PartialSandboxConfig) {
+        if let Some(mode) = partial.mode {
+            self.mode = mode;
+        }
+        if let Some(ro_paths) = partial.ro_paths {
+            self.ro_paths = ro_paths;
+        }
+        if let Some(rw_paths) = partial.rw_paths {
+            self.rw_paths = rw_paths;
+        }
+        if let Some(net) = partial.net {
+            self.net = net;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 struct PartialPermissionConfig {
     mode: Option<PermissionMode>,
     allow: Option<Vec<String>>,
     deny: Option<Vec<String>>,
     ask: Option<Vec<String>>,
+    sandbox: Option<PartialSandboxConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PartialSandboxConfig {
+    mode: Option<SandboxMode>,
+    ro_paths: Option<Vec<PathBuf>>,
+    rw_paths: Option<Vec<PathBuf>>,
+    net: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -3120,6 +3201,122 @@ extra_paths = ["/home/user/projects", "/opt/data"]
                 PathBuf::from("/home/user/projects"),
                 PathBuf::from("/opt/data"),
             ]
+        );
+    }
+
+    // ---- P5 sandbox config (TDD red phase; types do not exist yet) ----
+    //
+    // Implementation contract (see docs/plans/deepseek-harness-adoption.md §P5):
+    //   - `PermissionConfig` gains `pub sandbox: SandboxConfig`.
+    //   - `SandboxConfig { mode: SandboxMode, ro_paths: Vec<PathBuf>,
+    //     rw_paths: Vec<PathBuf>, net: bool }` in this module; manual `Default`
+    //     with `mode: Auto`, `net: true`, empty path lists.
+    //   - `SandboxMode` enum { Auto, Required, Off } with
+    //     `#[serde(rename_all = "kebab-case")]`; re-exported by
+    //     `nca_runtime::sandbox` (common stays the single source of truth).
+    //   - `PartialPermissionConfig` gains `sandbox: Option<PartialSandboxConfig>`
+    //     and `PermissionConfig::merge` forwards it.
+
+    #[test]
+    fn sandbox_defaults_are_auto_net_with_empty_paths() {
+        let config = NcaConfig::default();
+        assert_eq!(
+            config.permissions.sandbox.mode,
+            SandboxMode::Auto,
+            "mode defaults to auto (escape hatch for kernels without Landlock)"
+        );
+        assert!(
+            config.permissions.sandbox.net,
+            "net defaults to true (blocking network is a separate future feature)"
+        );
+        assert!(
+            config.permissions.sandbox.ro_paths.is_empty(),
+            "ro_paths default empty (built-in system roots are added by runtime)"
+        );
+        assert!(config.permissions.sandbox.rw_paths.is_empty());
+    }
+
+    #[test]
+    fn sandbox_modes_parse_from_toml() {
+        for (raw, expected) in [
+            ("auto", SandboxMode::Auto),
+            ("required", SandboxMode::Required),
+            ("off", SandboxMode::Off),
+        ] {
+            let toml_str = format!("[permissions.sandbox]\nmode = \"{raw}\"\n");
+            let partial: PartialNcaConfig = toml::from_str(&toml_str).expect("parse");
+            let mut config = NcaConfig::default();
+            config.merge(partial);
+            assert_eq!(
+                config.permissions.sandbox.mode, expected,
+                "mode = {raw} should parse"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_paths_and_net_parse_as_arrays() {
+        let toml_str = r#"
+[permissions.sandbox]
+mode = "required"
+net = false
+ro_paths = ["/usr", "/opt/tools"]
+rw_paths = ["/home/user/project", "/tmp"]
+"#;
+        let partial: PartialNcaConfig = toml::from_str(toml_str).expect("parse");
+        let mut config = NcaConfig::default();
+        config.merge(partial);
+
+        let sandbox = &config.permissions.sandbox;
+        assert_eq!(sandbox.mode, SandboxMode::Required);
+        assert!(!sandbox.net);
+        assert_eq!(
+            sandbox.ro_paths,
+            vec![PathBuf::from("/usr"), PathBuf::from("/opt/tools")]
+        );
+        assert_eq!(
+            sandbox.rw_paths,
+            vec![PathBuf::from("/home/user/project"), PathBuf::from("/tmp")]
+        );
+    }
+
+    #[test]
+    fn sandbox_roundtrip_via_workspace_file() {
+        let tmp_home = tempfile::tempdir().expect("tempdir");
+        let _guard = EnvGuard::set(&[
+            ("HOME", Some(tmp_home.path().to_str().unwrap())),
+            ("MINIMAX_API_KEY", None),
+            ("OPENAI_API_KEY", None),
+            ("NCA_EDITOR", None),
+            ("EDITOR", None),
+        ]);
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Non-default sandbox values must survive a workspace-file roundtrip.
+        let mut config = NcaConfig::default();
+        config.permissions.sandbox.mode = SandboxMode::Required;
+        config.permissions.sandbox.net = false;
+        config.permissions.sandbox.ro_paths = vec![PathBuf::from("/opt/tools")];
+        config.permissions.sandbox.rw_paths = vec![PathBuf::from("/tmp/work")];
+        config.save_workspace_file(dir.path()).expect("save");
+
+        let raw =
+            std::fs::read_to_string(workspace_config_path(dir.path())).expect("read local config");
+        assert!(
+            raw.contains("sandbox"),
+            "persisted config should contain [permissions.sandbox]: {raw}"
+        );
+
+        let reloaded = NcaConfig::load_for_workspace(dir.path()).expect("reload");
+        assert_eq!(reloaded.permissions.sandbox.mode, SandboxMode::Required);
+        assert!(!reloaded.permissions.sandbox.net);
+        assert_eq!(
+            reloaded.permissions.sandbox.ro_paths,
+            vec![PathBuf::from("/opt/tools")]
+        );
+        assert_eq!(
+            reloaded.permissions.sandbox.rw_paths,
+            vec![PathBuf::from("/tmp/work")]
         );
     }
 

@@ -99,6 +99,7 @@ This document records every dependency choice, the rationale behind it, and the 
 | Crate | Version | Role |
 |-------|---------|------|
 | `portable-pty` | 0.9.x | Cross-platform pseudo-terminal interface |
+| `landlock` | 0.4.x | Linux kernel syscall sandbox for confined command execution (P5) |
 | `tokio-process` | (via tokio) | Async child process spawning |
 
 **Why portable-pty**: Part of the WezTerm project, battle-tested across platforms. Provides the PTY abstraction needed for sandboxed bash execution and terminal capture.
