@@ -33,34 +33,10 @@ pub struct PipelineResult {
 /// Returns [`PipelineResult`] with ordered results. All events (approval
 /// requests/resolutions, tool call started/completed, hooks) are emitted
 /// directly via `event_tx` and also collected in `PipelineResult.events`.
+///
+/// `repeat_guard` is caller-owned and must live for the whole session so
+/// repeat detection persists across tool batches, steps, and turns.
 pub async fn run_tool_pipeline(
-    tools: &ToolRegistry,
-    approval: &mut ApprovalPolicy,
-    hooks: &Option<HookRunner>,
-    event_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
-    cancel_flag: &AtomicBool,
-    tool_calls: Vec<ToolCall>,
-) -> Result<PipelineResult, String> {
-    // Fresh guard: no cross-batch repeat detection. Production callers should
-    // hold one `RepeatCallGuard` per session and use
-    // [`run_tool_pipeline_with_guards`] instead.
-    let mut guard = RepeatCallGuard::new();
-    run_tool_pipeline_with_guards(
-        tools,
-        approval,
-        hooks,
-        event_tx,
-        cancel_flag,
-        tool_calls,
-        &mut guard,
-    )
-    .await
-}
-
-/// [`run_tool_pipeline`] with a caller-owned [`RepeatCallGuard`]. The guard
-/// lives for the whole session so repeat detection persists across tool
-/// batches, steps, and turns.
-pub async fn run_tool_pipeline_with_guards(
     tools: &ToolRegistry,
     approval: &mut ApprovalPolicy,
     hooks: &Option<HookRunner>,

@@ -449,7 +449,7 @@ impl AgentLoop {
                 self.event_tx.clone(),
             );
 
-            let pipeline = tool_pipeline::run_tool_pipeline_with_guards(
+            let pipeline = tool_pipeline::run_tool_pipeline(
                 &self.tools,
                 &mut self.approval,
                 &self.hooks,

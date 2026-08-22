@@ -1,31 +1,15 @@
-//! TDD red-phase tests for P6 "工具护栏" (tool guards).
+//! P6 "工具护栏" (tool guards) contract and wiring tests.
 //!
 //! Spec: `docs/plans/deepseek-harness-adoption.md` §P6.
 //!
-//! These tests are intentionally **compile-red** right now: they reference
-//! API that does not exist yet and that the implementer must provide:
-//!
-//! 1. New public module `nca_core::tool_guards` (declared in `lib.rs`):
-//!    - `pub struct RepeatCallGuard` with `new()` (recent-calls map capped at
-//!      32 entries, FIFO eviction) and `record(&mut self, &str, &serde_json::Value) -> RepeatAction`.
-//!    - `pub enum RepeatAction { Proceed, Hint(String), StrongHint(String), Stop(String) }`
-//!      deriving `Debug, Clone, PartialEq, Eq`.
-//! 2. `nca_common::tool::ToolDefinition` gains `#[serde(default)] pub timeout_ms: Option<u64>`.
-//! 3. `nca_common::tool::ToolResult` gains `#[serde(default)] pub timed_out: bool`.
-//! 4. `nca_core::tool_pipeline::run_tool_pipeline` wraps Phase-2 execution in
-//!    `tokio::time::timeout` when `timeout_ms` is set, returning a failed
-//!    `ToolResult` with `timed_out = true` and an error mentioning the tool
-//!    name and the numeric timeout value (in ms).
-//!
-//! Pipeline wiring contract for the implementer (not directly testable here
-//! because it changes `run_tool_pipeline`'s signature, which is a design
-//! decision): `RepeatAction::Hint/StrongHint(msg)` → append `msg` to the tool
-//! result `output`; `RepeatAction::Stop(msg)` → do not execute, return a
-//! failed `ToolResult` whose `error` is `msg` (strategy-change advice).
+//! Covers the public contract (`nca_core::tool_guards`, `timeout_ms`,
+//! `timed_out`) and the pipeline wiring (hints appended to output, hard stop
+//! without execution).
 //!
 //! Run with: `cargo test -p nca-core --test tool_guards`
 
-use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -76,8 +60,13 @@ impl ToolExecutor for StubTool {
 }
 
 /// Run one batch of tool calls through the real pipeline with an allow-all
-/// approval policy (no approvals, no hooks, no cancellation).
-async fn run_batch(tools: &ToolRegistry, calls: Vec<ToolCall>) -> Vec<ToolResult> {
+/// approval policy (no approvals, no hooks, no cancellation). The caller
+/// owns the [`RepeatCallGuard`] so batches can share session state.
+async fn run_batch(
+    tools: &ToolRegistry,
+    calls: Vec<ToolCall>,
+    guard: &mut RepeatCallGuard,
+) -> Vec<ToolResult> {
     let mut approval = ApprovalPolicy::new(PermissionConfig {
         mode: PermissionMode::BypassPermissions,
         ..Default::default()
@@ -85,9 +74,17 @@ async fn run_batch(tools: &ToolRegistry, calls: Vec<ToolCall>) -> Vec<ToolResult
     let hooks: Option<HookRunner> = None;
     let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
     let cancel_flag = AtomicBool::new(false);
-    let pipeline = run_tool_pipeline(&tools, &mut approval, &hooks, &tx, &cancel_flag, calls)
-        .await
-        .expect("pipeline must not be cancelled");
+    let pipeline = run_tool_pipeline(
+        &tools,
+        &mut approval,
+        &hooks,
+        &tx,
+        &cancel_flag,
+        calls,
+        guard,
+    )
+    .await
+    .expect("pipeline must not be cancelled");
     pipeline.results
 }
 
@@ -257,6 +254,85 @@ fn recent_calls_evict_oldest_fifo_without_resetting_survivors() {
 }
 
 // ---------------------------------------------------------------------------
+// Pipeline wiring: hint appended to output, hard stop skips execution
+// ---------------------------------------------------------------------------
+
+/// A stub tool that counts how many times it actually executed.
+struct CountingTool {
+    executions: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ToolExecutor for CountingTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "counting_stub".to_string(),
+            description: "counting stub for wiring tests".into(),
+            parameters: json!({"type": "object", "properties": {}}),
+            timeout_ms: None,
+        }
+    }
+
+    async fn execute(&self, call: &ToolCall) -> ToolResult {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        ToolResult {
+            call_id: call.id.clone(),
+            success: true,
+            output: "done".into(),
+            error: None,
+            timed_out: false,
+        }
+    }
+}
+
+#[tokio::test]
+async fn pipeline_appends_hint_and_hard_stops_identical_calls() {
+    let executions = Arc::new(AtomicUsize::new(0));
+    let mut tools = ToolRegistry::new();
+    tools.register(Box::new(CountingTool {
+        executions: Arc::clone(&executions),
+    }));
+
+    // One guard across batches = session semantics.
+    let mut guard = RepeatCallGuard::new();
+    let call = || ToolCall {
+        id: "c".into(),
+        name: "counting_stub".into(),
+        input: json!({"path": "same"}),
+    };
+
+    // Calls 1-7: all execute; the 3rd onward carry an appended guard hint.
+    let mut third_output = String::new();
+    for i in 0..7 {
+        let results = run_batch(&tools, vec![call()], &mut guard).await;
+        assert!(results[0].success, "calls 1-7 must execute");
+        if i == 2 {
+            third_output = results[0].output.clone();
+        }
+    }
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        7,
+        "calls 1-7 all executed"
+    );
+    assert!(
+        third_output.contains("[guard]"),
+        "3rd call output must carry the appended hint: {third_output}"
+    );
+
+    // 8th identical call: hard stop — failed result, and NO execution.
+    let results = run_batch(&tools, vec![call()], &mut guard).await;
+    assert!(!results[0].success, "8th identical call is hard-stopped");
+    let err = results[0].error.as_deref().unwrap_or_default();
+    assert!(!err.is_empty(), "stop must carry strategy-change advice");
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        7,
+        "hard-stopped call must NOT execute"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // ToolTimeout: declarative timeout_ms on ToolDefinition
 // ---------------------------------------------------------------------------
 
@@ -274,7 +350,7 @@ async fn tool_with_timeout_times_out_and_reports_timed_out() {
         name: "slow_stub".into(),
         input: json!({}),
     }];
-    let results = run_batch(&tools, calls).await;
+    let results = run_batch(&tools, calls, &mut RepeatCallGuard::new()).await;
 
     let res = &results[0];
     assert!(!res.success, "timed-out tool must be reported as a failure");
@@ -307,7 +383,7 @@ async fn tool_without_timeout_is_unaffected() {
         name: "no_timeout_stub".into(),
         input: json!({}),
     }];
-    let results = run_batch(&tools, calls).await;
+    let results = run_batch(&tools, calls, &mut RepeatCallGuard::new()).await;
 
     let res = &results[0];
     assert!(
@@ -332,7 +408,7 @@ async fn tool_finishing_before_timeout_succeeds() {
         name: "fast_stub".into(),
         input: json!({}),
     }];
-    let results = run_batch(&tools, calls).await;
+    let results = run_batch(&tools, calls, &mut RepeatCallGuard::new()).await;
 
     let res = &results[0];
     assert!(res.success, "tool finishing within timeout must succeed");
