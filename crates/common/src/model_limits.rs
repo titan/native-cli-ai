@@ -82,6 +82,12 @@ pub const MODEL_CONTEXT_LIMITS: &[ModelContextLimits] = &[
         context_window: 16_385,
         max_output_tokens: 4096,
     },
+    // MiniMax M3 (reasoning model)
+    ModelContextLimits {
+        pattern: "minimax-m3",
+        context_window: 512_000,
+        max_output_tokens: 128_000,
+    },
     // MiniMax M2.7 — OpenRouter `minimax/minimax-m2.7`: context_length 204_800 (must be before `minimax-m2`)
     ModelContextLimits {
         pattern: "minimax-m2.7",
