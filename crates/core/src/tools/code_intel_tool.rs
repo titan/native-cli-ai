@@ -17,6 +17,7 @@ impl<T: CodeIntel> CodeIntelTool<T> {
 impl<T: CodeIntel> ToolExecutor for CodeIntelTool<T> {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
+timeout_ms: None,
             name: "query_symbols".into(),
             description:
                 "Search for likely Rust symbol definitions by literal symbol name and return path:line:text results"
@@ -40,6 +41,7 @@ impl<T: CodeIntel> ToolExecutor for CodeIntelTool<T> {
         let glob = call.input["glob"].as_str();
         match self.intel.query_symbols(query, glob).await {
             Ok(matches) => ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: true,
                 output: matches
@@ -50,6 +52,7 @@ impl<T: CodeIntel> ToolExecutor for CodeIntelTool<T> {
                 error: None,
             },
             Err(err) => ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),

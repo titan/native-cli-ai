@@ -64,6 +64,7 @@ fn line_body(segment: &str) -> &str {
 impl ToolExecutor for ReplaceMatchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
+            timeout_ms: None,
             name: "replace_match".into(),
             description:
                 "Replace a specific search match using exact path, line, and column coordinates"
@@ -105,6 +106,7 @@ impl ToolExecutor for ReplaceMatchTool {
 
         if p.old_text.is_empty() {
             return ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),
@@ -113,6 +115,7 @@ impl ToolExecutor for ReplaceMatchTool {
         }
         if p.line == 0 || p.column == 0 {
             return ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),
@@ -128,6 +131,7 @@ impl ToolExecutor for ReplaceMatchTool {
         let total_occurrences = content.matches(&p.old_text).count();
         let Some((line_start, segment)) = line_segment(&content, p.line) else {
             return ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),
@@ -139,6 +143,7 @@ impl ToolExecutor for ReplaceMatchTool {
         let byte_column = p.column - 1;
         if byte_column > body.len() {
             return ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),
@@ -153,6 +158,7 @@ impl ToolExecutor for ReplaceMatchTool {
         let absolute_end = absolute_start + p.old_text.len();
         let Some(found_text) = content.get(absolute_start..absolute_end) else {
             return ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),
@@ -165,6 +171,7 @@ impl ToolExecutor for ReplaceMatchTool {
 
         if found_text != p.old_text {
             return ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),
@@ -178,6 +185,7 @@ impl ToolExecutor for ReplaceMatchTool {
         content.replace_range(absolute_start..absolute_end, &p.new_text);
         match self.fs.write_file(&p.path, &content).await {
             Ok(()) => ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: true,
                 output: format!(

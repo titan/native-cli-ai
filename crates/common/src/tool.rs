@@ -6,6 +6,11 @@ pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
+    /// Optional cooperative execution timeout in milliseconds. When set, the
+    /// tool pipeline wraps execution in `tokio::time::timeout` and returns a
+    /// failed `ToolResult` with `timed_out = true` on expiry.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 /// A tool invocation requested by the model.
@@ -24,6 +29,11 @@ pub struct ToolResult {
     pub output: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// True when this result was produced by the cooperative timeout guard
+    /// (not by the tool itself). Kept orthogonal to `success` so replay and
+    /// telemetry can distinguish "failed" from "timed out".
+    #[serde(default)]
+    pub timed_out: bool,
 }
 
 /// Permission tier for a tool or command.

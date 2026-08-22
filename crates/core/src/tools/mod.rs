@@ -83,6 +83,15 @@ impl ToolRegistry {
         registry
     }
 
+    /// Declarative timeout (if any) declared by the tool with this name.
+    /// Used by the tool pipeline to wrap execution in a cooperative timeout.
+    pub fn timeout_ms_for(&self, name: &str) -> Option<u64> {
+        self.tools
+            .iter()
+            .find(|t| t.definition().name == name)
+            .and_then(|t| t.definition().timeout_ms)
+    }
+
     /// Retain only tools whose name is in `allowed`; remove all others.
     /// Used by agent profiles to enforce tool gating.
     pub fn restrict_to(&mut self, allowed: &[String]) {
@@ -114,6 +123,7 @@ impl ToolRegistry {
         }
 
         ToolResult {
+            timed_out: false,
             call_id: call.id.clone(),
             success: false,
             output: String::new(),
@@ -130,6 +140,7 @@ impl ToolRegistry {
             }
         }
         ToolResult {
+            timed_out: false,
             call_id: call.id.clone(),
             success: false,
             output: String::new(),
@@ -222,6 +233,7 @@ impl ToolCallExt for ToolCall {
         let repaired = input_repair::repair_value(&self.input);
         let Ok(params) = serde_json::from_value::<T>(repaired) else {
             return Err(ToolResult {
+                timed_out: false,
                 call_id: self.id.clone(),
                 success: false,
                 output: String::new(),
@@ -282,6 +294,7 @@ mod tests {
     impl ToolExecutor for StubTool {
         fn definition(&self) -> ToolDefinition {
             ToolDefinition {
+                timeout_ms: None,
                 name: self.name.clone(),
                 description: "stub".into(),
                 parameters: serde_json::json!({"type": "object", "properties": {}}),
@@ -289,6 +302,7 @@ mod tests {
         }
         async fn execute(&self, _call: &ToolCall) -> ToolResult {
             ToolResult {
+                timed_out: false,
                 call_id: String::new(),
                 success: true,
                 output: String::new(),

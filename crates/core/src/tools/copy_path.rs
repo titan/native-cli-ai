@@ -26,6 +26,7 @@ struct Params {
 impl ToolExecutor for CopyPathTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
+            timeout_ms: None,
             name: "copy_path".into(),
             description: "Copy a file within the workspace".into(),
             parameters: serde_json::json!({
@@ -46,6 +47,7 @@ impl ToolExecutor for CopyPathTool {
         };
         match self.fs.copy(&p.from, &p.to).await {
             Ok(()) => ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: true,
                 output: format!("Copied {} -> {}", p.from, p.to),

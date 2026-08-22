@@ -26,6 +26,7 @@ struct Params {
 impl ToolExecutor for WriteFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
+            timeout_ms: None,
             name: "write_file".into(),
             description: "Create or overwrite a file inside the workspace".into(),
             parameters: serde_json::json!({
@@ -46,6 +47,7 @@ impl ToolExecutor for WriteFileTool {
         };
         match self.fs.write_file(&p.path, &p.content).await {
             Ok(()) => ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: true,
                 output: format!("Wrote {}", p.path),

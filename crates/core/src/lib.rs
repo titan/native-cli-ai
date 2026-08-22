@@ -19,6 +19,7 @@ pub mod plugin_capnp {
 pub mod provider;
 pub mod skill_installer;
 pub mod skills;
+pub mod tool_guards;
 pub mod tool_pipeline;
 pub mod tools;
 pub mod workspace_fs;

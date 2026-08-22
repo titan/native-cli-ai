@@ -15,6 +15,7 @@ use tokio::time::MissedTickBehavior;
 
 use crate::approval::{ApprovalPolicy, ApprovalVerdict};
 use crate::hooks::{HookEventKind, HookRunner};
+use crate::tool_guards::{RepeatAction, RepeatCallGuard};
 use crate::tools::ToolRegistry;
 
 /// Outcome of running the tool pipeline on a batch of tool calls.
@@ -40,6 +41,34 @@ pub async fn run_tool_pipeline(
     cancel_flag: &AtomicBool,
     tool_calls: Vec<ToolCall>,
 ) -> Result<PipelineResult, String> {
+    // Fresh guard: no cross-batch repeat detection. Production callers should
+    // hold one `RepeatCallGuard` per session and use
+    // [`run_tool_pipeline_with_guards`] instead.
+    let mut guard = RepeatCallGuard::new();
+    run_tool_pipeline_with_guards(
+        tools,
+        approval,
+        hooks,
+        event_tx,
+        cancel_flag,
+        tool_calls,
+        &mut guard,
+    )
+    .await
+}
+
+/// [`run_tool_pipeline`] with a caller-owned [`RepeatCallGuard`]. The guard
+/// lives for the whole session so repeat detection persists across tool
+/// batches, steps, and turns.
+pub async fn run_tool_pipeline_with_guards(
+    tools: &ToolRegistry,
+    approval: &mut ApprovalPolicy,
+    hooks: &Option<HookRunner>,
+    event_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+    cancel_flag: &AtomicBool,
+    tool_calls: Vec<ToolCall>,
+    repeat_guard: &mut RepeatCallGuard,
+) -> Result<PipelineResult, String> {
     let mut events = Vec::new();
     let mut emit = |e: AgentEvent| {
         events.push(e.clone());
@@ -50,7 +79,7 @@ pub async fn run_tool_pipeline(
     // ── Phase 1: permission checks (sequential — approvals may be interactive) ──
     enum Ticket {
         Resolved(ToolResult),
-        Execute(ToolCall),
+        Execute(ToolCall, Option<String>),
     }
 
     let mut tickets: Vec<Ticket> = Vec::with_capacity(tool_calls.len());
@@ -60,11 +89,30 @@ pub async fn run_tool_pipeline(
             return Err("run cancelled before tool execution".into());
         }
 
+        // Repeat-call guard fires BEFORE the permission check so that even a
+        // runaway loop of auto-approved identical calls is escalated. The call
+        // is always recorded (even when stopped) so the count keeps climbing.
+        let guard_hint = match repeat_guard.record(&call.name, &call.input) {
+            RepeatAction::Proceed => None,
+            RepeatAction::Hint(msg) | RepeatAction::StrongHint(msg) => Some(msg),
+            RepeatAction::Stop(msg) => {
+                tickets.push(Ticket::Resolved(ToolResult {
+                    call_id: call.id.clone(),
+                    success: false,
+                    output: String::new(),
+                    error: Some(msg),
+                    timed_out: false,
+                }));
+                continue;
+            }
+        };
+
         let tier = approval.check(&call.name, &call.input.to_string());
 
         match tier {
             PermissionTier::Denied => {
                 tickets.push(Ticket::Resolved(ToolResult {
+                    timed_out: false,
                     call_id: call.id.clone(),
                     success: false,
                     output: String::new(),
@@ -126,6 +174,7 @@ pub async fn run_tool_pipeline(
                     };
                     if let Some(reason) = hook_err {
                         tickets.push(Ticket::Resolved(ToolResult {
+                            timed_out: false,
                             call_id: call.id.clone(),
                             success: false,
                             output: String::new(),
@@ -133,7 +182,7 @@ pub async fn run_tool_pipeline(
                         }));
                         continue;
                     }
-                    tickets.push(Ticket::Execute(call.clone()));
+                    tickets.push(Ticket::Execute(call.clone(), guard_hint.clone()));
                 } else {
                     if approval.should_fail_on_ask() {
                         let message = format!(
@@ -146,6 +195,7 @@ pub async fn run_tool_pipeline(
                         return Err(message);
                     }
                     tickets.push(Ticket::Resolved(ToolResult {
+                        timed_out: false,
                         call_id: call.id.clone(),
                         success: false,
                         output: String::new(),
@@ -175,6 +225,7 @@ pub async fn run_tool_pipeline(
                 };
                 if let Some(reason) = hook_err {
                     tickets.push(Ticket::Resolved(ToolResult {
+                        timed_out: false,
                         call_id: call.id.clone(),
                         success: false,
                         output: String::new(),
@@ -182,7 +233,7 @@ pub async fn run_tool_pipeline(
                     }));
                     continue;
                 }
-                tickets.push(Ticket::Execute(call.clone()));
+                tickets.push(Ticket::Execute(call.clone(), guard_hint.clone()));
             }
         }
     }
@@ -190,11 +241,11 @@ pub async fn run_tool_pipeline(
     let n = tickets.len();
     let mut results: Vec<Option<ToolResult>> = (0..n).map(|_| None).collect();
 
-    let to_execute: Vec<(usize, ToolCall)> = tickets
+    let to_execute: Vec<(usize, ToolCall, Option<String>)> = tickets
         .into_iter()
         .enumerate()
         .filter_map(|(i, t)| match t {
-            Ticket::Execute(call) => Some((i, call)),
+            Ticket::Execute(call, hint) => Some((i, call, hint)),
             Ticket::Resolved(result) => {
                 results[i] = Some(result);
                 None
@@ -209,14 +260,51 @@ pub async fn run_tool_pipeline(
 
         // Run tool executions concurrently.  Poll cancel_flag every 50 ms so
         // the user can interrupt long-running tools (e.g. cargo build).
+        // Each call with a declared `timeout_ms` is additionally wrapped in a
+        // cooperative `tokio::time::timeout` (external processes like bash are
+        // killed by their own PTY timeout, not by this wrapper).
         let exec_fut = async {
-            let futs = to_execute.iter().map(|(i, call)| {
+            let futs = to_execute.iter().map(|(i, call, guard_hint)| {
                 let call_id = call.id.clone();
                 let tx = event_tx.clone();
                 let call = call.clone();
+                let guard_hint = guard_hint.clone();
+                let timeout_ms = tools.timeout_ms_for(&call.name);
                 async move {
                     let progress = crate::tools::ToolProgress::new(call_id, tx);
-                    let res = tools.execute_streaming(&call, &progress).await;
+                    let res = match timeout_ms {
+                        Some(ms) => match tokio::time::timeout(
+                            std::time::Duration::from_millis(ms),
+                            tools.execute_streaming(&call, &progress),
+                        )
+                        .await
+                        {
+                            Ok(res) => res,
+                            Err(_elapsed) => ToolResult {
+                                call_id: call.id.clone(),
+                                success: false,
+                                output: String::new(),
+                                error: Some(format!(
+                                    "tool `{}` timed out after {} ms",
+                                    call.name, ms
+                                )),
+                                timed_out: true,
+                            },
+                        },
+                        None => tools.execute_streaming(&call, &progress).await,
+                    };
+                    // Append the repeat-call hint (if any) to the result output.
+                    let res = match guard_hint {
+                        Some(hint) if !hint.is_empty() => {
+                            let mut res = res;
+                            if !res.output.is_empty() {
+                                res.output.push('\n');
+                            }
+                            res.output.push_str(&hint);
+                            res
+                        }
+                        _ => res,
+                    };
                     (*i, res)
                 }
             });

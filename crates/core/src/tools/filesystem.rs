@@ -25,6 +25,7 @@ struct Params {
 impl ToolExecutor for ReadFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
+            timeout_ms: None,
             name: "read_file".into(),
             description: "Read the contents of a file".into(),
             parameters: serde_json::json!({
@@ -47,6 +48,7 @@ impl ToolExecutor for ReadFileTool {
         };
         match self.fs.read_file(&p.path).await {
             Ok(content) => ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: true,
                 output: content,

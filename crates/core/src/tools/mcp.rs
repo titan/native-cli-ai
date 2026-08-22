@@ -41,6 +41,7 @@ impl McpTool {
 impl ToolExecutor for McpTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
+            timeout_ms: None,
             name: self.prefixed_name(),
             description: self.description.clone().unwrap_or_else(|| {
                 format!("MCP tool `{}` from `{}`", self.tool_name, self.server.name)
@@ -57,12 +58,14 @@ impl ToolExecutor for McpTool {
         let call_id = call.id.clone();
         match execute_mcp_call(&workspace_root, &server, &tool_name, input).await {
             Ok(output) => ToolResult {
+                timed_out: false,
                 call_id,
                 success: true,
                 output,
                 error: None,
             },
             Err(error) => ToolResult {
+                timed_out: false,
                 call_id,
                 success: false,
                 output: String::new(),

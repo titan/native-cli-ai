@@ -508,6 +508,7 @@ pub fn sandbox_error_to_tool_result(
     err: SandboxError,
 ) -> nca_common::tool::ToolResult {
     nca_common::tool::ToolResult {
+        timed_out: false,
         call_id: call_id.to_string(),
         success: false,
         output: String::new(),

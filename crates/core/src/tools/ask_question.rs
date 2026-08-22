@@ -48,6 +48,7 @@ impl AskQuestionTool {
 impl ToolExecutor for AskQuestionTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
+            timeout_ms: None,
             name: "ask_question".into(),
             description: "Ask the user a structured question with multiple choices, an optional \
                 custom text answer, and a suggested default (always provide `suggested_answer`). \
@@ -96,6 +97,7 @@ impl ToolExecutor for AskQuestionTool {
             .to_string();
         if prompt.is_empty() {
             return ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),
@@ -110,6 +112,7 @@ impl ToolExecutor for AskQuestionTool {
             .to_string();
         if suggested.is_empty() {
             return ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),
@@ -143,6 +146,7 @@ impl ToolExecutor for AskQuestionTool {
                         .to_string();
                     if id.is_empty() || label.is_empty() {
                         return ToolResult {
+                            timed_out: false,
                             call_id: call.id.clone(),
                             success: false,
                             output: String::new(),
@@ -155,6 +159,7 @@ impl ToolExecutor for AskQuestionTool {
             }
             _ => {
                 return ToolResult {
+                    timed_out: false,
                     call_id: call.id.clone(),
                     success: false,
                     output: String::new(),
@@ -165,6 +170,7 @@ impl ToolExecutor for AskQuestionTool {
 
         if options.is_empty() {
             return ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),
@@ -199,6 +205,7 @@ impl ToolExecutor for AskQuestionTool {
             let mut m = self.pending.lock().unwrap();
             m.remove(&question_id);
             return ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),
@@ -212,6 +219,7 @@ impl ToolExecutor for AskQuestionTool {
                 let mut m = self.pending.lock().unwrap();
                 m.remove(&question_id);
                 return ToolResult {
+                    timed_out: false,
                     call_id: call.id.clone(),
                     success: false,
                     output: String::new(),
@@ -232,6 +240,7 @@ impl ToolExecutor for AskQuestionTool {
             .await;
 
         ToolResult {
+            timed_out: false,
             call_id: call.id.clone(),
             success: true,
             output: summary,

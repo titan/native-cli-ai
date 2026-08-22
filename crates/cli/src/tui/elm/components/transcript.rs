@@ -1426,6 +1426,7 @@ mod tests {
         t.apply_event(&AgentEvent::ToolCallCompleted {
             call_id: "call-1".into(),
             output: ToolResult {
+                timed_out: false,
                 call_id: "call-1".into(),
                 success: true,
                 output: "line1\nline2\nline3\nline4".into(),

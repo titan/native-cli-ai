@@ -32,6 +32,7 @@ struct PatchEdit {
 impl ToolExecutor for ApplyPatchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
+            timeout_ms: None,
             name: "apply_patch".into(),
             description: "Apply one or more exact string replacements to a file".into(),
             parameters: serde_json::json!({
@@ -63,6 +64,7 @@ impl ToolExecutor for ApplyPatchTool {
 
         if p.edits.is_empty() {
             return ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),
@@ -103,6 +105,7 @@ impl ToolExecutor for ApplyPatchTool {
 
         match self.fs.write_file(&p.path, &content).await {
             Ok(()) => ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: errors.is_empty(),
                 output: format!(

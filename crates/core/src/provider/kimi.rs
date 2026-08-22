@@ -216,6 +216,7 @@ mod tests {
             .chat(
                 &[Message::user("read src")],
                 &[ToolDefinition {
+                    timeout_ms: None,
                     name: "read".into(),
                     description: "Read a file".into(),
                     parameters: json!({

@@ -391,6 +391,7 @@ fn parse_capabilities(hello: &hello::Reader<'_>) -> Result<PluginCapabilities, W
         let description = tool_reader.get_description()?.to_string()?;
         let params = build_json_schema(&tool_reader)?;
         tools.push(ToolDefinition {
+            timeout_ms: None,
             name,
             description,
             parameters: params,

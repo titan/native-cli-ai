@@ -29,6 +29,7 @@ struct Params {
 impl ToolExecutor for EditFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
+            timeout_ms: None,
             name: "edit_file".into(),
             description: "Replace a specific string in an existing file".into(),
             parameters: serde_json::json!({
@@ -52,6 +53,7 @@ impl ToolExecutor for EditFileTool {
 
         if p.old_text.is_empty() {
             return ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),
@@ -67,6 +69,7 @@ impl ToolExecutor for EditFileTool {
         let occurrence_count = content.matches(&p.old_text).count();
         if occurrence_count == 0 {
             return ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),
@@ -78,6 +81,7 @@ impl ToolExecutor for EditFileTool {
             content.replace(&p.old_text, &p.new_text)
         } else if occurrence_count > 1 {
             return ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),
@@ -91,6 +95,7 @@ impl ToolExecutor for EditFileTool {
             updated
         } else {
             return ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),
@@ -100,6 +105,7 @@ impl ToolExecutor for EditFileTool {
 
         match self.fs.write_file(&p.path, &updated).await {
             Ok(()) => ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: true,
                 output: format!(

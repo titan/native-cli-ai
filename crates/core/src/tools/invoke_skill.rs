@@ -23,6 +23,7 @@ impl InvokeSkillTool {
 impl ToolExecutor for InvokeSkillTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
+            timeout_ms: None,
             name: "invoke_skill".into(),
             description: "Load a skill's full instructions by name. Use this when a task matches \
                 an available skill from the skills manifest. Returns the complete skill \
@@ -50,6 +51,7 @@ impl ToolExecutor for InvokeSkillTool {
 
         if skill_name.is_empty() {
             return ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),
@@ -61,6 +63,7 @@ impl ToolExecutor for InvokeSkillTool {
             Ok(s) => s,
             Err(e) => {
                 return ToolResult {
+                    timed_out: false,
                     call_id: call.id.clone(),
                     success: false,
                     output: String::new(),
@@ -72,6 +75,7 @@ impl ToolExecutor for InvokeSkillTool {
         if let Some(skill) = skills.iter().find(|s| s.command == skill_name) {
             let body = skill.expanded_body();
             ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: true,
                 output: format!(
@@ -84,6 +88,7 @@ impl ToolExecutor for InvokeSkillTool {
         } else {
             let available: Vec<&str> = skills.iter().map(|s| s.command.as_str()).collect();
             ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),

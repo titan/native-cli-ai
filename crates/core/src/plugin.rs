@@ -167,6 +167,7 @@ pub trait NcaPlugin: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolResult> + Send + '_>> {
         Box::pin(async {
             ToolResult {
+                timed_out: false,
                 call_id: String::new(),
                 success: false,
                 output: String::new(),
@@ -429,6 +430,7 @@ mod tests {
 
         fn tools(&self) -> Vec<ToolDefinition> {
             vec![ToolDefinition {
+                timeout_ms: None,
                 name: "search-web".into(),
                 description: "Search the web".into(),
                 parameters: serde_json::json!({"type": "object", "properties": {}}),

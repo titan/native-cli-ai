@@ -27,6 +27,7 @@ struct Params {
 impl ToolExecutor for DeletePathTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
+            timeout_ms: None,
             name: "delete_path".into(),
             description: "Delete a file or directory within the workspace".into(),
             parameters: serde_json::json!({
@@ -68,6 +69,7 @@ impl ToolExecutor for DeletePathTool {
 
         match result {
             Ok(()) => ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: true,
                 output: format!("Deleted {}", p.path),

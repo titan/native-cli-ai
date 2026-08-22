@@ -25,6 +25,7 @@ struct Params {
 impl ToolExecutor for CreateDirectoryTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
+            timeout_ms: None,
             name: "create_directory".into(),
             description: "Create a directory inside the workspace".into(),
             parameters: serde_json::json!({
@@ -44,6 +45,7 @@ impl ToolExecutor for CreateDirectoryTool {
         };
         match self.fs.create_dir_all(&p.path).await {
             Ok(()) => ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: true,
                 output: format!("Created directory {}", p.path),

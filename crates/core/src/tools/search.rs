@@ -138,6 +138,7 @@ fn parse_context_line(data: &Value) -> Option<ContextLine> {
 impl ToolExecutor for SearchCodeTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
+            timeout_ms: None,
             name: "search_code".into(),
             description: "Search code with ripgrep and return structured JSON match objects".into(),
             parameters: serde_json::json!({
@@ -194,6 +195,7 @@ impl ToolExecutor for SearchCodeTool {
         let pattern = p.pattern.trim().to_string();
         if pattern.is_empty() {
             return ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),
@@ -205,6 +207,7 @@ impl ToolExecutor for SearchCodeTool {
             Ok(path) => path,
             Err(err) => {
                 return ToolResult {
+                    timed_out: false,
                     call_id: call.id.clone(),
                     success: false,
                     output: String::new(),
@@ -244,6 +247,7 @@ impl ToolExecutor for SearchCodeTool {
             Ok(output) => output,
             Err(err) => {
                 return ToolResult {
+                    timed_out: false,
                     call_id: call.id.clone(),
                     success: false,
                     output: String::new(),
@@ -256,6 +260,7 @@ impl ToolExecutor for SearchCodeTool {
         if !matches!(exit_code, 0 | 1) {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             return ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),
@@ -284,6 +289,7 @@ impl ToolExecutor for SearchCodeTool {
                 Ok(event) => event,
                 Err(err) => {
                     return ToolResult {
+                        timed_out: false,
                         call_id: call.id.clone(),
                         success: false,
                         output: String::new(),
@@ -378,12 +384,14 @@ impl ToolExecutor for SearchCodeTool {
 
         match serde_json::to_string_pretty(&response) {
             Ok(output) => ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: true,
                 output,
                 error: None,
             },
             Err(err) => ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),

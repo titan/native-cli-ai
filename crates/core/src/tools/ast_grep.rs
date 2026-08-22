@@ -120,6 +120,7 @@ fn make_call_result(
     error: Option<String>,
 ) -> ToolResult {
     ToolResult {
+        timed_out: false,
         call_id: call_id.to_string(),
         success,
         output,
@@ -157,6 +158,7 @@ fn default_max_results() -> usize {
 impl ToolExecutor for AstGrepSearchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
+            timeout_ms: None,
             name: "ast_grep_search".into(),
             description: "AST-aware code search across the filesystem. Supports 25 languages. \
                 Uses meta-variables: $VAR (single node), $$$ (multiple nodes). \
@@ -378,6 +380,7 @@ struct ReplaceParams {
 impl ToolExecutor for AstGrepReplaceTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
+            timeout_ms: None,
             name: "ast_grep_replace".into(),
             description: "Replace code patterns across filesystem with AST-aware rewriting. \
                 Dry-run by default. Use meta-variables in rewrite to preserve matched content. \

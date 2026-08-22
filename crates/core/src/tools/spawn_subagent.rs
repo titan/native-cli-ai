@@ -43,6 +43,7 @@ impl SpawnSubagentTool {
 impl ToolExecutor for SpawnSubagentTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
+            timeout_ms: None,
             name: "spawn_subagent".into(),
             description: "Spawn a sub-agent that runs as a separate session to handle a specific \
                 task in parallel. The sub-agent inherits your conversation context and workspace. \
@@ -88,6 +89,7 @@ impl ToolExecutor for SpawnSubagentTool {
 
         if task.is_empty() {
             return ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),
@@ -130,6 +132,7 @@ impl ToolExecutor for SpawnSubagentTool {
 
         if self.spawn_tx.send(req).await.is_err() {
             return ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),
@@ -142,6 +145,7 @@ impl ToolExecutor for SpawnSubagentTool {
                 let output = serde_json::to_string_pretty(&response).unwrap_or_default();
                 let success = response.status == "completed";
                 ToolResult {
+                    timed_out: false,
                     call_id: call.id.clone(),
                     success,
                     output,
@@ -156,12 +160,14 @@ impl ToolExecutor for SpawnSubagentTool {
                 }
             }
             Ok(Err(_)) => ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),
                 error: Some("Sub-agent spawner dropped the reply channel".into()),
             },
             Err(_) => ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),

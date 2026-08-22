@@ -128,6 +128,7 @@ pub fn validate_todos(input: &serde_json::Value) -> Result<Vec<AgentTodo>, Strin
 impl ToolExecutor for UpdateTodosTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
+            timeout_ms: None,
             name: "update_todos".into(),
             description: "Replace the session todo list atomically. Pass the complete current \
                 list (not a patch). Use this to track multi-step work: keep at most one item \
@@ -176,6 +177,7 @@ impl ToolExecutor for UpdateTodosTool {
             Ok(todos) => todos,
             Err(error) => {
                 return ToolResult {
+                    timed_out: false,
                     call_id: call.id.clone(),
                     success: false,
                     output: String::new(),
@@ -189,6 +191,7 @@ impl ToolExecutor for UpdateTodosTool {
                 Ok(g) => g,
                 Err(_) => {
                     return ToolResult {
+                        timed_out: false,
                         call_id: call.id.clone(),
                         success: false,
                         output: String::new(),
@@ -208,6 +211,7 @@ impl ToolExecutor for UpdateTodosTool {
             .is_err()
         {
             return ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),
@@ -229,6 +233,7 @@ impl ToolExecutor for UpdateTodosTool {
             .count();
 
         ToolResult {
+            timed_out: false,
             call_id: call.id.clone(),
             success: true,
             output: format!(

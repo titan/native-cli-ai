@@ -35,6 +35,7 @@ impl WebSearchTool {
 impl ToolExecutor for WebSearchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
+            timeout_ms: Some(30_000),
             name: "web_search".into(),
             description: "Search the public web and return titles, URLs, and snippets".into(),
             parameters: serde_json::json!({
@@ -58,6 +59,7 @@ impl ToolExecutor for WebSearchTool {
 
         if query.is_empty() {
             return ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),
@@ -83,6 +85,7 @@ impl ToolExecutor for WebSearchTool {
                 Ok(body) => body,
                 Err(err) => {
                     return ToolResult {
+                        timed_out: false,
                         call_id: call.id.clone(),
                         success: false,
                         output: String::new(),
@@ -92,6 +95,7 @@ impl ToolExecutor for WebSearchTool {
             },
             Err(err) => {
                 return ToolResult {
+                    timed_out: false,
                     call_id: call.id.clone(),
                     success: false,
                     output: String::new(),
@@ -106,6 +110,7 @@ impl ToolExecutor for WebSearchTool {
             let document = Html::parse_document(&body);
             let fallback = clean_text(&extract_text(&document));
             return ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: fallback.chars().take(self.config.max_fetch_chars).collect(),
@@ -114,6 +119,7 @@ impl ToolExecutor for WebSearchTool {
         }
 
         ToolResult {
+            timed_out: false,
             call_id: call.id.clone(),
             success: true,
             output: rows.join("\n"),

@@ -26,6 +26,7 @@ struct Params {
 impl ToolExecutor for MovePathTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
+            timeout_ms: None,
             name: "move_path".into(),
             description: "Move a file or directory within the workspace".into(),
             parameters: serde_json::json!({
@@ -46,6 +47,7 @@ impl ToolExecutor for MovePathTool {
         };
         match self.fs.rename(&p.from, &p.to).await {
             Ok(()) => ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: true,
                 output: format!("Moved {} -> {}", p.from, p.to),

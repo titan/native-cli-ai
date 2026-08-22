@@ -26,6 +26,7 @@ struct Params {
 impl ToolExecutor for RenamePathTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
+            timeout_ms: None,
             name: "rename_path".into(),
             description: "Rename a file or directory within the workspace".into(),
             parameters: serde_json::json!({
@@ -46,6 +47,7 @@ impl ToolExecutor for RenamePathTool {
         };
         match self.fs.rename(&p.from, &p.to).await {
             Ok(()) => ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: true,
                 output: format!("Renamed {} -> {}", p.from, p.to),

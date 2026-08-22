@@ -15,6 +15,7 @@ use crate::context_view::plan_context_view;
 use crate::cost::CostTracker;
 use crate::hooks::{HookEventKind, HookRunner};
 use crate::provider::{Provider, ProviderError, StreamChunk};
+use crate::tool_guards::RepeatCallGuard;
 use crate::tool_pipeline;
 use crate::tools::ToolRegistry;
 
@@ -38,6 +39,8 @@ pub struct AgentLoop {
     tool_start_times: HashMap<String, Instant>,
     /// Prompt-cache keepalive profile (per-provider economics).
     keepalive_profile: KeepaliveProfile,
+    /// Session-scoped repeated-call guard (persists across tool batches/turns).
+    repeat_guard: RepeatCallGuard,
 }
 
 impl AgentLoop {
@@ -69,6 +72,7 @@ impl AgentLoop {
             smart_compaction_mode: SmartCompactionMode::Off,
             tool_start_times: HashMap::new(),
             keepalive_profile: KeepaliveProfile::disabled(),
+            repeat_guard: RepeatCallGuard::new(),
         }
     }
 
@@ -445,13 +449,14 @@ impl AgentLoop {
                 self.event_tx.clone(),
             );
 
-            let pipeline = tool_pipeline::run_tool_pipeline(
+            let pipeline = tool_pipeline::run_tool_pipeline_with_guards(
                 &self.tools,
                 &mut self.approval,
                 &self.hooks,
                 &self.event_tx,
                 &self.cancel_flag,
                 tool_calls.clone(),
+                &mut self.repeat_guard,
             )
             .await
             .map_err(ProviderError::Other)?;

@@ -19,6 +19,7 @@ impl GitStatusTool {
 impl ToolExecutor for GitStatusTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
+            timeout_ms: None,
             name: "git_status".into(),
             description: "Show git status for the current workspace".into(),
             parameters: serde_json::json!({
@@ -40,6 +41,7 @@ impl ToolExecutor for GitStatusTool {
             Ok(out) => {
                 let text = String::from_utf8_lossy(&out.stdout).to_string();
                 ToolResult {
+                    timed_out: false,
                     call_id: call.id.clone(),
                     success: true,
                     output: if text.is_empty() {
@@ -51,6 +53,7 @@ impl ToolExecutor for GitStatusTool {
                 }
             }
             Err(e) => ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),
@@ -74,6 +77,7 @@ impl GitDiffTool {
 impl ToolExecutor for GitDiffTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
+            timeout_ms: None,
             name: "git_diff".into(),
             description: "Show git diff for the current workspace".into(),
             parameters: serde_json::json!({
@@ -99,6 +103,7 @@ impl ToolExecutor for GitDiffTool {
             Ok(out) => {
                 let text = String::from_utf8_lossy(&out.stdout).to_string();
                 ToolResult {
+                    timed_out: false,
                     call_id: call.id.clone(),
                     success: true,
                     output: if text.is_empty() {
@@ -110,6 +115,7 @@ impl ToolExecutor for GitDiffTool {
                 }
             }
             Err(e) => ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),

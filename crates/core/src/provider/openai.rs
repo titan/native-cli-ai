@@ -58,6 +58,7 @@ mod tests {
             .chat(
                 &[Message::user("hello")],
                 &[ToolDefinition {
+                    timeout_ms: None,
                     name: "lookup".into(),
                     description: "Lookup a path".into(),
                     parameters: json!({

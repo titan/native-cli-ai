@@ -37,6 +37,7 @@ fn default_timeout() -> u64 {
 impl ToolExecutor for RunValidationTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
+            timeout_ms: Some(300_000),
             name: "run_validation".into(),
             description: "Run a safe build, test, or lint command inside the workspace".into(),
             parameters: serde_json::json!({
@@ -71,6 +72,7 @@ impl ToolExecutor for RunValidationTool {
             Ok(p) => p,
             Err(e) => {
                 return ToolResult {
+                    timed_out: false,
                     call_id: call.id.clone(),
                     success: false,
                     output: String::new(),
@@ -90,6 +92,7 @@ impl ToolExecutor for RunValidationTool {
             Ok(c) => c,
             Err(e) => {
                 return ToolResult {
+                    timed_out: false,
                     call_id: call.id.clone(),
                     success: false,
                     output: String::new(),
@@ -108,6 +111,7 @@ impl ToolExecutor for RunValidationTool {
             Ok(Err(e)) => {
                 std::mem::drop(child.kill());
                 return ToolResult {
+                    timed_out: false,
                     call_id: call.id.clone(),
                     success: false,
                     output: String::new(),
@@ -118,6 +122,7 @@ impl ToolExecutor for RunValidationTool {
                 std::mem::drop(child.kill());
                 std::mem::drop(child.wait());
                 return ToolResult {
+                    timed_out: false,
                     call_id: call.id.clone(),
                     success: false,
                     output: String::new(),
@@ -147,6 +152,7 @@ impl ToolExecutor for RunValidationTool {
         }
 
         ToolResult {
+            timed_out: false,
             call_id: call.id.clone(),
             success: status.success(),
             output: text,

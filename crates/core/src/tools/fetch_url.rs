@@ -25,6 +25,7 @@ impl FetchUrlTool {
 impl ToolExecutor for FetchUrlTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
+            timeout_ms: Some(30_000),
             name: "fetch_url".into(),
             description: "Fetch and normalize the text content of a URL".into(),
             parameters: serde_json::json!({
@@ -41,6 +42,7 @@ impl ToolExecutor for FetchUrlTool {
         let url = call.input["url"].as_str().unwrap_or("").trim();
         if url.is_empty() {
             return ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),
@@ -53,6 +55,7 @@ impl ToolExecutor for FetchUrlTool {
             Ok(response) => response,
             Err(err) => {
                 return ToolResult {
+                    timed_out: false,
                     call_id: call.id.clone(),
                     success: false,
                     output: String::new(),
@@ -64,6 +67,7 @@ impl ToolExecutor for FetchUrlTool {
         let status = response.status();
         if !status.is_success() {
             return ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),
@@ -82,6 +86,7 @@ impl ToolExecutor for FetchUrlTool {
             Ok(body) => body,
             Err(err) => {
                 return ToolResult {
+                    timed_out: false,
                     call_id: call.id.clone(),
                     success: false,
                     output: String::new(),
@@ -97,6 +102,7 @@ impl ToolExecutor for FetchUrlTool {
         };
 
         ToolResult {
+            timed_out: false,
             call_id: call.id.clone(),
             success: true,
             output: normalized

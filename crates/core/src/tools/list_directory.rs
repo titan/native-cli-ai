@@ -30,6 +30,7 @@ fn default_path() -> String {
 impl ToolExecutor for ListDirectoryTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
+            timeout_ms: None,
             name: "list_directory".into(),
             description: "List files and directories under a path".into(),
             parameters: serde_json::json!({
@@ -76,6 +77,7 @@ impl ToolExecutor for ListDirectoryTool {
         }
 
         ToolResult {
+            timed_out: false,
             call_id: call.id.clone(),
             success: true,
             output: lines.join("\n"),

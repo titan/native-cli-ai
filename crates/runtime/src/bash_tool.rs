@@ -22,6 +22,7 @@ impl ToolExecutor for RuntimeBashTool {
     fn definition(&self) -> ToolDefinition {
         let cwd = self.pty.workspace_root().display().to_string();
         ToolDefinition {
+            timeout_ms: None,
             name: "execute_bash".into(),
             description: format!("Execute a shell command in the workspace (cwd: {cwd})"),
             parameters: serde_json::json!({
@@ -57,6 +58,7 @@ impl ToolExecutor for RuntimeBashTool {
             .await
         {
             Ok(out) => ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: out.exit_code == 0,
                 output: if out.stdout.is_empty() {
@@ -67,6 +69,7 @@ impl ToolExecutor for RuntimeBashTool {
                 error: None,
             },
             Err(err) => ToolResult {
+                timed_out: false,
                 call_id: call.id.clone(),
                 success: false,
                 output: String::new(),
