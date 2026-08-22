@@ -290,7 +290,7 @@ pub struct SandboxPolicy {
 ```
 
 - `exec_confined(cmd, policy) -> Result<PtyOutput>`：fork 后 pre-exec 阩塞
-  apply_ruleset（landlock crate 的 `RulesetCreated::apply_self()`，仅当前线程）
+  apply_ruleset（landlock crate 的 `RulesetCreated::restrict_self()`，仅当前线程）
   → execvp。与现有 `PtyManager::exec_streaming` 的 process_group(0) 组合
   （Landlock 约束随 exec 保留给子进程，父进程 unconfined）。
 - **fail-closed 语义**：`sandbox = "required"` 时探测失败 → 返回
