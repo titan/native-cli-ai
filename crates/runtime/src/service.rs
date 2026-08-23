@@ -149,7 +149,7 @@ async fn run_service_session_with_startup(
     }
 
     let commit_tx = handle.take_turn_commit_tx().map(|(tx, _flag)| tx);
-    let fanout_task = spawn_event_fanout(
+    let mut fanout_task = spawn_event_fanout(
         event_rx,
         info.event_log_path.clone(),
         event_tx_ipc,
@@ -252,12 +252,28 @@ async fn run_service_session_with_startup(
     }
 
     supervisor.finish(reason).await;
-    fanout_task.abort();
+
+    // Close order matters (oracle P0): the event channel has three sender
+    // holders — the supervisor (incl. tool clones), `command_task`, and
+    // `subagent_task`. The fanout task only drains once ALL senders drop,
+    // so abort the two auxiliary tasks FIRST (neither holds durable
+    // state), then drop the supervisor to close the channel, and only then
+    // bounded-await the fanout (it commits the log on drain). Awaiting the
+    // fanout before the aborts would stall into the timeout on every
+    // shutdown.
     if let Some(task) = command_task {
         task.abort();
     }
     if let Some(task) = subagent_task {
         task.abort();
+    }
+    drop(supervisor);
+    match tokio::time::timeout(std::time::Duration::from_secs(5), &mut fanout_task).await {
+        Ok(_) => {}
+        Err(_) => {
+            tracing::error!("event fanout drain at service shutdown timed out; aborting");
+            fanout_task.abort();
+        }
     }
     Ok(())
 }

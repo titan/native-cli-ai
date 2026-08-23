@@ -133,6 +133,14 @@ pub fn spawn_event_fanout(
                 cb(&envelope);
             }
         }
+
+        // All senders dropped (owning supervisor gone): flush + fsync
+        // anything still buffered (e.g. `SessionEnded`) so the log is
+        // durable on graceful close instead of resting in the page cache.
+        // Log-and-continue on error, matching the TurnCompleted handling.
+        if let Err(e) = writer.commit().await {
+            tracing::error!("event-log commit at channel close failed: {e}");
+        }
     })
 }
 

@@ -203,18 +203,35 @@ pub async fn spawn_child_session(
         }
     };
 
-    if let Some(f) = fanout {
-        f.abort();
-    }
-
+    // Snapshot meta BEFORE dropping the supervisor: `switch_to_worktree`
+    // mutates `sup.workspace_root` (supervisor.rs) and the result reads it,
+    // while `drop(sup)` moves `sup` out of reach.
     let branch = sup.branch.clone();
     let wt_path = sup.worktree_path.clone().map(|p| p.display().to_string());
+    let workspace_root = sup.workspace_root.display().to_string();
+
+    if let Some(mut f) = fanout {
+        // Graceful drain: dropping `sup` closes the child's event channel
+        // (all senders live inside `sup.agent`), letting the fanout drain
+        // its buffer and hit the final commit-on-close. Bounded wait —
+        // liveness over completeness at shutdown.
+        drop(sup);
+        match tokio::time::timeout(std::time::Duration::from_secs(5), &mut f).await {
+            Ok(_) => {}
+            Err(_) => {
+                tracing::error!("event fanout drain for child session timed out; aborting");
+                f.abort();
+            }
+        }
+    } else {
+        drop(sup);
+    }
 
     Ok(ChildSessionResult {
         child_session_id: child_id,
         status,
         output,
-        workspace: sup.workspace_root.display().to_string(),
+        workspace: workspace_root,
         branch,
         worktree_path: wt_path,
     })
