@@ -19,6 +19,7 @@ use crate::agent::AgentLoop;
 use crate::cache_keepalive::{CacheKeepalive, KeepaliveSnapshot};
 use crate::context_view::plan_context_view;
 use crate::hooks::HookEventKind;
+use crate::middleware::{StepReply, StepRequest};
 use crate::provider::{ProviderError, StreamChunk};
 use crate::tool_pipeline;
 
@@ -326,15 +327,65 @@ impl<'a> TurnDriver<'a> {
             agent.messages.clone()
         };
 
-        let mut stream = agent
-            .provider
-            .chat(
-                &request_messages,
-                &agent.tool_definitions(),
-                &agent.model,
-                self.workspace_root,
+        let reply = agent
+            .middleware
+            .call(
+                &agent.provider,
+                StepRequest {
+                    messages: request_messages,
+                    tools: agent.tool_definitions(),
+                    model: agent.model.clone(),
+                    workspace_root: self.workspace_root.to_path_buf(),
+                    turn_id: self.turn_id,
+                    step_index: self.step_index,
+                    event_tx: agent.event_tx.clone(),
+                },
             )
             .await?;
+
+        let mut stream = match reply {
+            StepReply::Stream(stream) => stream,
+            StepReply::FinalText(text) => {
+                // Empty short-circuit text is a middleware bug — fail loudly,
+                // do NOT record an empty assistant message (the empty-response
+                // policy exists precisely because empty assistant messages
+                // confuse providers and would replay back on resume).
+                if text.trim().is_empty() {
+                    return Err(ProviderError::Other(
+                        "middleware short-circuited the step with empty final text".into(),
+                    ));
+                }
+                // Attachments are real inputs even though the provider never
+                // ran: run the same cleanup the stream path does, BEFORE
+                // recording, so history + disk stay consistent (oracle P1-1).
+                if !self.attachments_cleaned {
+                    crate::agent::cleanup_processed_attachments(
+                        &mut agent.messages,
+                        self.workspace_root,
+                        attachments,
+                    );
+                    self.attachments_cleaned = true;
+                }
+                // Replay-safe short-circuit: identical bookkeeping to the
+                // normal final-text path — record, push, emit, then FinalText.
+                // The empty-response retry counter is intentionally NOT
+                // applied: the provider never ran.
+                let msg = Message::assistant(text.clone());
+                agent.record(&msg).await;
+                agent.messages.push(msg);
+                agent
+                    .emit(AgentEvent::MessageReceived {
+                        role: "assistant".into(),
+                        content: text.clone(),
+                        steering: false,
+                    })
+                    .await;
+                return Ok(StepOutcome::FinalText {
+                    text,
+                    had_tool_calls: false,
+                });
+            }
+        };
 
         let mut assistant_text = String::new();
         let mut reasoning_text = String::new();

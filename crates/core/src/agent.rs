@@ -39,6 +39,9 @@ pub struct AgentLoop {
     pub(crate) keepalive_profile: KeepaliveProfile,
     /// Session-scoped repeated-call guard (persists across tool batches/turns).
     pub(crate) repeat_guard: RepeatCallGuard,
+    /// Step-request middleware chain (P4). Empty by default — a bare
+    /// `AgentLoop` is observably identical to pre-P4 behavior.
+    pub(crate) middleware: crate::middleware::MiddlewareChain,
     /// Sender half of the single inbox (bounded 16). Cloned out via
     /// [`AgentLoop::inbox_sender`] for prompts/steering while a turn runs.
     inbox_tx: tokio::sync::mpsc::Sender<InboxItem>,
@@ -82,6 +85,7 @@ impl AgentLoop {
             tool_start_times: HashMap::new(),
             keepalive_profile: KeepaliveProfile::disabled(),
             repeat_guard: RepeatCallGuard::new(),
+            middleware: crate::middleware::MiddlewareChain::new(),
             inbox_tx,
             inbox_rx,
             turn_seq: 0,
@@ -93,6 +97,16 @@ impl AgentLoop {
     /// is surfaced by the caller.
     pub fn inbox_sender(&self) -> tokio::sync::mpsc::Sender<InboxItem> {
         self.inbox_tx.clone()
+    }
+
+    /// Append a step-request middleware. First added = outermost (wraps
+    /// everything added later and the provider call itself).
+    pub fn with_middleware(
+        mut self,
+        middleware: std::sync::Arc<dyn crate::middleware::AgentMiddleware>,
+    ) -> Self {
+        self.middleware.push(middleware);
+        self
     }
 
     /// Seed the turn-id counter (session resume: max `TurnStarted.turn_id`

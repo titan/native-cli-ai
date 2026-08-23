@@ -3,7 +3,10 @@
 > Implements `deepseek-harness-adoption.md` §P4. Prerequisites merged: P1
 > (`agent_driver.rs` step boundary), P2 (event-sourced sessions — the
 > projection invariants below assume it). Status: design complete,
-> oracle-reviewed (record at the bottom); implementation in progress.
+> oracle-reviewed (record at the bottom); **Status: implemented 2026-08-23 —
+> module + wiring + unit tests M1–M5 landed** (`crates/core/src/middleware.rs`,
+> `agent_driver.rs` step rewiring); integration tests M6–M9 pending (tester
+> lane, `core/tests/middleware.rs`).
 
 ## Problem
 

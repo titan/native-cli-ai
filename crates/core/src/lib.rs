@@ -7,6 +7,7 @@ pub mod context_view;
 pub mod cost;
 pub mod harness;
 pub mod hooks;
+pub mod middleware;
 pub mod plugin;
 pub mod plugin_protocol;
 
