@@ -892,7 +892,6 @@ impl Supervisor {
             .await;
         }
 
-        self.save().await.map_err(ProviderError::Other)?;
         self.update_last_session()
             .await
             .map_err(ProviderError::Other)?;
