@@ -126,6 +126,18 @@ impl<'a> TurnDriver<'a> {
         }
     }
 
+    /// Emit `StepCompleted` for the step that just ran.
+    async fn emit_step_completed(&mut self, duration_ms: u64, had_tool_calls: bool) {
+        self.agent
+            .emit(AgentEvent::StepCompleted {
+                turn_id: self.turn_id,
+                step_index: self.step_index,
+                duration_ms,
+                had_tool_calls,
+            })
+            .await;
+    }
+
     /// The driver loop: claim inbox → cancel check → StepStarted → step().
     /// `owed` is true while the conversation still expects another step
     /// (tool calls executed, or an empty-response retry).
@@ -158,51 +170,30 @@ impl<'a> TurnDriver<'a> {
                 })
                 .await;
             let step_start = Instant::now();
+            let outcome = self.step(attachments).await;
             let duration_ms = step_start.elapsed().as_millis() as u64;
-            match self.step(attachments).await {
+            match outcome {
                 Ok(StepOutcome::FinalText {
                     text,
                     had_tool_calls,
                 }) => {
-                    self.agent
-                        .emit(AgentEvent::StepCompleted {
-                            turn_id: self.turn_id,
-                            step_index: self.step_index,
-                            duration_ms: step_start.elapsed().as_millis() as u64,
-                            had_tool_calls,
-                        })
-                        .await;
+                    self.emit_step_completed(duration_ms, had_tool_calls).await;
                     break text;
                 }
                 Ok(StepOutcome::Continue { had_tool_calls }) => {
-                    self.agent
-                        .emit(AgentEvent::StepCompleted {
-                            turn_id: self.turn_id,
-                            step_index: self.step_index,
-                            duration_ms: step_start.elapsed().as_millis() as u64,
-                            had_tool_calls,
-                        })
-                        .await;
+                    self.emit_step_completed(duration_ms, had_tool_calls).await;
                     owed = had_tool_calls;
                 }
                 Ok(StepOutcome::Retry) => {
-                    self.agent
-                        .emit(AgentEvent::StepCompleted {
-                            turn_id: self.turn_id,
-                            step_index: self.step_index,
-                            duration_ms: step_start.elapsed().as_millis() as u64,
-                            had_tool_calls: false,
-                        })
-                        .await;
+                    self.emit_step_completed(duration_ms, false).await;
                     owed = true;
                 }
                 Err(e) => {
-                    let _ = duration_ms;
                     self.agent
                         .emit(AgentEvent::StepFailed {
                             turn_id: self.turn_id,
                             step_index: self.step_index,
-                            duration_ms: step_start.elapsed().as_millis() as u64,
+                            duration_ms,
                             error: e.to_string(),
                         })
                         .await;
