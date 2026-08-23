@@ -172,6 +172,10 @@ impl AgentLoop {
             Message::user_with_parts(parts)
         };
         let preview = user_msg.event_preview();
+        self.emit(AgentEvent::MessageRecorded {
+            message: user_msg.clone(),
+        })
+        .await;
         self.messages.push(user_msg);
         self.emit(AgentEvent::MessageReceived {
             role: "user".into(),

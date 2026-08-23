@@ -74,6 +74,12 @@ pub enum AgentEvent {
         #[serde(default)]
         steering: bool,
     },
+    /// A model-visible message was pushed to `agent.messages`. The replay
+    /// projection folds these, in order, to reconstruct conversation state.
+    /// Emitted at every push site inside `run_turn`; never for system prompts.
+    MessageRecorded {
+        message: crate::message::Message,
+    },
     /// A turn started: emitted at the beginning of `run_turn`. `turn_id` is
     /// monotonic per agent (1-based) and stays session-unique across resume.
     TurnStarted {
@@ -384,6 +390,28 @@ mod interactive_question_serde_tests {
         let back: AgentEvent = serde_json::from_str(&json).expect("deserialize");
         match back {
             AgentEvent::QuestionRequested { question } => assert_eq!(question, q),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn message_recorded_roundtrip() {
+        let message = crate::message::Message::assistant_with_tool_calls(
+            "thinking aloud",
+            vec![crate::message::MessageToolCall {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path": "README.md"}),
+            }],
+        )
+        .with_reasoning("because".into());
+        let ev = AgentEvent::MessageRecorded {
+            message: message.clone(),
+        };
+        let json = serde_json::to_string(&ev).expect("serialize");
+        let back: AgentEvent = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            AgentEvent::MessageRecorded { message: m } => assert_eq!(m, message),
             _ => panic!("wrong variant"),
         }
     }

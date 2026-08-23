@@ -18,6 +18,7 @@ pub mod plugin_capnp {
     include!(concat!(env!("OUT_DIR"), "/schema/plugin_capnp.rs"));
 }
 pub mod provider;
+pub mod replay;
 pub mod skill_installer;
 pub mod skills;
 pub mod tool_guards;

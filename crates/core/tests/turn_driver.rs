@@ -594,6 +594,71 @@ fn old_log_serde_replay() {
 }
 
 // ---------------------------------------------------------------------------
+// T7 — MessageRecorded events exactly mirror agent.messages (P2 Phase A)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn message_recorded_matches_agent_messages() {
+    let provider = Arc::new(CapturingScriptedProvider::new(
+        vec![
+            vec![
+                StreamChunk::ReasoningDelta("need tools".into()),
+                StreamChunk::ToolUse(ToolCall {
+                    id: "t1".into(),
+                    name: "echo".into(),
+                    input: json!({}),
+                }),
+            ],
+            vec![
+                StreamChunk::TextDelta("done".into()),
+                StreamChunk::Finish {
+                    reason: "stop".into(),
+                },
+            ],
+        ],
+        vec![None, None],
+    ));
+
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
+    let mut agent = test_agent(Arc::clone(&provider) as Arc<dyn Provider>, event_tx);
+    provider.set_inbox(agent.inbox_sender());
+
+    let collector = tokio::spawn(collect_events_until(event_rx, 1));
+
+    let result = agent
+        .run_turn("do the thing", Path::new("."), &[])
+        .await
+        .expect("scripted 2-step turn succeeds");
+    assert_eq!(result, "done");
+
+    let events = collector.await.expect("event collector task");
+    let recorded: Vec<Message> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::MessageRecorded { message } => Some(message.clone()),
+            _ => None,
+        })
+        .collect();
+
+    let expected: Vec<Message> = agent
+        .messages
+        .iter()
+        .filter(|m| m.role != Role::System)
+        .cloned()
+        .collect();
+
+    assert_eq!(
+        recorded, expected,
+        "MessageRecorded sequence must equal agent.messages (sans system), in push order"
+    );
+    // Sanity: the turn actually exercised the interesting sites — initial
+    // user, assistant-with-tool_calls, tool result, assistant final.
+    assert_eq!(recorded.len(), 4, "unexpected record count: {recorded:?}");
+    assert!(recorded.iter().any(|m| m.tool_calls.is_some()));
+    assert!(recorded.iter().any(|m| m.role == Role::Tool));
+}
+
+// ---------------------------------------------------------------------------
 // T6 — inbox is bounded (16); overflow is rejected
 // ---------------------------------------------------------------------------
 
