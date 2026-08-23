@@ -248,6 +248,14 @@ enum Command {
         #[command(subcommand)]
         command: IndexCmd,
     },
+    /// Run a shell command under the Landlock sandbox (P5).
+    SandboxRun {
+        /// Shell command string to execute (e.g. `"cargo build"`);\n        /// required unless `--probe`.
+        cmd: Option<String>,
+        /// Report Landlock backend status without executing anything.
+        #[arg(long)]
+        probe: bool,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -654,6 +662,36 @@ async fn try_main() -> anyhow::Result<()> {
                 autoresearch_once(program, ws).await?;
             }
         },
+        Some(Command::SandboxRun { cmd, probe }) => {
+            if probe {
+                if nca_runtime::sandbox::backend_supported() {
+                    println!("landlock: supported");
+                } else {
+                    println!("landlock: unavailable");
+                }
+                return Ok(());
+            }
+            let cmd = cmd.unwrap_or_else(|| {
+                eprintln!("error: <CMD> is required unless --probe is passed");
+                std::process::exit(2);
+            });
+            if !nca_runtime::sandbox::backend_supported() {
+                eprintln!("error: Landlock sandbox unavailable on this kernel");
+                std::process::exit(2);
+            }
+            let policy = nca_runtime::sandbox::SandboxPolicy::from_config(
+                &config.permissions.sandbox,
+                &workspace_root,
+            );
+            let out = tokio::task::spawn_blocking(move || {
+                nca_runtime::sandbox::exec_confined(&cmd, &policy)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("sandbox task join failed: {e}"))?
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            print!("{}", out.combined);
+            std::process::exit(out.exit_code.unwrap_or(1));
+        }
         None => {
             if let Some(prompt) = cli.prompt.as_deref() {
                 if let Some(mode) = cli.permission_mode {

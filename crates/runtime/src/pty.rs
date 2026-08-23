@@ -1,11 +1,20 @@
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 use tokio::io::AsyncReadExt;
 use tokio::time::{Duration, Instant};
 
+use nca_common::config::SandboxConfig;
 use nca_common::event::AgentEvent;
 use nca_core::tools::ToolProgress;
+
+use crate::sandbox::{self, SandboxPolicy};
+
+/// Warn-once flag for auto-mode sandbox degradation (module-level so all
+/// `PtyManager` instances share it; the warn lands in `.nca/nca.log` in TUI
+/// mode via the tracing file writer).
+static SANDBOX_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// Runs shell commands in their own process group: streams stdout, and on
 /// completion or timeout kills the entire process group (clearing any
@@ -13,13 +22,42 @@ use nca_core::tools::ToolProgress;
 /// starve the TUI input loop.
 pub struct PtyManager {
     workspace_root: Mutex<std::path::PathBuf>,
+    /// Resolved confinement policy; `None` = run unconfined (sandbox off,
+    /// auto-degraded, or never configured).
+    sandbox: Mutex<Option<SandboxPolicy>>,
 }
 
 impl PtyManager {
     pub fn new(workspace_root: impl AsRef<Path>) -> Self {
         Self {
             workspace_root: Mutex::new(workspace_root.as_ref().to_path_buf()),
+            sandbox: Mutex::new(None),
         }
+    }
+
+    /// Configure Landlock confinement for all subsequent `exec_streaming`
+    /// calls. Resolves the mode against the backend exactly once per process
+    /// (warn-once on auto degradation); `required` + unavailable is logged as
+    /// an error and degrades to unconfined rather than breaking every shell
+    /// tool call.
+    pub fn set_sandbox_config(&mut self, cfg: SandboxConfig) {
+        let decision = sandbox::resolve(
+            cfg.mode,
+            &sandbox::backend_supported,
+            &SANDBOX_WARNED,
+            &|| tracing::warn!("Landlock sandbox unavailable; PTY commands run unconfined"),
+        );
+        let policy = match decision {
+            Ok(sandbox::SandboxDecision::Confined) => {
+                Some(SandboxPolicy::from_config(&cfg, &self.workspace_root()))
+            }
+            Ok(sandbox::SandboxDecision::Unconfined) => None,
+            Err(e) => {
+                tracing::error!("sandbox required but unavailable: {e}; running unconfined");
+                None
+            }
+        };
+        *self.sandbox.lock().expect("sandbox lock poisoned") = policy;
     }
 
     pub fn workspace_root(&self) -> std::path::PathBuf {
@@ -49,15 +87,35 @@ impl PtyManager {
         progress: &ToolProgress,
     ) -> Result<PtyOutput, PtyError> {
         let root = self.workspace_root();
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-lc")
-            .arg(command)
-            .current_dir(&root)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // Make the child the leader of a NEW process group (pgid == child pid),
-            // so we can kill the whole group via libc::kill(-pid, SIGKILL).
-            .process_group(0);
+        let sandbox_policy = self.sandbox.lock().expect("sandbox lock poisoned").clone();
+        let mut cmd = if let Some(policy) = sandbox_policy {
+            // Confined path: build the command as std::process::Command (same
+            // sh -lc / cwd / piped stdio / own process group), attach the
+            // Landlock pre_exec via confine_cmd, then hand it to tokio.
+            let std_cmd = {
+                use std::os::unix::process::CommandExt;
+                let mut c = std::process::Command::new("sh");
+                c.arg("-lc")
+                    .arg(command)
+                    .current_dir(&root)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .process_group(0);
+                sandbox::confine_cmd(c, &policy)
+            };
+            tokio::process::Command::from(std_cmd)
+        } else {
+            let mut c = tokio::process::Command::new("sh");
+            c.arg("-lc")
+                .arg(command)
+                .current_dir(&root)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                // Make the child the leader of a NEW process group (pgid == child pid),
+                // so we can kill the whole group via libc::kill(-pid, SIGKILL).
+                .process_group(0);
+            c
+        };
 
         let mut child = cmd
             .spawn()

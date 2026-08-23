@@ -3,6 +3,7 @@ use chrono::{Duration, Utc};
 use nca_common::config::ProviderKind;
 use nca_common::message::Message;
 use nca_common::session::{SessionMeta, SessionState, SessionStatus};
+use predicates::prelude::PredicateBooleanExt;
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
@@ -511,4 +512,40 @@ fn index_show_and_build_json_status() {
     let status: Value = serde_json::from_slice(&out).expect("status json");
     assert!(status["path"].as_str().unwrap().contains("cli-index.json"));
     assert!(status["workspace_id"].as_str().unwrap().len() > 10);
+}
+
+/// §P5 acceptance 3: `nca sandbox-run --probe` reports backend status without
+/// executing a command. Red-phase: the subcommand does not exist yet, so this
+/// fails until the CLI wiring lands.
+#[test]
+fn sandbox_run_probe_reports_backend_status() {
+    let temp = tempdir().expect("tempdir");
+
+    Command::cargo_bin("nca")
+        .expect("binary")
+        .current_dir(temp.path())
+        .env("HOME", temp.path())
+        .args(["sandbox-run", "--probe"])
+        .assert()
+        .success()
+        .stdout(
+            predicates::str::contains("supported").or(predicates::str::contains("unavailable")),
+        );
+}
+
+/// §P5 acceptance 3: `nca sandbox-run "<cmd>"` executes the positional command
+/// string (no `--` separator) and streams its output. Red-phase: fails until
+/// the CLI wiring lands.
+#[test]
+fn sandbox_run_executes_positional_command() {
+    let temp = tempdir().expect("tempdir");
+
+    Command::cargo_bin("nca")
+        .expect("binary")
+        .current_dir(temp.path())
+        .env("HOME", temp.path())
+        .args(["sandbox-run", "echo p5w-ok"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("p5w-ok"));
 }

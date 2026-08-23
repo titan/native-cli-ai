@@ -286,7 +286,11 @@ impl Supervisor {
             }
         }
 
-        let pty = Arc::new(PtyManager::new(&workspace_root));
+        // Wire the P5 Landlock sandbox into every PTY shell execution
+        // (resolved once here; per-exec confinement applies only to children).
+        let mut pty = PtyManager::new(&workspace_root);
+        pty.set_sandbox_config(config.permissions.sandbox.clone());
+        let pty = Arc::new(pty);
         let pty_for_supervisor = pty.clone();
         tools.register(Box::new(crate::bash_tool::RuntimeBashTool::new(pty)));
 

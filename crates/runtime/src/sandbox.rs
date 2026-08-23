@@ -45,6 +45,20 @@ impl SandboxPolicy {
         ro.extend(config.ro_paths.iter().cloned());
 
         let mut rw = vec![workspace_root.to_path_buf(), std::env::temp_dir()];
+        // Plan §P5 default rw roots: also cargo home and XDG cache so that
+        // default-Auto confinement does not break `cargo build`.
+        let cargo_home = std::env::var_os("CARGO_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")));
+        let cache_home = std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")));
+        rw.extend(
+            [cargo_home, cache_home]
+                .into_iter()
+                .flatten()
+                .filter(|p| p.exists()),
+        );
         rw.extend(config.rw_paths.iter().cloned());
 
         Self {
@@ -196,6 +210,30 @@ mod landlock_backend {
             .is_ok()
     }
 
+    /// Attach the Landlock ruleset to a caller-built
+    /// [`std::process::Command`] as a `pre_exec` hook: the caller's
+    /// argv/cwd/pipes are kept, only the confinement is added. The ruleset is
+    /// applied in the child between fork and exec, so the parent stays
+    /// unconfined and the restriction persists across `execve`.
+    ///
+    /// Does NOT probe backend support — callers confine only after
+    /// [`super::resolve`] returned [`super::SandboxDecision::Confined`].
+    pub fn confine_cmd(
+        mut cmd: std::process::Command,
+        policy: &SandboxPolicy,
+    ) -> std::process::Command {
+        let ro = policy.ro.clone();
+        let rw = policy.rw.clone();
+        let net = policy.net;
+        // SAFETY: pre_exec runs between fork and exec in the child; the
+        // closure only issues landlock syscalls and returns an io::Error on
+        // failure, which aborts the exec.
+        unsafe {
+            cmd.pre_exec(move || apply_ruleset(ro.clone(), rw.clone(), net));
+        }
+        cmd
+    }
+
     /// Run `cmd` via `sh -c` under a Landlock ruleset built from `policy`.
     ///
     /// The ruleset is applied in the child's `pre_exec` hook, so the parent
@@ -206,19 +244,9 @@ mod landlock_backend {
             return Err(SandboxError::SandboxUnavailable);
         }
 
-        let ro = policy.ro.clone();
-        let rw = policy.rw.clone();
-        let net = policy.net;
-
         let mut command = std::process::Command::new("sh");
         command.arg("-c").arg(cmd);
-        // SAFETY: pre_exec runs between fork and exec in the child; the
-        // closure only issues landlock syscalls (no allocations beyond what
-        // landlock itself does) and returns an io::Error on failure, which
-        // aborts the exec and propagates as Command::output's error.
-        unsafe {
-            command.pre_exec(move || apply_ruleset(ro.clone(), rw.clone(), net));
-        }
+        let mut command = confine_cmd(command, policy);
 
         let output = command
             .output()
@@ -235,7 +263,7 @@ mod landlock_backend {
 }
 
 #[cfg(target_os = "linux")]
-pub use landlock_backend::{backend_supported, exec_confined};
+pub use landlock_backend::{backend_supported, confine_cmd, exec_confined};
 
 #[cfg(not(target_os = "linux"))]
 mod fallback_backend {
@@ -245,6 +273,16 @@ mod fallback_backend {
     /// builds) never support confinement.
     pub fn backend_supported() -> bool {
         false
+    }
+
+    /// Identity: there is no backend off Linux, so a command is returned
+    /// unchanged. Callers only reach this after `resolve` said `Confined`
+    /// via a lying probe (or `Required` mode on a non-Linux host).
+    pub fn confine_cmd(
+        cmd: std::process::Command,
+        _policy: &SandboxPolicy,
+    ) -> std::process::Command {
+        cmd
     }
 
     /// Never confinable off Linux; callers hit this only after `resolve`
