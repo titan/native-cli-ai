@@ -1583,6 +1583,9 @@ impl Repl {
             std::sync::Mutex<Option<crate::tui::state::ApprovalRequest>>,
         > = std::sync::Arc::new(std::sync::Mutex::new(None));
         let staged_images = tui_feedback.staged_images_handle();
+        // Authoritative busy flag + agent inbox for mid-turn steering (P1 TUI wiring).
+        let busy_flag = tui_feedback.busy_flag_handle();
+        let inbox_tx = self.runtime.inbox_sender();
 
         let _bridge = spawn_tui_bridge(
             rx,
@@ -1680,6 +1683,8 @@ impl Repl {
                 Arc::clone(&active_question_payload),
                 Arc::clone(&active_approval_payload),
                 Arc::clone(&staged_images),
+                Some(inbox_tx),
+                Arc::clone(&busy_flag),
                 params,
             )
         });
@@ -2008,6 +2013,9 @@ impl Repl {
                             }
                         };
                         tui_feedback.set_busy(true);
+                        // Authoritative busy flag for mid-turn steering routing;
+                        // see feedback.rs for why BusyStateChanged can't be used.
+                        tui_feedback.set_busy_flag(true);
                         let attachments = tui_feedback.take_staged_images();
                         let turn = if attachments.is_empty() {
                             self.runtime.run_turn(&expanded).await
@@ -2016,6 +2024,7 @@ impl Repl {
                                 .run_turn_with_images(&expanded, attachments)
                                 .await
                         };
+                        tui_feedback.set_busy_flag(false);
                         if let Err(e) = turn {
                             tracing::error!(
                                 error = %e,

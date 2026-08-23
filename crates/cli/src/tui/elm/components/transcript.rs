@@ -245,10 +245,21 @@ impl TranscriptState {
                 // force an O(transcript) line-height rebuild for nothing.
                 return TranscriptAction::None;
             }
-            AgentEvent::MessageReceived { role, content, .. } => {
+            AgentEvent::MessageReceived {
+                role,
+                content,
+                steering,
+            } => {
                 if role == "user" {
                     self.streaming_assistant = None;
-                    self.blocks.push(DisplayBlock::User(content.clone()));
+                    // Steering messages get a small dim-style prefix marker so
+                    // they are visually distinct from the turn's initial prompt.
+                    let content = if *steering {
+                        format!("⤳ {content}")
+                    } else {
+                        content.clone()
+                    };
+                    self.blocks.push(DisplayBlock::User(content));
                     self.blocks_pushed();
                 } else if role == "assistant" {
                     self.streaming_assistant = None;

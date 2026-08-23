@@ -38,6 +38,8 @@ pub(crate) struct StatusBarData {
     /// Start of the current busy period (stamped on Idle→non-Idle). Drives the
     /// Turn Timer; distinct from `busy_state_since` (per-state, for the spinner).
     pub busy_since: Instant,
+    /// Steering messages queued in the agent inbox during the current turn.
+    pub queued: u32,
 }
 
 impl Default for StatusBarData {
@@ -59,6 +61,7 @@ impl Default for StatusBarData {
             active_approval: false,
             active_question: false,
             busy_since: Instant::now(),
+            queued: 0,
         }
     }
 }
@@ -152,6 +155,10 @@ impl StatusBar {
 
     pub(crate) fn set_active_question(&mut self, active: bool) {
         self.data.active_question = active;
+    }
+
+    pub(crate) fn set_queued(&mut self, queued: u32) {
+        self.data.queued = queued;
     }
 
     /// Render the status bar into the given area.
@@ -250,6 +257,12 @@ impl StatusBar {
 
         // Build status spans
         let mut status_spans = vec![busy, approval_hint, q_hint];
+        if d.queued > 0 {
+            status_spans.push(Span::styled(
+                format!(" queued:{}", d.queued),
+                Style::default().fg(theme::MUTED),
+            ));
+        }
         status_spans.push(Span::raw(" │ "));
         status_spans.push(Span::styled(&d.model, Style::default().fg(theme::USER)));
         status_spans.push(Span::raw(" │ "));

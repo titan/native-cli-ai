@@ -173,6 +173,11 @@ pub struct TuiFeedbackChannel {
     active_question_payload: std::sync::Arc<std::sync::Mutex<Option<InteractiveQuestionPayload>>>,
     /// Shared staged images for synchronous reads (set by NcaModel).
     staged_images: std::sync::Arc<std::sync::Mutex<Vec<ImageAttachment>>>,
+    /// Authoritative busy flag, set by the cmd_rx loop around `run_turn`.
+    /// The bridged `BusyStateChanged` events are racy (delayed forwarding can
+    /// flip the state back after a direct idle), so this atomic is the source
+    /// of truth for mid-turn steering routing.
+    busy_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TuiFeedbackChannel {
@@ -182,6 +187,7 @@ impl TuiFeedbackChannel {
             active_question_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
             active_question_payload: std::sync::Arc::new(std::sync::Mutex::new(None)),
             staged_images: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            busy_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -204,6 +210,22 @@ impl TuiFeedbackChannel {
         &self,
     ) -> std::sync::Arc<std::sync::Mutex<Vec<ImageAttachment>>> {
         Arc::clone(&self.staged_images)
+    }
+
+    /// Clone the shared busy-flag handle (for passing to NcaModel).
+    pub(crate) fn busy_flag_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.busy_flag)
+    }
+
+    /// Authoritative busy check: true while `run_turn` is awaited.
+    pub(crate) fn is_busy(&self) -> bool {
+        self.busy_flag.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Set the authoritative busy flag (called by the cmd_rx loop).
+    pub(crate) fn set_busy_flag(&self, busy: bool) {
+        self.busy_flag
+            .store(busy, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Update the shared active question ID (called by NcaModel on SetActiveQuestion).

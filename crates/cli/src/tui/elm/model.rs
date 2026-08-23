@@ -56,6 +56,10 @@ pub(crate) struct SideEffectChannels {
     pub active_approval_payload: Arc<StdMutex<Option<crate::tui::state::ApprovalRequest>>>,
     /// Shared staged images for synchronous reads by the runtime.
     pub staged_images: Arc<StdMutex<Vec<ImageAttachment>>>,
+    /// Agent inbox sender for mid-turn steering (clone of the runtime sender).
+    pub inbox_tx: Option<tokio::sync::mpsc::Sender<nca_core::agent_driver::InboxItem>>,
+    /// Authoritative busy flag shared with the cmd_rx loop (see feedback.rs).
+    pub busy_flag: Arc<AtomicBool>,
 }
 
 // ── NcaModel ─────────────────────────────────────────────────────
@@ -87,6 +91,8 @@ pub(crate) struct NcaModel {
     pub(crate) size: (u16, u16),
     /// Timestamp of the last Animation Frame redraw (time-based dirty source).
     pub(crate) last_animation_draw: Instant,
+    /// Number of steering messages queued in the agent inbox during this turn.
+    pub(crate) queued_count: u32,
 }
 
 impl NcaModel {
@@ -106,6 +112,7 @@ impl NcaModel {
             popup_open: false,
             size: (80, 24),
             last_animation_draw: Instant::now(),
+            queued_count: 0,
         }
     }
 
@@ -473,6 +480,15 @@ impl NcaModel {
                             .status_bar
                             .update_context(*context_window, *usage_percent as usize);
                     }
+                    AgentEvent::MessageReceived { steering: true, .. } => {
+                        // A queued steering message was claimed by the agent.
+                        self.queued_count = self.queued_count.saturating_sub(1);
+                        self.components.status_bar.set_queued(self.queued_count);
+                    }
+                    AgentEvent::TurnCompleted { .. } => {
+                        self.queued_count = 0;
+                        self.components.status_bar.set_queued(0);
+                    }
                     AgentEvent::BusyStateChanged { state } => {
                         self.components.status_bar.set_busy(*state);
                     }
@@ -815,6 +831,37 @@ impl NcaModel {
     fn process_component_msg(&mut self, msg: Msg) {
         match msg {
             Msg::Cmd(cmd) => {
+                // Mid-turn steering: while a turn runs, the cmd_rx loop is
+                // blocked inside `run_turn` and a plain Submit would dead-end.
+                // Route it into the agent inbox instead. Slash commands keep
+                // the normal path (they must reach the command handler, never
+                // the LLM).
+                if let TuiCmd::Submit(ref raw) = cmd
+                    && !raw.starts_with('/')
+                    && self
+                        .side_effects
+                        .busy_flag
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    let text = raw.clone();
+                    if let Some(ref tx) = self.side_effects.inbox_tx {
+                        match tx.try_send(nca_core::agent_driver::InboxItem::Steering { text }) {
+                            Ok(()) => {
+                                self.queued_count = self.queued_count.saturating_add(1);
+                                self.components.status_bar.set_queued(self.queued_count);
+                                self.redraw = true;
+                                return;
+                            }
+                            Err(_) => {
+                                self.components
+                                    .transcript
+                                    .push_error("inbox full — message dropped".to_string());
+                                self.redraw = true;
+                                return;
+                            }
+                        }
+                    }
+                }
                 let _ = self.cmd_tx.send(Msg::Cmd(cmd));
             }
             Msg::QuestionSubmit(raw) => {
@@ -1052,6 +1099,8 @@ mod tests {
             active_question_payload: Arc::new(StdMutex::new(None)),
             active_approval_payload: Arc::new(StdMutex::new(None)),
             staged_images: Arc::new(StdMutex::new(Vec::new())),
+            inbox_tx: None,
+            busy_flag: Arc::new(AtomicBool::new(false)),
         };
         let model = NcaModel::new(bridge_rx, _cmd_tx, side_effects);
         (model, bridge_tx)

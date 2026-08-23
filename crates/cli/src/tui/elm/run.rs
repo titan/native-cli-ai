@@ -40,6 +40,8 @@ pub(crate) fn run_nca_model(
     active_question_payload: Arc<StdMutex<Option<InteractiveQuestionPayload>>>,
     active_approval_payload: Arc<StdMutex<Option<crate::tui::state::ApprovalRequest>>>,
     staged_images: Arc<StdMutex<Vec<nca_common::message::ImageAttachment>>>,
+    inbox_tx: Option<tokio::sync::mpsc::Sender<nca_core::agent_driver::InboxItem>>,
+    busy_flag: Arc<AtomicBool>,
     params: NcaModelParams,
 ) -> anyhow::Result<()> {
     // Setup terminal
@@ -61,6 +63,8 @@ pub(crate) fn run_nca_model(
             active_question_payload,
             active_approval_payload,
             staged_images,
+            inbox_tx,
+            busy_flag,
         },
     );
 
