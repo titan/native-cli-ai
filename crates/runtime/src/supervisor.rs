@@ -193,13 +193,19 @@ fn resolve_resume_workspace_root(current_root: &Path, stored_root: &Path) -> Pat
     stored_root.to_path_buf()
 }
 
-/// Which truth a resumed conversation was restored from (P2 Phase A).
+/// Which truth a resumed conversation was restored from (P2 Phase B:
+/// `docs/plans/p2-phase-b-design.md` §5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResumeMessageSource {
-    /// The json snapshot (authoritative in Phase A).
+    /// The json snapshot (old-format logs that cannot fold, or a fresh log
+    /// whose replay projection is empty).
     Snapshot,
-    /// The event-log replay projection (json corrupt or empty).
+    /// The event-log replay rescued a session whose json would not load.
     ReplayFallback,
+    /// The event-log replay is authoritative: the log is fresh-format and
+    /// folds to a non-empty projection, so it wins over the json snapshot
+    /// (json is a cache; divergence is warned, not trusted).
+    ReplayAuthoritative,
 }
 
 /// Normalization used for resume selection and divergence comparison:
@@ -237,19 +243,24 @@ fn repair_missing_images(messages: Vec<Message>, workspace_root: &Path) -> Vec<M
     repaired
 }
 
-/// Pure decision core of the Phase A resume algorithm
-/// (`docs/plans/p2-event-sourced-session-design.md` §"Resume algorithm").
+/// Pure decision core of the resume algorithm
+/// (`docs/plans/p2-phase-b-design.md` §5 decision table).
 ///
 /// - Both paths are normalized: system messages from the snapshot/replay are
 ///   dropped and the fresh system messages `create()` just pushed are
 ///   prepended (fixes stale/duplicated system prompts in the json).
-/// - Replay fallback triggers when the json load failed (`None`) or the json
-///   has no non-System messages while the replay has some. Otherwise the json
-///   snapshot wins (authoritative in Phase A).
-/// - The fallback path repairs image parts whose file is gone.
+/// - Replay wins when the log is fresh-format (`log_has_surface_events`:
+///   contains `MessageRecorded`) AND folds to a non-empty projection —
+///   `ReplayAuthoritative` when the json also loaded, `ReplayFallback` when
+///   the json is corrupt/unusable and the replay rescues the session.
+/// - Otherwise the json snapshot wins: old-format logs cannot fold (empty
+///   projection by construction), and a fresh log whose every turn failed
+///   legitimately folds to empty.
+/// - The replay path repairs image parts whose file is gone.
 pub(crate) fn select_resume_messages(
     snapshot_messages: Option<Vec<Message>>,
     replayed: Vec<Message>,
+    log_has_surface_events: bool,
     fresh_system: Vec<Message>,
     workspace_root: &Path,
 ) -> (Vec<Message>, ResumeMessageSource) {
@@ -258,14 +269,20 @@ pub(crate) fn select_resume_messages(
         .map(normalize_resume_projection)
         .unwrap_or_default();
 
-    let use_fallback =
-        snapshot_messages.is_none() || (snapshot_non_system.is_empty() && !replayed.is_empty());
-
-    if use_fallback {
+    if log_has_surface_events && !replayed.is_empty() {
+        let source = if snapshot_messages.is_some() {
+            ResumeMessageSource::ReplayAuthoritative
+        } else {
+            ResumeMessageSource::ReplayFallback
+        };
         let mut out = fresh_system;
         out.extend(repair_missing_images(replayed, workspace_root));
-        (out, ResumeMessageSource::ReplayFallback)
+        (out, source)
     } else {
+        // Old-format log or empty replay: the json is the only foldable
+        // truth. `snapshot_messages == None` here is unreachable from
+        // `resume()` (it errors when json is unusable AND replay is empty);
+        // defensively yields the fresh system prompt only.
         let mut out = fresh_system;
         out.extend(snapshot_non_system);
         (out, ResumeMessageSource::Snapshot)
@@ -687,36 +704,58 @@ impl Supervisor {
             .as_deref()
             .map(normalize_resume_projection)
             .unwrap_or_default();
+        // Fresh-format log (contains MessageRecorded) ⇒ its projection can
+        // be trusted as the resume truth (P2 Phase B §5).
+        let log_has_surface_events = envelopes
+            .iter()
+            .any(|e| matches!(e.event, AgentEvent::MessageRecorded { .. }));
 
         let (messages, source) = select_resume_messages(
             snapshot_messages,
             replayed.clone(),
+            log_has_surface_events,
             fresh_system,
             &sup.workspace_root,
         );
         sup.agent.messages = messages;
 
-        if source == ResumeMessageSource::ReplayFallback {
-            tracing::warn!(
-                "session json unusable; restored {} messages from event-log replay",
-                sup.agent.messages.len()
-            );
-            seed_cost_tracker_from_log(&mut sup.agent, &envelopes);
-        } else if envelopes
-            .iter()
-            .any(|e| matches!(e.event, AgentEvent::MessageRecorded { .. }))
-        {
-            // Compare the REPAIRED replay: attachment cleanup rewrites image
-            // parts in the snapshot after the message was recorded, so the
-            // raw record legitimately differs; repaired, it must match.
-            // (Guarded on `MessageRecorded` first — old logs never reach here.)
-            let repaired = repair_missing_images(replayed.clone(), &sup.workspace_root);
-            if normalize_resume_projection(&repaired) != snapshot_non_system {
+        match source {
+            ResumeMessageSource::ReplayAuthoritative => {
+                // Json loaded but the replay won: warn on any real drift so
+                // cache staleness is visible. Compare the REPAIRED replay —
+                // attachment cleanup rewrites image parts in the snapshot
+                // after the message was recorded, so the raw record
+                // legitimately differs; repaired, it must match.
+                let repaired = repair_missing_images(replayed.clone(), &sup.workspace_root);
+                if normalize_resume_projection(&repaired) != snapshot_non_system {
+                    tracing::warn!(
+                        "session json and event-log replay diverge (json={} msgs, replay={} msgs); replay kept",
+                        snapshot_non_system.len(),
+                        replayed.len()
+                    );
+                }
+                seed_cost_tracker_from_log(&mut sup.agent, &envelopes);
+            }
+            ResumeMessageSource::ReplayFallback => {
                 tracing::warn!(
-                    "session json and event-log replay diverge (json={} msgs, replay={} msgs); json kept",
-                    snapshot_non_system.len(),
-                    replayed.len()
+                    "session json unusable; restored {} messages from event-log replay",
+                    sup.agent.messages.len()
                 );
+                seed_cost_tracker_from_log(&mut sup.agent, &envelopes);
+            }
+            ResumeMessageSource::Snapshot => {
+                // Json kept. Only a fresh-format log can meaningfully
+                // diverge (old logs fold to empty by construction).
+                if log_has_surface_events {
+                    let repaired = repair_missing_images(replayed.clone(), &sup.workspace_root);
+                    if normalize_resume_projection(&repaired) != snapshot_non_system {
+                        tracing::warn!(
+                            "session json and event-log replay diverge (json={} msgs, replay={} msgs); json kept",
+                            snapshot_non_system.len(),
+                            replayed.len()
+                        );
+                    }
+                }
             }
         }
 
@@ -1002,6 +1041,25 @@ impl Supervisor {
         }
     }
 
+    /// Checkpoint the post-compaction history into the event log (P2 Phase
+    /// B §1): replay-authoritative resume folds `HistoryReplaced` as a state
+    /// checkpoint, so the projection must see exactly the state the json
+    /// will save. System messages are stripped here — resume always
+    /// prepends a fresh system prompt; stale prompts must not ride along.
+    async fn emit_history_replaced(&self, new_messages: &[Message]) {
+        let Some(tx) = self.agent.event_sender() else {
+            return;
+        };
+        let payload: Vec<Message> = new_messages
+            .iter()
+            .filter(|m| m.role != Role::System)
+            .cloned()
+            .collect();
+        let _ = tx
+            .send(AgentEvent::HistoryReplaced { messages: payload })
+            .await;
+    }
+
     /// Perform the actual auto-summarization.
     async fn perform_auto_summarize(&mut self) -> Result<(), String> {
         let messages_to_summarize = self
@@ -1013,6 +1071,7 @@ impl Supervisor {
             let compacted = self
                 .context_manager
                 .get_sliding_window(&self.agent.messages, None);
+            self.emit_history_replaced(&compacted).await;
             self.agent.messages = compacted;
             return Ok(());
         }
@@ -1025,9 +1084,11 @@ impl Supervisor {
         match self.summarize_with_ai(&summary_prompt).await {
             Ok(summary) => {
                 // Apply the summary
-                self.agent.messages = self
+                let replaced = self
                     .context_manager
                     .apply_summary(&self.agent.messages, &summary);
+                self.emit_history_replaced(&replaced).await;
+                self.agent.messages = replaced;
                 self.last_summary_at_tokens = self
                     .context_manager
                     .stats(&self.agent.messages)
@@ -1056,6 +1117,7 @@ impl Supervisor {
                 let compacted = self
                     .context_manager
                     .get_sliding_window(&self.agent.messages, None);
+                self.emit_history_replaced(&compacted).await;
                 self.agent.messages = compacted;
                 self.last_summary_at_tokens = self
                     .context_manager
@@ -1667,7 +1729,8 @@ mod tests {
     #[test]
     fn select_resume_messages_replaces_stale_system_prompts_with_fresh() {
         // T11: json carries stale (and duplicated) system prompts; resume must
-        // drop them all and prepend only the fresh system message.
+        // drop them all and prepend only the fresh system message. Old-format
+        // log (no surface events) ⇒ json snapshot path.
         let dir = tempfile::tempdir().expect("tempdir");
         let stale1 = Message::system("old prompt v1");
         let stale2 = Message::system("old prompt v2");
@@ -1677,6 +1740,7 @@ mod tests {
         let (msgs, source) = select_resume_messages(
             Some(vec![stale1, user.clone(), stale2, Message::assistant("hi")]),
             Vec::new(),
+            false,
             fresh.clone(),
             dir.path(),
         );
@@ -1713,7 +1777,8 @@ mod tests {
         ]);
         let fresh = vec![Message::system("fresh prompt")];
 
-        let (msgs, source) = select_resume_messages(None, vec![user], fresh.clone(), dir.path());
+        let (msgs, source) =
+            select_resume_messages(None, vec![user], true, fresh.clone(), dir.path());
 
         assert_eq!(source, ResumeMessageSource::ReplayFallback);
         assert_eq!(msgs.len(), 2);
@@ -1733,31 +1798,54 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let fresh = vec![Message::system("fresh")];
         let (msgs, source) =
-            select_resume_messages(Some(Vec::new()), Vec::new(), fresh, dir.path());
+            select_resume_messages(Some(Vec::new()), Vec::new(), true, fresh, dir.path());
         assert_eq!(source, ResumeMessageSource::Snapshot);
         assert_eq!(msgs.len(), 1);
         assert!(matches!(msgs[0].role, Role::System));
     }
 
     #[test]
-    fn select_resume_messages_empty_snapshot_with_replay_triggers_fallback() {
+    fn select_resume_messages_replay_rescues_empty_json() {
         let dir = tempfile::tempdir().expect("tempdir");
         let replay = vec![Message::user("from log")];
         let fresh = vec![Message::system("fresh")];
         let (msgs, source) =
-            select_resume_messages(Some(Vec::new()), replay.clone(), fresh, dir.path());
-        assert_eq!(source, ResumeMessageSource::ReplayFallback);
+            select_resume_messages(Some(Vec::new()), replay.clone(), true, fresh, dir.path());
+        assert_eq!(source, ResumeMessageSource::ReplayAuthoritative);
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[1], replay[0]);
     }
 
     #[test]
-    fn select_resume_messages_snapshot_wins_when_both_non_empty() {
+    fn t18_fresh_log_replay_beats_divergent_json() {
+        // Phase B flip: fresh-format log (surface events present) with a
+        // non-empty projection wins even when the json is healthy and the
+        // two diverge — the json is a cache.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let snap = vec![Message::user("stale json turn")];
+        let replay = vec![Message::user("fresh log turn")];
+        let fresh = vec![Message::system("fresh")];
+        let (msgs, source) =
+            select_resume_messages(Some(snap), replay.clone(), true, fresh, dir.path());
+        assert_eq!(source, ResumeMessageSource::ReplayAuthoritative);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1], replay[0]);
+    }
+
+    #[test]
+    fn t19_old_format_log_keeps_snapshot() {
+        // Old logs (pre-Phase-A, no MessageRecorded) fold to empty — the json
+        // snapshot must keep winning for them.
         let dir = tempfile::tempdir().expect("tempdir");
         let snap = vec![Message::user("from json")];
-        let replay = vec![Message::user("from log")];
         let fresh = vec![Message::system("fresh")];
-        let (msgs, source) = select_resume_messages(Some(snap.clone()), replay, fresh, dir.path());
+        let (msgs, source) = select_resume_messages(
+            Some(snap.clone()),
+            Vec::new(), // old-format log folds to empty
+            false,
+            fresh,
+            dir.path(),
+        );
         assert_eq!(source, ResumeMessageSource::Snapshot);
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[1], snap[0]);

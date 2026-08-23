@@ -286,19 +286,30 @@ async fn t9_resume_resaves_without_wiping_json() {
         .await
         .expect("resume must succeed");
 
-    // No turn is run. The json on disk must already contain the non-system
-    // history (the create()-wipes-json window is closed).
+    // No turn is run. The json on disk must already contain the restored
+    // non-system history (the create()-wipes-json window is closed). Phase B:
+    // the fresh-format log wins, so the re-saved json mirrors the replay
+    // projection (4 messages for this turn fixture), not the stale json body.
     let on_disk = read_json_messages(ws.path(), sid);
     let non_system: Vec<&Message> = on_disk.iter().filter(|m| m.role != Role::System).collect();
-    assert_eq!(non_system.len(), 2, "json must retain non-system messages");
+    assert_eq!(
+        non_system.len(),
+        4,
+        "json must retain the replayed turn's non-system messages"
+    );
     assert_eq!(non_system[0], &Message::user("persisted question"));
-    assert_eq!(non_system[1], &Message::assistant("persisted answer"));
+    assert_eq!(
+        non_system.last().map(|m| m.content.event_preview()),
+        Some("persisted answer".into())
+    );
     assert_eq!(on_disk.len(), sup.agent().messages.len());
 }
 
 // ---------------------------------------------------------------------------
 // T11 — stale system prompts in json are replaced by the fresh one on the
-//       snapshot path too (json wins, normalization applies to BOTH paths).
+//       snapshot path too (old-format log ⇒ json wins, normalization
+//       applies to BOTH paths). Phase B note: a fresh-format log would take
+//       the replay path — that flip is T18 below.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -316,7 +327,24 @@ async fn t11_stale_system_prompts_replaced_on_snapshot_path() {
             Message::assistant("a"),
         ],
     );
-    write_event_log(ws.path(), sid, completed_turn_events(1, "q", "a"));
+    // OLD-format log (no MessageRecorded — pre-Phase-A events only): folds
+    // to an empty projection, so the json snapshot path is taken.
+    write_event_log(
+        ws.path(),
+        sid,
+        vec![
+            AgentEvent::TurnStarted { turn_id: 1 },
+            AgentEvent::MessageReceived {
+                role: "user".into(),
+                content: "q".into(),
+                steering: false,
+            },
+            AgentEvent::TurnCompleted {
+                turn_id: 1,
+                duration_ms: 0,
+            },
+        ],
+    );
 
     let sup = Supervisor::resume(offline_config(), ws.path(), true, false, sid, None)
         .await
@@ -331,4 +359,116 @@ async fn t11_stale_system_prompts_replaced_on_snapshot_path() {
     assert_eq!(messages.len(), 3);
     assert_eq!(messages[1], Message::user("q"));
     assert_eq!(messages[2], Message::assistant("a"));
+}
+
+// ---------------------------------------------------------------------------
+// T18 — fresh-format log + healthy but DIVERGENT json → replay wins
+//       (Phase B flip: json is a cache; `docs/plans/p2-phase-b-design.md` §5).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn t18_fresh_log_replay_beats_divergent_json() {
+    let ws = tempfile::tempdir().expect("tempdir");
+    let sid = "p2-t18-replay-authoritative";
+
+    // Json says turn 2 ended with a truncated final answer (stale cache);
+    // the log records the full turn 2.
+    write_good_json(
+        ws.path(),
+        sid,
+        vec![
+            Message::user("first question"),
+            Message::assistant("first answer"),
+            Message::user("second question"),
+            Message::assistant("cut-off answ"), // diverges from the log
+        ],
+    );
+    write_event_log(
+        ws.path(),
+        sid,
+        [
+            completed_turn_events(1, "first question", "first answer"),
+            completed_turn_events(2, "second question", "second answer"),
+        ]
+        .concat(),
+    );
+
+    let sup = Supervisor::resume(offline_config(), ws.path(), true, false, sid, None)
+        .await
+        .expect("resume must succeed");
+
+    let messages = sup.agent().messages.clone();
+    // Replay projection: 2 turns × 4 messages, NOT the json's 4-message pair
+    // list with the truncated answer.
+    assert_eq!(messages[1..].len(), 8, "replay projection wins");
+    assert_eq!(messages[1], Message::user("first question"));
+    assert_eq!(messages[8], Message::assistant("second answer"));
+    assert_no_orphaned_tool_calls(&messages);
+}
+
+// ---------------------------------------------------------------------------
+// T20 — log carries a compaction checkpoint (HistoryReplaced) + a stale
+//       pre-compaction json → resume reflects the COMPACTED history.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn t20_history_replaced_checkpoint_wins_over_stale_json() {
+    let ws = tempfile::tempdir().expect("tempdir");
+    let sid = "p2-t20-compaction-checkpoint";
+
+    // Pre-compaction json (would resurrect rolled-up history).
+    write_good_json(
+        ws.path(),
+        sid,
+        vec![
+            Message::user("old question 1"),
+            Message::assistant("old answer 1"),
+            Message::user("old question 2"),
+            Message::assistant("old answer 2"),
+        ],
+    );
+    // Log: turn 1 recorded, then compaction replaced the history with a
+    // summary pair, then turn 2 recorded on top of it.
+    write_event_log(
+        ws.path(),
+        sid,
+        vec![
+            AgentEvent::TurnStarted { turn_id: 1 },
+            AgentEvent::MessageRecorded {
+                message: Message::user("old question 1"),
+            },
+            AgentEvent::MessageRecorded {
+                message: Message::assistant("old answer 1"),
+            },
+            AgentEvent::TurnCompleted {
+                turn_id: 1,
+                duration_ms: 0,
+            },
+            AgentEvent::HistoryReplaced {
+                messages: vec![
+                    Message::user("[summary of earlier turns]"),
+                    Message::assistant("[acknowledged]"),
+                ],
+            },
+        ]
+        .into_iter()
+        .chain(completed_turn_events(
+            2,
+            "post-compact question",
+            "post-compact answer",
+        ))
+        .collect::<Vec<_>>(),
+    );
+
+    let sup = Supervisor::resume(offline_config(), ws.path(), true, false, sid, None)
+        .await
+        .expect("resume must succeed");
+
+    let messages = sup.agent().messages.clone();
+    // Checkpoint (2) + turn 2 (4) — the pre-compaction json history is gone.
+    assert_eq!(messages[1..].len(), 6, "compacted history must win");
+    assert_eq!(messages[1], Message::user("[summary of earlier turns]"));
+    assert_eq!(messages[2], Message::assistant("[acknowledged]"));
+    assert_eq!(messages[3], Message::user("post-compact question"));
+    assert_eq!(messages[6], Message::assistant("post-compact answer"));
 }

@@ -342,17 +342,20 @@ Sessions are stored as JSON files in `.nca/sessions/<session-id>.json`:
 
 Persistence is workspace-local:
 
-- `<workspace>/.nca/sessions/*.json` stores session snapshots and conversation state.
+- `<workspace>/.nca/sessions/*.json` stores session snapshots and conversation state (a cache since Phase B).
 - `<workspace>/.nca/sessions/*.events.jsonl` stores append-only event streams for replay and live attach.
 
-Resume prefers the json snapshot (Phase A of the event-sourced-session plan,
-`docs/plans/p2-event-sourced-session-design.md`): `MessageRecorded` events are
-folded by `core::replay::replay_surface_events` (turn-bracket rule — a turn
-contributes its messages only if it closed with no `StepFailed`), and the
-projection rescues sessions with a corrupt/empty json, replaces stale system
-prompts with a fresh build, and feeds a json-vs-replay divergence warning.
-Old logs without `MessageRecorded` fold to an empty projection (json still
-covers them).
+Resume is **replay-authoritative** (P2 Phase B, `docs/plans/p2-phase-b-design.md`):
+`MessageRecorded` events are folded by `core::replay::replay_surface_events`
+(turn-bracket rule — a turn contributes its messages only if it closed with no
+`StepFailed`; `HistoryReplaced` is a compaction state checkpoint), and the
+projection wins over the json whenever the log is fresh-format and non-empty.
+The json snapshot serves old-format logs (pre-`MessageRecorded`) and empty
+projections; corrupt json is rescued by the replay. Durability:
+`EventLogWriter` (seeded ids, line-atomic writes) flush+fsyncs at every
+`TurnCompleted`, and `Supervisor::run_turn` blocks on that commit before
+returning — "model-visible means logged". Divergence between the two truths
+is warned, never silently trusted.
 
 ### Lifecycle
 
