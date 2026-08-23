@@ -103,7 +103,7 @@ impl AgentLoop {
     /// everything added later and the provider call itself).
     pub fn with_middleware(
         mut self,
-        middleware: std::sync::Arc<dyn crate::middleware::AgentMiddleware>,
+        middleware: Arc<dyn crate::middleware::AgentMiddleware>,
     ) -> Self {
         self.middleware.push(middleware);
         self

@@ -25,6 +25,8 @@ native-cli-ai/
 │   │   └── src/
 │   │       ├── lib.rs
 │   │       ├── agent.rs        # AgentLoop: drives conversation + tool execution
+│   │       ├── agent_driver.rs # TurnDriver: turn/step loop, inbox claiming (P1)
+│   │       ├── middleware.rs   # Waterfall middleware chain around step requests (P4)
 │   │       ├── provider.rs     # Provider trait + provider modules
 │   │       ├── provider/
 │   │       │   ├── factory.rs  # Selects the configured provider adapter
@@ -169,6 +171,15 @@ sequenceDiagram
 ```
 
 ### Streaming
+
+Every step's terminal provider `chat()` call is wrapped by
+`core::middleware::MiddlewareChain` (P4, tower-style `Next`): middlewares
+observe, rewrite, or short-circuit step requests; the chain is empty by
+default (observably identical to a bare call) and is attached via
+`AgentLoop::with_middleware`. Keepalive pings (`keepalive_ping`),
+auto-summarize side-calls, and the tool pipeline are deliberately outside
+the chain. Short-circuited final text is recorded like any assistant
+message (replay-safe).
 
 Provider responses are streamed token-by-token via `tokio::sync::mpsc` using MiniMax SSE. The CLI can render:
 

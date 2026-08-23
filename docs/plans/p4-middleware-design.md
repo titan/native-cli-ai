@@ -2,11 +2,10 @@
 
 > Implements `deepseek-harness-adoption.md` §P4. Prerequisites merged: P1
 > (`agent_driver.rs` step boundary), P2 (event-sourced sessions — the
-> projection invariants below assume it). Status: design complete,
-> oracle-reviewed (record at the bottom); **Status: implemented 2026-08-23 —
-> module + wiring + unit tests M1–M5 landed** (`crates/core/src/middleware.rs`,
-> `agent_driver.rs` step rewiring); integration tests M6–M9 pending (tester
-> lane, `core/tests/middleware.rs`).
+> projection invariants below assume it). Status: **implemented
+> 2026-08-23** — module + wiring + tests M1–M9 all green (`middleware.rs`,
+> `agent_driver.rs` step rewiring, `core/tests/middleware.rs`); oracle
+> review record and implementation deviations at the bottom.
 
 ## Problem
 
@@ -299,3 +298,21 @@ Findings applied to this doc:
   `async fn`; `StepRequest: Clone` cost already paid per step today;
   `StepReply::Stream` Receiver moved (never cloned) through layers;
   empty-chain argument ordering identical; M6 is a genuine wiring pin.
+
+## Implementation record (2026-08-23)
+
+- Lanes: fixer (`middleware.rs` + wiring + M1–M5, `afd9969`), tester
+  (integration M6–M9, `9e83402`), ponytail pass (lean; one Arc-path nit
+  applied, one test-code shrink noted and skipped).
+- **Deviation from §1 (accepted):** `Next` derives `Clone` (two borrows,
+  zero cost). The spec's "`run` consumes it" made catch-and-retry
+  middlewares impossible — `next.run()` consumes the only handle to the
+  rest of the chain. Clone is the minimal fix and matches the design's
+  own retry intent; documented on the type.
+- **M7b clarification (from tester lane):** after a failed short-circuit,
+  `run_turn`'s P1 rollback truncates to the pre-turn baseline — a fresh
+  agent ends with **empty** messages (not `[user]`). The design's
+  "nothing recorded" wording is what holds; the rollback is pre-existing
+  P1 policy, unchanged by P4.
+- Validation: `cargo fmt --all -- --check`, `cargo clippy --workspace
+  -- -D warnings`, `cargo test --workspace` — all green at merge.
