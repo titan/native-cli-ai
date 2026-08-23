@@ -21,6 +21,7 @@ use crate::session_store::SessionStore;
 use chrono::Utc;
 use nca_common::config::{AgentProfileConfig, NcaConfig};
 use nca_common::event::{AgentEvent, EndReason, EventEnvelope};
+use nca_common::message::{ContentPart, Message, MessageContent, Role};
 use nca_common::session::{
     OrchestrationContext, SessionMeta, SessionSnapshot, SessionState, SessionStatus,
 };
@@ -42,7 +43,7 @@ use nca_core::tools::spawn_subagent::{SpawnRequest, SpawnSubagentTool};
 use nca_core::tools::{TodoStore, UpdateTodosTool};
 use nca_core::workspace_fs::{RealFs, WorkspaceFs};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -169,22 +170,103 @@ fn resolve_resume_workspace_root(current_root: &Path, stored_root: &Path) -> Pat
     stored_root.to_path_buf()
 }
 
-/// Scan a session's `events.jsonl` for the max `TurnStarted.turn_id`.
-/// Tolerant of missing files, empty logs, and unparseable lines (skipped) —
-/// seeding the turn counter is best-effort and must never fail a resume.
-fn scan_max_turn_id(log_path: &Path) -> u64 {
-    let Ok(content) = std::fs::read_to_string(log_path) else {
-        return 0;
-    };
-    content
-        .lines()
-        .filter_map(|line| serde_json::from_str::<EventEnvelope>(line).ok())
-        .filter_map(|envelope| match envelope.event {
-            AgentEvent::TurnStarted { turn_id } => Some(turn_id),
-            _ => None,
-        })
-        .max()
-        .unwrap_or(0)
+/// Which truth a resumed conversation was restored from (P2 Phase A).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResumeMessageSource {
+    /// The json snapshot (authoritative in Phase A).
+    Snapshot,
+    /// The event-log replay projection (json corrupt or empty).
+    ReplayFallback,
+}
+
+/// Normalization used for resume selection and divergence comparison:
+/// drop system messages, keep everything else as-is (records are exact,
+/// reasoning included).
+pub(crate) fn normalize_resume_projection(messages: &[Message]) -> Vec<Message> {
+    messages
+        .iter()
+        .filter(|m| m.role != Role::System)
+        .cloned()
+        .collect()
+}
+
+/// Replace image parts whose on-disk file no longer exists (deleted by
+/// attachment cleanup after the message was recorded) with text placeholders
+/// via [`MessageContent::strip_image_paths`]. Text-only messages untouched.
+fn repair_missing_images(messages: Vec<Message>, workspace_root: &Path) -> Vec<Message> {
+    let mut repaired = messages;
+    for message in repaired.iter_mut() {
+        let MessageContent::Parts(parts) = &message.content else {
+            continue;
+        };
+        let missing: HashSet<String> = parts
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::Image { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .filter(|path| !workspace_root.join(path).exists())
+            .collect();
+        if !missing.is_empty() {
+            message.content.strip_image_paths(&missing);
+        }
+    }
+    repaired
+}
+
+/// Pure decision core of the Phase A resume algorithm
+/// (`docs/plans/p2-event-sourced-session-design.md` §"Resume algorithm").
+///
+/// - Both paths are normalized: system messages from the snapshot/replay are
+///   dropped and the fresh system messages `create()` just pushed are
+///   prepended (fixes stale/duplicated system prompts in the json).
+/// - Replay fallback triggers when the json load failed (`None`) or the json
+///   has no non-System messages while the replay has some. Otherwise the json
+///   snapshot wins (authoritative in Phase A).
+/// - The fallback path repairs image parts whose file is gone.
+pub(crate) fn select_resume_messages(
+    snapshot_messages: Option<Vec<Message>>,
+    replayed: Vec<Message>,
+    fresh_system: Vec<Message>,
+    workspace_root: &Path,
+) -> (Vec<Message>, ResumeMessageSource) {
+    let snapshot_non_system: Vec<Message> = snapshot_messages
+        .as_deref()
+        .map(normalize_resume_projection)
+        .unwrap_or_default();
+
+    let use_fallback =
+        snapshot_messages.is_none() || (snapshot_non_system.is_empty() && !replayed.is_empty());
+
+    if use_fallback {
+        let mut out = fresh_system;
+        out.extend(repair_missing_images(replayed, workspace_root));
+        (out, ResumeMessageSource::ReplayFallback)
+    } else {
+        let mut out = fresh_system;
+        out.extend(snapshot_non_system);
+        (out, ResumeMessageSource::Snapshot)
+    }
+}
+
+/// Seed the cost tracker from the last cumulative `CostUpdated` in the event
+/// log (best-effort, fallback path only — the json path restores totals from
+/// the snapshot).
+fn seed_cost_tracker_from_log(agent: &mut AgentLoop, envelopes: &[EventEnvelope]) {
+    for envelope in envelopes.iter().rev() {
+        if let AgentEvent::CostUpdated {
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            ..
+        } = &envelope.event
+        {
+            agent.cost_tracker.input_tokens = *input_tokens;
+            agent.cost_tracker.output_tokens = *output_tokens;
+            agent.cost_tracker.cache_read_tokens = *cache_read_tokens;
+            return;
+        }
+    }
 }
 
 /// Persist an approved allow pattern to the workspace config file.
@@ -504,11 +586,15 @@ impl Supervisor {
         // Load the original session state BEFORE create() overwrites the file.
         // create() calls save() with an empty message list, which would destroy
         // the conversation history if we loaded after.
+        // A failed json load is NOT fatal here: if the event log can supply a
+        // replay projection, the resume proceeds with a corrupt-json rescue.
         let store = SessionStore::new(workspace_root.join(&config.session.history_dir));
-        let loaded = store
-            .load(session_id)
-            .await
-            .map_err(|e| ProviderError::Other(e.to_string()))?;
+        let load_result = store.load(session_id).await;
+        let load_error = load_result
+            .as_ref()
+            .err()
+            .map(|e| ProviderError::Other(e.to_string()));
+        let loaded = load_result.ok();
 
         let mut sup = Self::create(SupervisorConfig {
             config: config.clone(),
@@ -522,34 +608,98 @@ impl Supervisor {
         })
         .await?;
 
-        sup.session_id = loaded.meta.id.clone();
-        sup.workspace_root =
-            resolve_resume_workspace_root(&sup.workspace_root, &loaded.meta.workspace);
-        sup.model = loaded.meta.model.clone();
-        sup.agent.model = loaded.meta.model.clone();
-        sup.created_at = loaded.meta.created_at;
-        sup.status = loaded.meta.status;
+        if let Some(loaded) = loaded.as_ref() {
+            sup.session_id = loaded.meta.id.clone();
+            sup.workspace_root =
+                resolve_resume_workspace_root(&sup.workspace_root, &loaded.meta.workspace);
+            sup.model = loaded.meta.model.clone();
+            sup.agent.model = loaded.meta.model.clone();
+            sup.created_at = loaded.meta.created_at;
+            sup.status = loaded.meta.status.clone();
+            sup.worktree_path = loaded.meta.worktree_path.clone();
+            sup.branch = loaded.meta.branch.clone();
+            sup.base_branch = loaded.meta.base_branch.clone();
+            sup.parent_session_id = loaded.meta.parent_session_id.clone();
+            sup.child_session_ids = loaded.meta.child_session_ids.clone();
+            sup.inherited_summary = loaded.meta.inherited_summary.clone();
+            sup.spawn_reason = loaded.meta.spawn_reason.clone();
+            sup.session_summary = loaded.meta.session_summary.clone();
+            sup.session_title = loaded.meta.session_title.clone();
+            sup.orchestration = loaded.meta.orchestration.clone();
+            sup.context_manager = Self::make_context_manager(&sup.config, &sup.model).await;
+        }
         sup.pid = Some(std::process::id());
-        sup.agent.messages = loaded.messages;
         sup.session_store = store;
-        sup.worktree_path = loaded.meta.worktree_path;
-        sup.branch = loaded.meta.branch;
-        sup.base_branch = loaded.meta.base_branch;
-        sup.parent_session_id = loaded.meta.parent_session_id;
-        sup.child_session_ids = loaded.meta.child_session_ids;
-        sup.inherited_summary = loaded.meta.inherited_summary;
-        sup.spawn_reason = loaded.meta.spawn_reason;
-        sup.session_summary = loaded.meta.session_summary;
-        sup.session_title = loaded.meta.session_title;
-        sup.orchestration = loaded.meta.orchestration;
-        sup.context_manager = Self::make_context_manager(&sup.config, &sup.model).await;
+
+        // Event-log replay (P2 Phase A): always read + project — cheap, and it
+        // enables the corrupt-json fallback and the divergence detector.
+        let envelopes = crate::session_store::read_event_log(&sup.event_log_path());
+        let replayed = nca_core::replay::replay_surface_events(&envelopes);
+
+        // Fail only when BOTH truths are gone: json unloadable AND replay empty.
+        if loaded.is_none() && replayed.is_empty() {
+            return Err(
+                load_error.unwrap_or_else(|| ProviderError::Other("session load failed".into()))
+            );
+        }
+
+        let fresh_system: Vec<Message> = sup
+            .agent
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::System)
+            .cloned()
+            .collect();
+        let snapshot_messages = loaded.map(|l| l.messages);
+        let snapshot_non_system = snapshot_messages
+            .as_deref()
+            .map(normalize_resume_projection)
+            .unwrap_or_default();
+
+        let (messages, source) = select_resume_messages(
+            snapshot_messages,
+            replayed.clone(),
+            fresh_system,
+            &sup.workspace_root,
+        );
+        sup.agent.messages = messages;
+
+        if source == ResumeMessageSource::ReplayFallback {
+            tracing::warn!(
+                "session json unusable; restored {} messages from event-log replay",
+                sup.agent.messages.len()
+            );
+            seed_cost_tracker_from_log(&mut sup.agent, &envelopes);
+        } else if envelopes
+            .iter()
+            .any(|e| matches!(e.event, AgentEvent::MessageRecorded { .. }))
+            && normalize_resume_projection(&replayed) != snapshot_non_system
+        {
+            tracing::warn!(
+                "session json and event-log replay diverge (json={} msgs, replay={} msgs); json kept",
+                snapshot_non_system.len(),
+                replayed.len()
+            );
+        }
+
         // Seed the turn-id counter from the persisted event log so turn ids
         // stay session-unique across restarts. Tolerant scan: a missing,
         // empty, or partially-corrupt log never fails the resume.
-        let max_turn = scan_max_turn_id(&sup.event_log_path());
+        let max_turn = envelopes
+            .iter()
+            .filter_map(|e| match e.event {
+                AgentEvent::TurnStarted { turn_id } => Some(turn_id),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
         if max_turn > 0 {
             sup.agent.set_turn_seq_start(max_turn);
         }
+
+        // Re-save immediately after restore: closes the create()-saves-empty-
+        // state window so a crash right after resume no longer wipes the json.
+        sup.save().await.map_err(ProviderError::Other)?;
         Ok(sup)
     }
 
@@ -1423,6 +1573,158 @@ pub(crate) fn register_skill_agents(config: &mut NcaConfig, workspace_root: &Pat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn select_resume_messages_replaces_stale_system_prompts_with_fresh() {
+        // T11: json carries stale (and duplicated) system prompts; resume must
+        // drop them all and prepend only the fresh system message.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stale1 = Message::system("old prompt v1");
+        let stale2 = Message::system("old prompt v2");
+        let user = Message::user("hello");
+        let fresh = vec![Message::system("fresh prompt")];
+
+        let (msgs, source) = select_resume_messages(
+            Some(vec![stale1, user.clone(), stale2, Message::assistant("hi")]),
+            Vec::new(),
+            fresh.clone(),
+            dir.path(),
+        );
+
+        assert_eq!(source, ResumeMessageSource::Snapshot);
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0], fresh[0]);
+        assert!(matches!(msgs[1].role, Role::User));
+        assert!(matches!(msgs[2].role, Role::Assistant));
+    }
+
+    #[test]
+    fn select_resume_messages_replay_fallback_repairs_missing_images() {
+        // T7 unit half: json unloadable + replay non-empty → fallback with
+        // fresh system first, and image parts whose file is gone collapse to
+        // a text placeholder.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let kept_image = dir.path().join("attachments/kept.png");
+        std::fs::create_dir_all(dir.path().join("attachments")).expect("mkdir");
+        std::fs::write(&kept_image, b"png").expect("write image");
+
+        let user = Message::user_with_parts(vec![
+            ContentPart::Text {
+                text: "look at these".into(),
+            },
+            ContentPart::Image {
+                media_type: "image/png".into(),
+                path: "attachments/kept.png".into(),
+            },
+            ContentPart::Image {
+                media_type: "image/png".into(),
+                path: "attachments/deleted.png".into(),
+            },
+        ]);
+        let fresh = vec![Message::system("fresh prompt")];
+
+        let (msgs, source) = select_resume_messages(None, vec![user], fresh.clone(), dir.path());
+
+        assert_eq!(source, ResumeMessageSource::ReplayFallback);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0], fresh[0]);
+        // The kept image file exists → survives; the deleted one becomes a
+        // text placeholder.
+        let MessageContent::Parts(parts) = &msgs[1].content else {
+            panic!("expected parts content");
+        };
+        assert_eq!(parts.len(), 3);
+        assert!(matches!(parts[1], ContentPart::Image { .. }));
+        assert!(matches!(&parts[2], ContentPart::Text { text } if text.contains("deleted.png")));
+    }
+
+    #[test]
+    fn select_resume_messages_empty_snapshot_and_empty_replay_yields_fresh_system_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fresh = vec![Message::system("fresh")];
+        let (msgs, source) =
+            select_resume_messages(Some(Vec::new()), Vec::new(), fresh, dir.path());
+        assert_eq!(source, ResumeMessageSource::Snapshot);
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(msgs[0].role, Role::System));
+    }
+
+    #[test]
+    fn select_resume_messages_empty_snapshot_with_replay_triggers_fallback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let replay = vec![Message::user("from log")];
+        let fresh = vec![Message::system("fresh")];
+        let (msgs, source) =
+            select_resume_messages(Some(Vec::new()), replay.clone(), fresh, dir.path());
+        assert_eq!(source, ResumeMessageSource::ReplayFallback);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1], replay[0]);
+    }
+
+    #[test]
+    fn select_resume_messages_snapshot_wins_when_both_non_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let snap = vec![Message::user("from json")];
+        let replay = vec![Message::user("from log")];
+        let fresh = vec![Message::system("fresh")];
+        let (msgs, source) = select_resume_messages(Some(snap.clone()), replay, fresh, dir.path());
+        assert_eq!(source, ResumeMessageSource::Snapshot);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1], snap[0]);
+    }
+
+    #[test]
+    fn divergence_comparison_fires_only_on_real_difference() {
+        // T10 pure half: normalization drops system messages; identical
+        // non-system histories compare equal.
+        let msgs = vec![Message::system("s"), Message::user("u")];
+        let again = vec![Message::user("u"), Message::system("other s")];
+        assert_eq!(
+            normalize_resume_projection(&msgs),
+            normalize_resume_projection(&again)
+        );
+        let different = vec![Message::user("different")];
+        assert_ne!(
+            normalize_resume_projection(&msgs),
+            normalize_resume_projection(&different)
+        );
+    }
+
+    #[test]
+    fn read_event_log_parses_envelopes_legacy_and_skips_garbage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("log.events.jsonl");
+        let env_line = serde_json::to_string(&EventEnvelope::new(
+            1,
+            AgentEvent::TurnStarted { turn_id: 7 },
+        ))
+        .expect("serialize envelope");
+        let legacy = serde_json::to_string(&AgentEvent::TurnStarted { turn_id: 3 })
+            .expect("serialize bare event");
+        let content = format!(
+            "{env_line}\n{legacy}\n{{not json at all\n{{\"id\":2,\"event\":{{\"type\":\"Ga",
+            env_line = env_line,
+            legacy = legacy,
+        );
+        std::fs::write(&path, content).expect("write log");
+
+        let envelopes = crate::session_store::read_event_log(&path);
+        assert_eq!(envelopes.len(), 2, "garbage/torn lines must be skipped");
+        assert!(matches!(
+            envelopes[0].event,
+            AgentEvent::TurnStarted { turn_id: 7 }
+        ));
+        assert!(matches!(
+            envelopes[1].event,
+            AgentEvent::TurnStarted { turn_id: 3 }
+        ));
+    }
+
+    #[test]
+    fn read_event_log_missing_file_is_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(crate::session_store::read_event_log(&dir.path().join("nope.jsonl")).is_empty());
+    }
 
     #[test]
     fn resolve_resume_workspace_root_adopts_current_when_stored_path_vanished() {

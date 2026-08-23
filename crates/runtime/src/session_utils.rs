@@ -115,8 +115,13 @@ pub fn spawn_event_fanout(
             if let Some(file) = log_file.as_mut()
                 && let Ok(line) = serde_json::to_string(&envelope)
             {
-                let _ = file.write_all(line.as_bytes()).await;
-                let _ = file.write_all(b"\n").await;
+                // Single write of line+"\n": a torn tail can only ever be a
+                // partial line, which the tolerant reader (`read_event_log`)
+                // skips. Two separate writes could leave a complete-but-
+                // newline-less line that still parses as an envelope.
+                let mut buf = line.into_bytes();
+                buf.push(b'\n');
+                let _ = file.write_all(&buf).await;
             }
 
             if let Some(ref cb) = on_event {
@@ -213,6 +218,8 @@ pub fn spawn_command_consumer_with_store(
                     if let Some(ref tx) = prompt_tx {
                         let _ = tx.send(content);
                     } else if let Some(ref tx) = event_tx {
+                        // UI-only echo; no `messages.push` here, so it is deliberately NOT a
+                        // `MessageRecorded` (never replayed). See p2 design doc.
                         let _ = tx
                             .send(AgentEvent::MessageReceived {
                                 role: "user".into(),

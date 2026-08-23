@@ -1,3 +1,5 @@
+// `AgentEvent`/`EventEnvelope` are used in `read_event_log` signatures below.
+use nca_common::event::{AgentEvent, EventEnvelope};
 use nca_common::session::{SessionSnapshot, SessionState};
 use std::path::{Path, PathBuf};
 
@@ -74,6 +76,32 @@ impl SessionStore {
 
         Ok(ids)
     }
+}
+
+/// Read a session's `events.jsonl` into envelopes. Tolerant of corruption:
+/// unparseable or torn-tail lines are skipped, not fatal. Legacy bare
+/// `AgentEvent` lines (pre-envelope) are wrapped in an envelope. A missing
+/// file yields an empty vec.
+pub fn read_event_log(path: &Path) -> Vec<EventEnvelope> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| {
+            // Envelope-shaped lines are the normal case; fall back to a bare
+            // AgentEvent (pre-envelope log format) and wrap it. Anything else
+            // (garbage or a torn tail) is skipped, never fatal.
+            serde_json::from_str::<EventEnvelope>(line)
+                .ok()
+                .or_else(|| {
+                    serde_json::from_str::<AgentEvent>(line)
+                        .ok()
+                        .map(|ev| EventEnvelope::new(0, ev))
+                })
+        })
+        .collect()
 }
 
 #[derive(Debug, thiserror::Error)]
