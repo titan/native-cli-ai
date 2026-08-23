@@ -345,6 +345,15 @@ Persistence is workspace-local:
 - `<workspace>/.nca/sessions/*.json` stores session snapshots and conversation state.
 - `<workspace>/.nca/sessions/*.events.jsonl` stores append-only event streams for replay and live attach.
 
+Resume prefers the json snapshot (Phase A of the event-sourced-session plan,
+`docs/plans/p2-event-sourced-session-design.md`): `MessageRecorded` events are
+folded by `core::replay::replay_surface_events` (turn-bracket rule — a turn
+contributes its messages only if it closed with no `StepFailed`), and the
+projection rescues sessions with a corrupt/empty json, replaces stale system
+prompts with a fresh build, and feeds a json-vs-replay divergence warning.
+Old logs without `MessageRecorded` fold to an empty projection (json still
+covers them).
+
 ### Lifecycle
 
 ```mermaid

@@ -69,10 +69,7 @@ impl AgentLoop {
                 InboxItem::Steering { text } => (text, true),
             };
             let msg = Message::user(text.clone());
-            self.emit(AgentEvent::MessageRecorded {
-                message: msg.clone(),
-            })
-            .await;
+            self.record(&msg).await;
             self.messages.push(msg);
             self.emit(AgentEvent::MessageReceived {
                 role: "user".into(),
@@ -483,11 +480,7 @@ impl<'a> TurnDriver<'a> {
             if !reasoning_text.is_empty() {
                 msg = msg.with_reasoning(std::mem::take(&mut reasoning_text));
             }
-            agent
-                .emit(AgentEvent::MessageRecorded {
-                    message: msg.clone(),
-                })
-                .await;
+            agent.record(&msg).await;
             agent.messages.push(msg);
             agent
                 .emit(AgentEvent::MessageReceived {
@@ -515,11 +508,7 @@ impl<'a> TurnDriver<'a> {
         if !reasoning_text.is_empty() {
             msg = msg.with_reasoning(std::mem::take(&mut reasoning_text));
         }
-        agent
-            .emit(AgentEvent::MessageRecorded {
-                message: msg.clone(),
-            })
-            .await;
+        agent.record(&msg).await;
         agent.messages.push(msg);
 
         if tool_calls.len() as u32 > agent.max_tool_calls_per_turn {
@@ -616,11 +605,7 @@ impl<'a> TurnDriver<'a> {
                 result.call_id.clone(),
                 crate::agent::format_tool_result(&result),
             );
-            agent
-                .emit(AgentEvent::MessageRecorded {
-                    message: msg.clone(),
-                })
-                .await;
+            agent.record(&msg).await;
             agent.messages.push(msg);
             agent
                 .emit(AgentEvent::ToolCallCompleted {

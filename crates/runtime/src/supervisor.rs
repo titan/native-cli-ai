@@ -673,13 +673,19 @@ impl Supervisor {
         } else if envelopes
             .iter()
             .any(|e| matches!(e.event, AgentEvent::MessageRecorded { .. }))
-            && normalize_resume_projection(&replayed) != snapshot_non_system
         {
-            tracing::warn!(
-                "session json and event-log replay diverge (json={} msgs, replay={} msgs); json kept",
-                snapshot_non_system.len(),
-                replayed.len()
-            );
+            // Compare the REPAIRED replay: attachment cleanup rewrites image
+            // parts in the snapshot after the message was recorded, so the
+            // raw record legitimately differs; repaired, it must match.
+            // (Guarded on `MessageRecorded` first — old logs never reach here.)
+            let repaired = repair_missing_images(replayed.clone(), &sup.workspace_root);
+            if normalize_resume_projection(&repaired) != snapshot_non_system {
+                tracing::warn!(
+                    "session json and event-log replay diverge (json={} msgs, replay={} msgs); json kept",
+                    snapshot_non_system.len(),
+                    replayed.len()
+                );
+            }
         }
 
         // Seed the turn-id counter from the persisted event log so turn ids
@@ -1687,6 +1693,31 @@ mod tests {
         assert_ne!(
             normalize_resume_projection(&msgs),
             normalize_resume_projection(&different)
+        );
+    }
+
+    #[test]
+    fn divergence_comparison_tolerates_attachment_placeholders() {
+        // The snapshot stores the post-cleanup placeholder; the event record
+        // stores the original image part. Repairing the record (file gone)
+        // must make the two compare equal — no spurious divergence warning.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let snapshot = vec![Message::user(
+            "look\n[image processed and removed after send: gone.png]",
+        )];
+        let recorded = vec![Message::user_with_parts(vec![
+            ContentPart::Text {
+                text: "look".into(),
+            },
+            ContentPart::Image {
+                media_type: "image/png".into(),
+                path: "gone.png".into(),
+            },
+        ])];
+        let repaired = repair_missing_images(recorded, dir.path());
+        assert_eq!(
+            normalize_resume_projection(&repaired),
+            normalize_resume_projection(&snapshot)
         );
     }
 

@@ -93,7 +93,7 @@ Key types:
 - **Tool execution:** shell commands must go through `runtime::pty` (isolated process group + streaming stdout + whole-group cleanup on completion/timeout, so a backgrounded child can never pin a worker or starve the TUI input loop). Don't bypass it with ad-hoc `Command` usage for user-visible execution. File write tools must canonicalize paths and verify they are within the workspace root or any mounted extra path. External directories can be mounted at runtime via `/mount <path>`.
 - **Tool-use streaming:** incoming tool-use blocks are buffered until the closing tag is received, then executed as a batch (not streamed incrementally).
 - **IPC:** newline-delimited JSON over Unix domain sockets. `AgentEvent` enum is the shared event bus.
-- **Sessions:** `<workspace>/.nca/sessions/<id>.json` (state) + `<id>.events.jsonl` (event log). IPC socket at `$XDG_RUNTIME_DIR/nca/` (fallback `/tmp/nca/`).
+- **Sessions:** `<workspace>/.nca/sessions/<id>.json` (state) + `<id>.events.jsonl` (event log). Resume prefers the json snapshot; corrupt/empty json falls back to event-log replay via `MessageRecorded` events (`core::replay`, P2 Phase A — json stays authoritative until Phase B adds turn-end flush). IPC socket at `$XDG_RUNTIME_DIR/nca/` (fallback `/tmp/nca/`).
 - **Config resolution:** compiled defaults → `$XDG_CONFIG_HOME/nca/config.toml` → `<workspace>/.nca/config.local.toml` → env vars → CLI flags.
 - **Conventional Commits** for commit messages (type(scope): description).
 - **Do not edit `for-test/`** — it is gitignored and used for transient test artifacts.

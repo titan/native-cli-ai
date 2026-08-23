@@ -172,10 +172,7 @@ impl AgentLoop {
             Message::user_with_parts(parts)
         };
         let preview = user_msg.event_preview();
-        self.emit(AgentEvent::MessageRecorded {
-            message: user_msg.clone(),
-        })
-        .await;
+        self.record(&user_msg).await;
         self.messages.push(user_msg);
         self.emit(AgentEvent::MessageReceived {
             role: "user".into(),
@@ -215,6 +212,16 @@ impl AgentLoop {
 
     pub(crate) async fn emit(&self, event: AgentEvent) {
         let _ = self.event_tx.send(event).await;
+    }
+
+    /// Record a model-visible message: emit [`AgentEvent::MessageRecorded`]
+    /// for the replay projection, then the caller pushes it. Every push site
+    /// inside `run_turn` goes through this; system prompts never do.
+    pub(crate) async fn record(&self, message: &Message) {
+        self.emit(AgentEvent::MessageRecorded {
+            message: message.clone(),
+        })
+        .await;
     }
 
     pub fn event_sender(&self) -> Option<tokio::sync::mpsc::Sender<AgentEvent>> {

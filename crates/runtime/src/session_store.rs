@@ -1,4 +1,3 @@
-// `AgentEvent`/`EventEnvelope` are used in `read_event_log` signatures below.
 use nca_common::event::{AgentEvent, EventEnvelope};
 use nca_common::session::{SessionSnapshot, SessionState};
 use std::path::{Path, PathBuf};
