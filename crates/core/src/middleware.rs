@@ -152,6 +152,78 @@ impl MiddlewareChain {
     }
 }
 
+/// Prune ladder (P3 design §4): first retry keeps the last 8 groups full
+/// (matching `plan_context_view`'s recent window), the second is more
+/// aggressive (last 2).
+const PRUNE_LADDER: [usize; 2] = [crate::context_view::RECENT_GROUPS_KEEP_FULL, 2];
+
+/// Catches context-overflow rejections at the `chat()` seam and retries with
+/// a progressively pruned request view (P3,
+/// `docs/plans/p3-compaction-design.md` §4). Bounded; escalates the original
+/// error unchanged when pruning cannot shrink the view further. Non-overflow
+/// errors pass through untouched (single attempt, no events).
+///
+/// Wired alone for now; as the only middleware it is trivially outermost.
+/// When a fuller chain lands, recovery goes innermost-of-policy /
+/// outermost-of-retry.
+pub struct OverflowRecoveryMiddleware {
+    /// Max prune-retry attempts per step (roadmap: at most 2).
+    max_retries: u32,
+}
+
+impl Default for OverflowRecoveryMiddleware {
+    fn default() -> Self {
+        Self { max_retries: 2 }
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentMiddleware for OverflowRecoveryMiddleware {
+    fn name(&self) -> &str {
+        "overflow-recovery"
+    }
+
+    async fn call(&self, mut req: StepRequest, next: Next<'_>) -> Result<StepReply, ProviderError> {
+        let mut attempt: u32 = 0;
+        loop {
+            match next.clone().run(req.clone()).await {
+                Ok(reply) => return Ok(reply),
+                Err(e) if e.is_context_overflow() && attempt < self.max_retries => {
+                    let tokens_before =
+                        crate::context_view::estimate_tokens_for_slice(&req.messages);
+                    let _ = req
+                        .event_tx
+                        .send(AgentEvent::ContextCompactionStart {
+                            tokens_before,
+                            reason: "overflow_prune".into(),
+                        })
+                        .await;
+                    let pruned = crate::context_view::prune_tool_results(
+                        &req.messages,
+                        PRUNE_LADDER[attempt as usize],
+                    );
+                    let tokens_after =
+                        crate::context_view::estimate_tokens_for_slice(&pruned.messages);
+                    let _ = req
+                        .event_tx
+                        .send(AgentEvent::ContextCompactionEnd {
+                            tokens_after,
+                            kv_prefix_broken: pruned.pruned_groups > 0,
+                        })
+                        .await;
+                    // No progress possible → escalate the original error unchanged.
+                    if pruned.pruned_groups == 0 {
+                        return Err(e);
+                    }
+                    req.messages = pruned.messages;
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,6 +604,210 @@ mod tests {
         assert_eq!(
             calls[1].0,
             vec!["attempt".to_string(), "retry marker".into()]
+        );
+    }
+
+    // --- P3: OverflowRecoveryMiddleware (C4/C5) ---
+
+    /// Scripted overflow provider: fails the first `fail_calls` calls with a
+    /// context-overflow error body, then succeeds. Records every call's
+    /// message texts.
+    struct OverflowThenOkProvider {
+        calls: Mutex<Vec<Vec<String>>>,
+        fail_calls: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for OverflowThenOkProvider {
+        async fn chat(
+            &self,
+            messages: &[Message],
+            _tools: &[ToolDefinition],
+            _model: &str,
+            _workspace_root: &Path,
+        ) -> Result<tokio::sync::mpsc::Receiver<StreamChunk>, ProviderError> {
+            let seen: Vec<String> = messages
+                .iter()
+                .map(|m| m.content.to_summary_text())
+                .collect();
+            self.calls.lock().unwrap().push(seen);
+            if self.calls.lock().unwrap().len() <= self.fail_calls {
+                return Err(ProviderError::RequestFailed(
+                    "{\"error\":{\"message\":\"This model's maximum context length is 65536 tokens. However, you requested 90124 tokens.\"}}".into(),
+                ));
+            }
+            Ok(text_stream())
+        }
+    }
+
+    fn read_call(id: &str) -> nca_common::message::MessageToolCall {
+        nca_common::message::MessageToolCall {
+            id: id.into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "a.rs"}),
+        }
+    }
+
+    /// Fixture with prunable material: system + old compactible tool groups +
+    /// a long recent tail, so rung 0 (keep last 8 groups) has something to delete.
+    fn overflow_fixture() -> Vec<Message> {
+        let mut messages = vec![Message::system("sys")];
+        for i in 0..6 {
+            messages.push(Message::assistant_with_tool_calls(
+                "",
+                vec![read_call(&format!("c{i}"))],
+            ));
+            messages.push(Message::tool(&format!("c{i}"), &format!("read output {i}")));
+        }
+        for i in 0..9 {
+            messages.push(Message::user(format!("u{i}")));
+            messages.push(Message::assistant(format!("a{i}")));
+        }
+        messages
+    }
+
+    // C4 — overflow once → prune → retry succeeds.
+    #[tokio::test]
+    async fn overflow_recovery_prunes_and_retries_successfully() {
+        let provider = Arc::new(OverflowThenOkProvider {
+            calls: Mutex::new(Vec::new()),
+            fail_calls: 1,
+        });
+        let dyn_provider: Arc<dyn Provider> = provider.clone();
+        let mut chain = MiddlewareChain::new();
+        chain.push(Arc::new(OverflowRecoveryMiddleware::default()));
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let request = StepRequest {
+            messages: overflow_fixture(),
+            tools: vec![],
+            model: "test-model".into(),
+            workspace_root: PathBuf::from("/tmp/nca-p3-test"),
+            turn_id: 1,
+            step_index: 1,
+            event_tx,
+        };
+
+        let reply = chain
+            .call(&dyn_provider, request)
+            .await
+            .expect("pruned retry must succeed");
+        assert!(matches!(reply, StepReply::Stream(_)));
+
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "provider called exactly twice");
+        assert!(
+            !calls[1].iter().any(|t| t.contains("read output")),
+            "attempt-2 messages must lack the pruned tool groups: {:?}",
+            calls[1]
+        );
+        assert!(calls[1].iter().any(|t| t == "sys"), "system kept");
+
+        // Bracket events on the channel: Start(overflow_prune) then
+        // End(kv_prefix_broken=true).
+        let mut saw_start = false;
+        let mut saw_end = false;
+        while let Ok(ev) = event_rx.try_recv() {
+            match ev {
+                AgentEvent::ContextCompactionStart {
+                    tokens_before,
+                    reason,
+                } => {
+                    assert!(tokens_before > 0);
+                    assert_eq!(reason, "overflow_prune");
+                    saw_start = true;
+                }
+                AgentEvent::ContextCompactionEnd {
+                    kv_prefix_broken, ..
+                } => {
+                    assert!(kv_prefix_broken);
+                    saw_end = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_start, "ContextCompactionStart emitted");
+        assert!(saw_end, "ContextCompactionEnd emitted");
+    }
+
+    // C5a — nothing prunable → escalates the original overflow error after
+    // one attempt (prune made no progress).
+    #[tokio::test]
+    async fn overflow_recovery_escalates_when_nothing_prunable() {
+        let provider = Arc::new(OverflowThenOkProvider {
+            calls: Mutex::new(Vec::new()),
+            fail_calls: 5, // always fails
+        });
+        let dyn_provider: Arc<dyn Provider> = provider.clone();
+        let mut chain = MiddlewareChain::new();
+        chain.push(Arc::new(OverflowRecoveryMiddleware::default()));
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let request = StepRequest {
+            // Minimal view: no tool groups → pruned_groups == 0 on rung 0.
+            messages: vec![Message::system("sys"), Message::user("hi")],
+            tools: vec![],
+            model: "test-model".into(),
+            workspace_root: PathBuf::from("/tmp/nca-p3-test"),
+            turn_id: 1,
+            step_index: 1,
+            event_tx,
+        };
+
+        let err = chain
+            .call(&dyn_provider, request)
+            .await
+            .expect_err("must escalate");
+        assert!(err.is_context_overflow(), "original error unchanged");
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "no-progress prune escalates after one call (≤2 bound)"
+        );
+        // The bracket (Start + End with kv_prefix_broken=false) is emitted
+        // before the escalation decision — audit value even without retry.
+    }
+
+    // C5b — non-overflow error: single attempt, no events, untouched Err.
+    #[tokio::test]
+    async fn non_overflow_error_passes_through_untouched() {
+        struct AlwaysAuthFail;
+        #[async_trait::async_trait]
+        impl Provider for AlwaysAuthFail {
+            async fn chat(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolDefinition],
+                _model: &str,
+                _workspace_root: &Path,
+            ) -> Result<tokio::sync::mpsc::Receiver<StreamChunk>, ProviderError> {
+                Err(ProviderError::AuthError("invalid api key".into()))
+            }
+        }
+        let dyn_provider: Arc<dyn Provider> = Arc::new(AlwaysAuthFail);
+        let mut chain = MiddlewareChain::new();
+        chain.push(Arc::new(OverflowRecoveryMiddleware::default()));
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let request = StepRequest {
+            messages: overflow_fixture(),
+            tools: vec![],
+            model: "test-model".into(),
+            workspace_root: PathBuf::from("/tmp/nca-p3-test"),
+            turn_id: 1,
+            step_index: 1,
+            event_tx,
+        };
+
+        let err = chain
+            .call(&dyn_provider, request)
+            .await
+            .expect_err("auth error must pass through");
+        assert!(matches!(err, ProviderError::AuthError(_)));
+        assert!(
+            event_rx.try_recv().is_err(),
+            "non-overflow errors must not emit events"
         );
     }
 }

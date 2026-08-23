@@ -126,3 +126,109 @@ pub enum ProviderError {
     #[error("{0}")]
     Other(String),
 }
+
+/// Error-body substrings that identify a context-window overflow rejection
+/// (HTTP 4xx raised before streaming started). Deliberately tight — a false
+/// positive triggers destructive compaction recovery.
+///
+/// Coverage is intentionally partial (`docs/plans/p3-compaction-design.md`
+/// §2): providers phrasing overflow differently (e.g. non-English bodies)
+/// will not match and the error passes through unchanged (graceful
+/// degradation). Patterns are extended only with verified literal strings.
+const CONTEXT_OVERFLOW_PATTERNS: [&str; 4] = [
+    // OpenAI / OpenAI-compatible (incl. DeepSeek, served by OpenAiCompatProvider)
+    "maximum context length",
+    // OpenAI-compatible alt phrasing
+    "context length exceeded",
+    // Anthropic-compatible (incl. MiniMax, Kimi)
+    "prompt is too long",
+    // Anthropic alt phrasing ("input length and `max_tokens` exceed context limit")
+    "exceed context limit",
+];
+
+impl ProviderError {
+    /// Whether this error is a context-window overflow rejection (HTTP 4xx
+    /// raised before streaming started). Recoverable by compaction + retry.
+    ///
+    /// Case-insensitive substring match over the payloads of `RequestFailed`
+    /// and `Other` — all providers route non-401/403/404/429 HTTP bodies to
+    /// `RequestFailed(body_text)` via the compat stream parsers.
+    pub fn is_context_overflow(&self) -> bool {
+        let payload = match self {
+            ProviderError::RequestFailed(body) | ProviderError::Other(body) => body,
+            _ => return false,
+        };
+        let lower = payload.to_ascii_lowercase();
+        CONTEXT_OVERFLOW_PATTERNS
+            .iter()
+            .any(|pattern| lower.contains(pattern))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_context_overflow_matches_the_four_literal_patterns() {
+        for literal in [
+            "This model's maximum context length is 65536 tokens",
+            "context length exceeded",
+            "prompt is too long: 12000 tokens > 8192 maximum",
+            "input length and `max_tokens` exceed context limit: 100000 > 65536",
+        ] {
+            assert!(
+                ProviderError::RequestFailed(literal.into()).is_context_overflow(),
+                "must match: {literal}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_context_overflow_is_case_insensitive_and_matches_other_variant() {
+        assert!(
+            ProviderError::RequestFailed(
+                "This Model's MAXIMUM CONTEXT LENGTH is 65536 tokens".into()
+            )
+            .is_context_overflow()
+        );
+        assert!(ProviderError::Other("Prompt Is TOO LONG".into()).is_context_overflow());
+    }
+
+    #[test]
+    fn is_context_overflow_matches_inside_realistic_json_bodies() {
+        let openai_style = r#"{"error":{"message":"This model's maximum context length is 65536 tokens. However, you requested 70124 tokens (68676 in the messages, 1448 in the completion). Please reduce the length of the messages or completion.","type":"invalid_request_error","param":null,"code":"context_length_exceeded"}}"#;
+        assert!(ProviderError::RequestFailed(openai_style.into()).is_context_overflow());
+
+        let anthropic_style = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 200001 tokens > 200000 maximum"}}"#;
+        assert!(ProviderError::RequestFailed(anthropic_style.into()).is_context_overflow());
+    }
+
+    #[test]
+    fn is_context_overflow_false_for_unrelated_errors() {
+        assert!(!ProviderError::AuthError("invalid api key".into()).is_context_overflow());
+        assert!(
+            !ProviderError::RateLimited {
+                retry_after_ms: 1000
+            }
+            .is_context_overflow()
+        );
+        assert!(!ProviderError::ModelNotFound("no such model".into()).is_context_overflow());
+        assert!(
+            !ProviderError::RequestFailed("internal server error".into()).is_context_overflow()
+        );
+        assert!(
+            !ProviderError::RequestFailed("upstream connect error".into()).is_context_overflow()
+        );
+        assert!(!ProviderError::Configuration("missing api key".into()).is_context_overflow());
+    }
+
+    #[test]
+    fn is_context_overflow_false_for_non_matching_overflow_body() {
+        // Graceful passthrough (design §2): a provider phrasing overflow in
+        // another language does not match any pattern — the error passes
+        // through unchanged, which is exactly the pre-P3 behavior.
+        let chinese_body = "错误：输入内容超过了模型的最大上下文窗口，请缩短输入";
+        assert!(!ProviderError::RequestFailed(chinese_body.into()).is_context_overflow());
+    }
+}

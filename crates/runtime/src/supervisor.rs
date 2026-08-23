@@ -869,8 +869,42 @@ impl Supervisor {
             .agent
             .run_turn(prompt, self.workspace_root.as_path(), attachments)
             .await;
+        // Durability ordering (P3 §5): ALWAYS wait for the first turn's
+        // commit before any further canonical-history mutation (the overflow
+        // summarize below replaces history).
         self.await_turn_commit(before).await;
-        let output = result?;
+        let output = match result {
+            Ok(out) => out,
+            Err(e) if should_overflow_retry(&e, false) => {
+                // Canonical fallback arm: summarize + exactly one retry.
+                // `run_turn`'s Err already rolled `agent.messages` back to
+                // the pre-turn baseline, so the summarize operates on it.
+                let stats = self.context_manager.stats(&self.agent.messages);
+                if let Some(tx) = self.agent.event_sender() {
+                    let _ = tx
+                        .send(AgentEvent::ContextCompactionStart {
+                            tokens_before: stats.estimated_tokens,
+                            reason: "overflow_summarize".into(),
+                        })
+                        .await;
+                }
+                if let Err(e) = self.perform_auto_summarize("overflow_summarize").await {
+                    tracing::error!("overflow summarize failed: {}", e);
+                }
+                let retry_before = self
+                    .turn_commit_rx
+                    .as_ref()
+                    .map(|rx| *rx.borrow())
+                    .unwrap_or(0);
+                let second = self
+                    .agent
+                    .run_turn(prompt, self.workspace_root.as_path(), attachments)
+                    .await;
+                self.await_turn_commit(retry_before).await;
+                second?
+            }
+            Err(e) => return Err(e),
+        };
 
         // Check context after turn
         self.check_and_summarize_context().await;
@@ -992,21 +1026,14 @@ impl Supervisor {
 
         if let Some(tx) = self.agent.event_sender() {
             let _ = tx
-                .send(AgentEvent::ContextCompaction {
-                    phase: "starting".to_string(),
-                    message: format!(
-                        "Auto-summarizing context before turn ({}% full, {} tokens)",
-                        stats.usage_percent, stats.estimated_tokens
-                    ),
-                    tokens_before: None,
-                    tokens_after: None,
-                    retained_groups: None,
-                    dropped_groups: None,
+                .send(AgentEvent::ContextCompactionStart {
+                    tokens_before: stats.estimated_tokens,
+                    reason: "auto_summarize".into(),
                 })
                 .await;
         }
 
-        if let Err(e) = self.perform_auto_summarize().await {
+        if let Err(e) = self.perform_auto_summarize("auto_summarize").await {
             tracing::error!("Pre-turn auto-summarize failed: {}", e);
             self.last_summary_at_tokens = 0;
         }
@@ -1030,22 +1057,15 @@ impl Supervisor {
             // Emit event that summarization is starting
             if let Some(tx) = self.agent.event_sender() {
                 let _ = tx
-                    .send(AgentEvent::ContextCompaction {
-                        phase: "starting".to_string(),
-                        message: format!(
-                            "Auto-summarizing context ({}% full, {} tokens)",
-                            stats.usage_percent, stats.estimated_tokens
-                        ),
-                        tokens_before: None,
-                        tokens_after: None,
-                        retained_groups: None,
-                        dropped_groups: None,
+                    .send(AgentEvent::ContextCompactionStart {
+                        tokens_before: stats.estimated_tokens,
+                        reason: "auto_summarize".into(),
                     })
                     .await;
             }
 
             // Trigger summarization
-            if let Err(e) = self.perform_auto_summarize().await {
+            if let Err(e) = self.perform_auto_summarize("auto_summarize").await {
                 tracing::error!("Auto-summarize failed: {}", e);
                 // Reset so we can try again
                 self.last_summary_at_tokens = 0;
@@ -1086,8 +1106,12 @@ impl Supervisor {
             .await;
     }
 
-    /// Perform the actual auto-summarization.
-    async fn perform_auto_summarize(&mut self) -> Result<(), String> {
+    /// Perform the actual auto-summarization. `reason` threads the bracket
+    /// cause ("auto_summarize" | "overflow_summarize") into diagnostics; the
+    /// matching `ContextCompactionStart` is emitted by the caller, and this
+    /// method emits `ContextCompactionEnd` on BOTH exit paths (AI summary and
+    /// sliding-window fallback, including the early empty-messages path).
+    async fn perform_auto_summarize(&mut self, reason: &str) -> Result<(), String> {
         let messages_to_summarize = self
             .context_manager
             .get_messages_to_summarize(&self.agent.messages);
@@ -1099,6 +1123,19 @@ impl Supervisor {
                 .get_sliding_window(&self.agent.messages, None);
             self.emit_history_replaced(&compacted).await;
             self.agent.messages = compacted;
+            let tokens_after = self
+                .context_manager
+                .stats(&self.agent.messages)
+                .estimated_tokens;
+            if let Some(tx) = self.agent.event_sender() {
+                let _ = tx
+                    .send(AgentEvent::ContextCompactionEnd {
+                        tokens_after,
+                        kv_prefix_broken: true,
+                    })
+                    .await;
+            }
+            tracing::debug!(reason = reason, "auto-summarize applied sliding window");
             return Ok(());
         }
 
@@ -1122,17 +1159,9 @@ impl Supervisor {
 
                 if let Some(tx) = self.agent.event_sender() {
                     let _ = tx
-                        .send(AgentEvent::ContextCompaction {
-                            phase: "completed".to_string(),
-                            message: format!(
-                                "Context summarized. Reduced from {} to ~{} tokens.",
-                                messages_to_summarize.len() * 100, // rough estimate
-                                self.last_summary_at_tokens
-                            ),
-                            tokens_before: None,
-                            tokens_after: None,
-                            retained_groups: None,
-                            dropped_groups: None,
+                        .send(AgentEvent::ContextCompactionEnd {
+                            tokens_after: self.last_summary_at_tokens,
+                            kv_prefix_broken: true,
                         })
                         .await;
                 }
@@ -1149,6 +1178,14 @@ impl Supervisor {
                     .context_manager
                     .stats(&self.agent.messages)
                     .estimated_tokens;
+                if let Some(tx) = self.agent.event_sender() {
+                    let _ = tx
+                        .send(AgentEvent::ContextCompactionEnd {
+                            tokens_after: self.last_summary_at_tokens,
+                            kv_prefix_broken: true,
+                        })
+                        .await;
+                }
             }
         }
 
@@ -1748,6 +1785,14 @@ pub(crate) fn register_skill_agents(config: &mut NcaConfig, workspace_root: &Pat
     }
 }
 
+/// Pure: should a `run_turn` error trigger the supervisor's one-shot
+/// summarize-retry (P3 §5)? Exactly one retry per `run_turn_with_images`
+/// call; the middleware view-prune arm has already run by the time an
+/// overflow reaches here.
+pub(crate) fn should_overflow_retry(err: &ProviderError, already_retried: bool) -> bool {
+    !already_retried && err.is_context_overflow()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1763,6 +1808,27 @@ mod tests {
                 branch: None,
             },
         )
+    }
+
+    // C9 — overflow summarize-retry decision table.
+    #[test]
+    fn should_overflow_retry_decision_table() {
+        let overflow = ProviderError::RequestFailed(
+            "This model's maximum context length is 65536 tokens".into(),
+        );
+        let other = ProviderError::AuthError("invalid api key".into());
+        assert!(
+            should_overflow_retry(&overflow, false),
+            "first overflow retries"
+        );
+        assert!(
+            !should_overflow_retry(&overflow, true),
+            "exactly one retry — second overflow escalates"
+        );
+        assert!(
+            !should_overflow_retry(&other, false),
+            "non-overflow never retries"
+        );
     }
 
     #[test]

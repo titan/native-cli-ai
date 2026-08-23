@@ -109,6 +109,13 @@ impl AgentLoop {
         self
     }
 
+    /// Append a step-request middleware in place (non-consuming counterpart
+    /// of [`AgentLoop::with_middleware`], for construction sites that build
+    /// via `new` and then configure). First added = outermost.
+    pub fn push_middleware(&mut self, middleware: Arc<dyn crate::middleware::AgentMiddleware>) {
+        self.middleware.push(middleware);
+    }
+
     /// Seed the turn-id counter (session resume: max `TurnStarted.turn_id`
     /// found in the event log) so ids stay session-unique across restarts.
     pub fn set_turn_seq_start(&mut self, n: u64) {

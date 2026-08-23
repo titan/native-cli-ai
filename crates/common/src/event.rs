@@ -245,6 +245,33 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         dropped_groups: Option<usize>,
     },
+    /// Replacement-type compaction started (canonical summarize or overflow
+    /// recovery). Informational; replay-ignored. Pairs with
+    /// [`AgentEvent::ContextCompactionEnd`]; the middle of the bracket is the
+    /// replacement itself (`HistoryReplaced` for canonical paths, nothing for
+    /// view-prune). Routine per-step smart compaction keeps emitting the
+    /// single `ContextCompaction` event above.
+    ContextCompactionStart {
+        /// Estimated token count of the context before compaction.
+        #[serde(default)]
+        tokens_before: usize,
+        /// Why compaction started: "auto_summarize" | "overflow_prune" |
+        /// "overflow_summarize".
+        #[serde(default)]
+        reason: String,
+    },
+    /// Replacement-type compaction finished. `kv_prefix_broken` marks
+    /// recoveries that changed the request view or replaced history
+    /// (cache-cold retry).
+    ContextCompactionEnd {
+        /// Estimated token count of the context after compaction.
+        #[serde(default)]
+        tokens_after: usize,
+        /// Whether the warmed KV cache prefix was invalidated by the
+        /// replacement (always true for current paths).
+        #[serde(default)]
+        kv_prefix_broken: bool,
+    },
     /// Busy state transition (for animated indicator rendering).
     BusyStateChanged {
         state: BusyState,
@@ -490,6 +517,61 @@ mod interactive_question_serde_tests {
             AgentEvent::TodosUpdated { todos } => {
                 assert_eq!(todos.len(), 1);
                 assert_eq!(todos[0].id, "1");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn context_compaction_start_end_roundtrip() {
+        let start = AgentEvent::ContextCompactionStart {
+            tokens_before: 12_345,
+            reason: "overflow_prune".into(),
+        };
+        let json = serde_json::to_string(&start).expect("serialize");
+        let back: AgentEvent = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            AgentEvent::ContextCompactionStart {
+                tokens_before,
+                reason,
+            } => {
+                assert_eq!(tokens_before, 12_345);
+                assert_eq!(reason, "overflow_prune");
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let end = AgentEvent::ContextCompactionEnd {
+            tokens_after: 4_000,
+            kv_prefix_broken: true,
+        };
+        let json = serde_json::to_string(&end).expect("serialize");
+        let back: AgentEvent = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            AgentEvent::ContextCompactionEnd {
+                tokens_after,
+                kv_prefix_broken,
+            } => {
+                assert_eq!(tokens_after, 4_000);
+                assert!(kv_prefix_broken);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn compaction_end_missing_kv_prefix_broken_still_deserializes() {
+        // C10: a partially-written log tail may drop trailing fields;
+        // `#[serde(default)]` must tolerate it.
+        let raw = r#"{"type":"ContextCompactionEnd","tokens_after":900}"#;
+        let back: AgentEvent = serde_json::from_str(raw).expect("deserialize");
+        match back {
+            AgentEvent::ContextCompactionEnd {
+                tokens_after,
+                kv_prefix_broken,
+            } => {
+                assert_eq!(tokens_after, 900);
+                assert!(!kv_prefix_broken);
             }
             _ => panic!("wrong variant"),
         }

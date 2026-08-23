@@ -8,7 +8,9 @@ use nca_common::config::SmartCompactionMode;
 use nca_common::message::{Message, MessageContent, Role};
 use std::collections::HashSet;
 
-const RECENT_GROUPS_KEEP_FULL: usize = 8;
+/// Number of most-recent groups kept fully intact by smart compaction (and
+/// the first rung of the overflow-recovery prune ladder).
+pub(crate) const RECENT_GROUPS_KEEP_FULL: usize = 8;
 const TOOL_RESULT_KEEP_CHARS: usize = 400;
 const FILE_MENTION_KEEP_CHARS: usize = 240;
 
@@ -448,6 +450,51 @@ pub fn orphaned_tool_results(messages: &[Message]) -> usize {
         .count()
 }
 
+/// Outcome of a prune pass ([`prune_tool_results`]).
+#[derive(Debug, Clone)]
+pub struct PruneOutcome {
+    /// The pruned message list (input minus deleted groups).
+    pub messages: Vec<Message>,
+    /// Number of complete tool groups deleted.
+    pub pruned_groups: usize,
+}
+
+/// Delete (not truncate) the oldest compactible tool groups from a message
+/// list, keeping system messages, `must_keep` groups, and the last
+/// `keep_recent_groups` groups intact. Never splits a tool group — deletion
+/// removes the assistant carrier plus all its results. Pure: operates on any
+/// message list (in recovery, the request view), never canonical history.
+///
+/// A group is prunable when it is a `ToolGroup`, not `must_keep`, its
+/// assistant carrier calls only compactible tools, and it sits older than
+/// the recent window of `keep_recent_groups` groups (of any kind).
+pub fn prune_tool_results(messages: &[Message], keep_recent_groups: usize) -> PruneOutcome {
+    let groups = partition_groups(messages);
+    let recent_start = groups.len().saturating_sub(keep_recent_groups);
+    let mut out = Vec::with_capacity(messages.len());
+    let mut pruned_groups = 0usize;
+    for (idx, group) in groups.iter().enumerate() {
+        let prunable = group.kind == GroupKind::ToolGroup
+            && !group.must_keep
+            && idx < recent_start
+            && group.messages.iter().any(|m| {
+                m.role == Role::Assistant && {
+                    let names = tool_names_in_assistant(m);
+                    !names.is_empty() && names.iter().all(|n| is_compactible_tool(n))
+                }
+            });
+        if prunable {
+            pruned_groups += 1;
+        } else {
+            out.extend(group.messages.iter().cloned());
+        }
+    }
+    PruneOutcome {
+        messages: out,
+        pruned_groups,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -576,5 +623,156 @@ mod tests {
                 .iter()
                 .any(|m| message_text(m).contains("wrote important change"))
         );
+    }
+
+    fn assert_no_orphaned_tool_results(messages: &[Message]) {
+        assert_eq!(
+            orphaned_tool_results(messages),
+            0,
+            "pruned view must never orphan tool results"
+        );
+    }
+
+    // C2 + C8 — complete-group deletion, must_keep/system/orphan safety,
+    // no orphans even on group-straddling fixtures.
+    #[test]
+    fn prune_deletes_complete_compactible_groups_only() {
+        let mut messages = vec![Message::system("sys")];
+        messages.extend(tool_group("r0", "read_file", "old read output 0"));
+        messages.extend(tool_group("w0", "write_file", "wrote ok"));
+        messages.extend(tool_group("r1", "read_file", "error: failed to read"));
+        // Group-straddling fixture: an assistant carrier with two compactible
+        // calls must vanish as one unit (both results), never split.
+        messages.extend([
+            Message::assistant_with_tool_calls(
+                "",
+                vec![
+                    MessageToolCall {
+                        id: "a1".into(),
+                        name: "read_file".into(),
+                        arguments: json!({"path": "x.rs"}),
+                    },
+                    MessageToolCall {
+                        id: "a2".into(),
+                        name: "search_code".into(),
+                        arguments: json!({"pattern": "x"}),
+                    },
+                ],
+            ),
+            Message::tool("a1", "read output"),
+            Message::tool("a2", "search output"),
+        ]);
+        // Recent window.
+        for i in 0..10 {
+            messages.push(Message::user(format!("u{i}")));
+            messages.push(Message::assistant(format!("a{i}")));
+        }
+
+        let out = prune_tool_results(&messages, 2);
+        assert!(out.pruned_groups >= 2, "old compactible groups are deleted");
+        let texts: Vec<_> = out.messages.iter().map(message_text).collect();
+        assert!(
+            !texts.iter().any(|t| t.contains("old read output 0")),
+            "compactible old group deleted"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("wrote ok")),
+            "write group kept"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("error: failed to read")),
+            "error-result group kept"
+        );
+        // (Orphan tool results are partitioned into their own must_keep
+        // groups and never deleted — covered by partition_groups itself; a
+        // fixture containing one cannot also assert zero orphans.)
+        // Multi-call carrier deleted as one unit: neither call id survives.
+        let ids: Vec<_> = out
+            .messages
+            .iter()
+            .flat_map(|m| m.tool_calls.iter().flatten().map(|c| c.id.clone()))
+            .collect();
+        assert!(!ids.iter().any(|id| id == "a1" || id == "a2"));
+        assert_eq!(
+            out.messages[0].role,
+            Role::System,
+            "system message kept first"
+        );
+        assert_no_orphaned_tool_results(&out.messages);
+    }
+
+    // C3 — ladder amounts and the minimal-list no-op.
+    #[test]
+    fn prune_ladder_prunes_progressively_and_minimal_prunes_zero() {
+        let mut messages = vec![Message::system("sys")];
+        for i in 0..12 {
+            messages.extend(tool_group(&format!("p{i}"), "read_file", "payload"));
+        }
+        for i in 0..6 {
+            messages.push(Message::user(format!("u{i}")));
+            messages.push(Message::assistant(format!("a{i}")));
+        }
+        // A compactible group INSIDE the recent-8 window (but outside the
+        // recent-2): gentle rung protects it, aggressive rung deletes it.
+        messages.extend(tool_group("late", "read_file", "late read output"));
+        messages.push(Message::user("final"));
+        messages.push(Message::assistant("done"));
+
+        let gentle = prune_tool_results(&messages, 8);
+        let aggressive = prune_tool_results(&messages, 2);
+        assert!(
+            gentle.pruned_groups < aggressive.pruned_groups,
+            "keep_recent=8 prunes fewer ({}) than keep_recent=2 ({})",
+            gentle.pruned_groups,
+            aggressive.pruned_groups
+        );
+        assert!(gentle.pruned_groups > 0);
+        let gentle_texts: Vec<_> = gentle.messages.iter().map(message_text).collect();
+        assert!(
+            gentle_texts.iter().any(|t| t.contains("late read output")),
+            "recent-8 window protects the late group"
+        );
+        assert_no_orphaned_tool_results(&gentle.messages);
+        assert_no_orphaned_tool_results(&aggressive.messages);
+
+        // Already-minimal list: nothing outside the recent window → no-op.
+        let minimal = vec![Message::system("sys"), Message::user("hi")];
+        let out = prune_tool_results(&minimal, 8);
+        assert_eq!(out.pruned_groups, 0);
+        assert_eq!(out.messages, minimal);
+    }
+
+    // C11 — post-summarize fixture: the summary system message is never
+    // pruned and nothing is orphaned.
+    #[test]
+    fn prune_never_deletes_post_summarize_summary() {
+        let mut messages = vec![
+            Message::system("You are nca."),
+            Message::system("## Conversation Summary\nEarlier we did many things."),
+        ];
+        for i in 0..10 {
+            messages.extend(tool_group(
+                &format!("s{i}"),
+                "read_file",
+                "summary-era output",
+            ));
+        }
+        for i in 0..8 {
+            messages.push(Message::user(format!("u{i}")));
+            messages.push(Message::assistant(format!("a{i}")));
+        }
+
+        let out = prune_tool_results(&messages, 2);
+        assert!(
+            out.messages
+                .iter()
+                .any(|m| m.role == Role::System
+                    && message_text(m).contains("## Conversation Summary"))
+        );
+        assert!(
+            out.pruned_groups > 0,
+            "summary-era tool groups are prunable"
+        );
+        assert_no_orphaned_tool_results(&out.messages);
     }
 }
