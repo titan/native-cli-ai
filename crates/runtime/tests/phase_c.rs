@@ -77,15 +77,11 @@ async fn create_sup(ws: &Path, session_id: &str) -> Supervisor {
 }
 
 /// Single-round text provider — one TextDelta + Finish per chat() call.
-struct OneShotProvider {
-    _recorded: Mutex<Vec<Vec<Message>>>,
-}
+struct OneShotProvider;
 
 impl OneShotProvider {
     fn new() -> Arc<Self> {
-        Arc::new(Self {
-            _recorded: Mutex::new(Vec::new()),
-        })
+        Arc::new(Self)
     }
 }
 
@@ -93,12 +89,11 @@ impl OneShotProvider {
 impl Provider for OneShotProvider {
     async fn chat(
         &self,
-        messages: &[Message],
+        _messages: &[Message],
         _tools: &[ToolDefinition],
         _model: &str,
         _workspace_root: &Path,
     ) -> Result<tokio::sync::mpsc::Receiver<StreamChunk>, ProviderError> {
-        self._recorded.lock().unwrap().push(messages.to_vec());
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         tokio::spawn(async move {
             let _ = tx.send(StreamChunk::TextDelta("answer".into())).await;

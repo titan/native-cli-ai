@@ -268,12 +268,6 @@ async fn run_service_session_with_startup(
         task.abort();
     }
     drop(supervisor);
-    match tokio::time::timeout(std::time::Duration::from_secs(5), &mut fanout_task).await {
-        Ok(_) => {}
-        Err(_) => {
-            tracing::error!("event fanout drain at service shutdown timed out; aborting");
-            fanout_task.abort();
-        }
-    }
+    crate::session_utils::drain_event_fanout(&mut fanout_task, "service shutdown").await;
     Ok(())
 }

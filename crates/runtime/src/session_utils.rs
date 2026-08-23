@@ -89,6 +89,20 @@ pub(crate) type TurnCommitTx = watch::Sender<u64>;
 /// (via [`crate::event_log::EventLogWriter`], which seeds ids from the
 /// existing log), broadcasts over IPC, renders to the provided callback,
 /// and fsync-commits at every `TurnCompleted` before signalling `commit_tx`.
+/// Bounded graceful drain of a [`spawn_event_fanout`] task (P2 Phase C §4).
+/// Callers must first drop every event-channel sender (supervisor + consumer
+/// clones) so the fanout's loop ends, commits on close, and exits; this
+/// awaits that exit with a liveness timeout, aborting on expiry.
+pub(crate) async fn drain_event_fanout(task: &mut tokio::task::JoinHandle<()>, label: &str) {
+    if tokio::time::timeout(std::time::Duration::from_secs(5), &mut *task)
+        .await
+        .is_err()
+    {
+        tracing::error!("event fanout drain for {label} timed out; aborting");
+        task.abort();
+    }
+}
+
 pub fn spawn_event_fanout(
     mut event_rx: mpsc::Receiver<AgentEvent>,
     log_path: PathBuf,

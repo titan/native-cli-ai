@@ -187,7 +187,7 @@ pub async fn spawn_child_session(
 
     let commit_tx = handle.take_turn_commit_tx().map(|(tx, _flag)| tx);
     let parent_forward = event_tx.map(|tx| (child_id.clone(), tx));
-    let fanout =
+    let mut fanout =
         event_rx.map(|rx| spawn_event_fanout(rx, log_path, None, None, parent_forward, commit_tx));
 
     let result = sup.run_turn(&context_prompt).await;
@@ -210,21 +210,13 @@ pub async fn spawn_child_session(
     let wt_path = sup.worktree_path.clone().map(|p| p.display().to_string());
     let workspace_root = sup.workspace_root.display().to_string();
 
-    if let Some(mut f) = fanout {
-        // Graceful drain: dropping `sup` closes the child's event channel
-        // (all senders live inside `sup.agent`), letting the fanout drain
-        // its buffer and hit the final commit-on-close. Bounded wait —
-        // liveness over completeness at shutdown.
-        drop(sup);
-        match tokio::time::timeout(std::time::Duration::from_secs(5), &mut f).await {
-            Ok(_) => {}
-            Err(_) => {
-                tracing::error!("event fanout drain for child session timed out; aborting");
-                f.abort();
-            }
-        }
-    } else {
-        drop(sup);
+    // Graceful drain: dropping `sup` closes the child's event channel (all
+    // senders live inside `sup.agent`), letting the fanout drain its buffer
+    // and hit the final commit-on-close. Bounded wait — liveness over
+    // completeness at shutdown.
+    drop(sup);
+    if let Some(ref mut f) = fanout {
+        crate::session_utils::drain_event_fanout(f, "child session").await;
     }
 
     Ok(ChildSessionResult {
