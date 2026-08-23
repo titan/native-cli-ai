@@ -162,6 +162,16 @@ impl<'a> TurnDriver<'a> {
                         message: "Run cancelled".into(),
                     })
                     .await;
+                // Bracket rule parity: run_turn truncates to baseline on Err, so the
+                // bracket must carry a StepFailed or replay would fold rolled-back messages.
+                self.agent
+                    .emit(AgentEvent::StepFailed {
+                        turn_id: self.turn_id,
+                        step_index: self.step_index,
+                        duration_ms: 0,
+                        error: "run cancelled".into(),
+                    })
+                    .await;
                 return Err(ProviderError::Other("run cancelled".into()));
             }
             self.step_index += 1;
@@ -640,5 +650,98 @@ impl<'a> TurnDriver<'a> {
         Ok(StepOutcome::Continue {
             had_tool_calls: true,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::approval::ApprovalPolicy;
+    use crate::provider::Provider;
+    use crate::tools::ToolRegistry;
+    use nca_common::config::{PermissionConfig, PermissionMode};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Minimal scripted provider (one round per `chat()` call; rounds are
+    /// irrelevant here because the loop-top cancel fires before any call).
+    struct NoopProvider {
+        calls: AtomicU32,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for NoopProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[nca_common::tool::ToolDefinition],
+            _model: &str,
+            _workspace_root: &Path,
+        ) -> Result<tokio::sync::mpsc::Receiver<StreamChunk>, ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            Ok(rx)
+        }
+    }
+
+    // T14 — loop-top cancel branch emits BOTH `Error` and `StepFailed`
+    // before returning Err, so the replay bracket never folds rolled-back
+    // messages. Driven via `TurnDriver::run` directly because `run_turn`
+    // resets the cancel flag at entry (the loop-top branch is unreachable
+    // from an external test without racing the mid-stream cancel poll).
+    #[tokio::test]
+    async fn t14_loop_top_cancel_emits_error_and_step_failed() {
+        let provider = Arc::new(NoopProvider {
+            calls: AtomicU32::new(0),
+        });
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+        let mut agent = AgentLoop::new(
+            Arc::clone(&provider) as Arc<dyn Provider>,
+            ToolRegistry::new(),
+            ApprovalPolicy::new(PermissionConfig {
+                mode: PermissionMode::BypassPermissions,
+                ..Default::default()
+            }),
+            "test-model".into(),
+            event_tx,
+            10,
+            16,
+            0,
+            None,
+        );
+        agent.cancel_flag.store(true, Ordering::SeqCst);
+
+        let err = TurnDriver::new(&mut agent, Path::new("."), 1, &[])
+            .run(&[])
+            .await
+            .expect_err("cancelled run must return Err");
+        assert_eq!(err.to_string(), "run cancelled");
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            0,
+            "no provider call may happen"
+        );
+
+        let mut saw_error = false;
+        let mut step_failed: Option<(u64, u64, u64, String)> = None;
+        while let Ok(e) = event_rx.try_recv() {
+            match e {
+                AgentEvent::Error { message } => {
+                    assert_eq!(message, "Run cancelled");
+                    saw_error = true;
+                }
+                AgentEvent::StepFailed {
+                    turn_id,
+                    step_index,
+                    duration_ms,
+                    error,
+                } => step_failed = Some((turn_id, step_index, duration_ms, error)),
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert!(saw_error, "cancel branch must emit Error");
+        let (turn_id, step_index, duration_ms, error) =
+            step_failed.expect("cancel branch must also emit StepFailed");
+        assert_eq!((turn_id, step_index, duration_ms), (1, 0, 0));
+        assert_eq!(error, "run cancelled");
     }
 }

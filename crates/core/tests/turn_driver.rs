@@ -659,6 +659,12 @@ async fn message_recorded_matches_agent_messages() {
 }
 
 // ---------------------------------------------------------------------------
+// T14 (loop-top cancel emits Error + StepFailed) lives as a unit test in
+// `agent_driver.rs`: `run_turn` resets the cancel flag at entry, so the
+// loop-top branch can only be driven deterministically via `TurnDriver::run`.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
 // T6 — inbox is bounded (16); overflow is rejected
 // ---------------------------------------------------------------------------
 

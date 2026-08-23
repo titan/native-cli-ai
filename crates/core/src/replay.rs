@@ -17,6 +17,12 @@ use nca_common::message::Message;
 /// A bracket left unclosed (crash mid-turn) is dropped, and a
 /// `MessageRecorded` outside any bracket is dropped defensively. Logs that
 /// predate `MessageRecorded` fold to an empty projection.
+///
+/// State-checkpoint semantics: a `HistoryReplaced` event sets the committed
+/// base to exactly its payload, verbatim. It is emitted between turn
+/// brackets; if a bracket is nevertheless open, it is left untouched (its
+/// records still belong to the bracket — no panic, no double-apply), and any
+/// later failed bracket still drops only its own messages.
 pub fn replay_surface_events(envelopes: &[EventEnvelope]) -> Vec<Message> {
     let mut out = Vec::new();
     // Open bracket: buffered messages + failure flag. `None` = no open turn.
@@ -31,6 +37,11 @@ pub fn replay_surface_events(envelopes: &[EventEnvelope]) -> Vec<Message> {
                 if let Some((buf, _)) = bracket.as_mut() {
                     buf.push(message.clone());
                 }
+            }
+            AgentEvent::HistoryReplaced { messages } => {
+                // State checkpoint: the committed base becomes the payload
+                // verbatim. An open bracket, if any, is left untouched.
+                out = messages.clone();
             }
             AgentEvent::StepFailed { .. } => {
                 if let Some((_, failed)) = bracket.as_mut() {
@@ -223,5 +234,92 @@ mod tests {
             },
         ]);
         assert!(replay_surface_events(&envs).is_empty());
+    }
+
+    // T12 — HistoryReplaced sets the committed base; later successful
+    // turns extend it.
+    #[test]
+    fn t12_history_replaced_sets_base() {
+        let envs = envelopes(vec![
+            AgentEvent::TurnStarted { turn_id: 1 },
+            AgentEvent::MessageRecorded {
+                message: Message::user("a"),
+            },
+            AgentEvent::TurnCompleted {
+                turn_id: 1,
+                duration_ms: 0,
+            },
+            AgentEvent::HistoryReplaced {
+                messages: vec![Message::user("b"), Message::assistant("b2")],
+            },
+            AgentEvent::TurnStarted { turn_id: 2 },
+            AgentEvent::MessageRecorded {
+                message: Message::user("c"),
+            },
+            AgentEvent::TurnCompleted {
+                turn_id: 2,
+                duration_ms: 0,
+            },
+        ]);
+        assert_eq!(
+            replay_surface_events(&envs),
+            vec![
+                Message::user("b"),
+                Message::assistant("b2"),
+                Message::user("c")
+            ]
+        );
+    }
+
+    // T13 — a checkpoint stands even when a later turn fails; the failed
+    // turn drops only its own messages.
+    #[test]
+    fn t13_history_replaced_checkpoint_stands_over_failed_turn() {
+        let envs = envelopes(vec![
+            AgentEvent::HistoryReplaced {
+                messages: vec![Message::user("b"), Message::assistant("b2")],
+            },
+            AgentEvent::TurnStarted { turn_id: 2 },
+            AgentEvent::MessageRecorded {
+                message: Message::user("c"),
+            },
+            AgentEvent::StepFailed {
+                turn_id: 2,
+                step_index: 1,
+                duration_ms: 1,
+                error: "boom".into(),
+            },
+            AgentEvent::TurnCompleted {
+                turn_id: 2,
+                duration_ms: 1,
+            },
+        ]);
+        assert_eq!(
+            replay_surface_events(&envs),
+            vec![Message::user("b"), Message::assistant("b2")]
+        );
+    }
+
+    // HistoryReplaced before any turn: base = payload even with no prior
+    // bracket.
+    #[test]
+    fn history_replaced_before_any_turn() {
+        let envs = envelopes(vec![AgentEvent::HistoryReplaced {
+            messages: vec![Message::user("solo")],
+        }]);
+        assert_eq!(replay_surface_events(&envs), vec![Message::user("solo")]);
+    }
+
+    // HistoryReplaced payload is used verbatim — the fold performs no
+    // system filtering (that happens at the emit site).
+    #[test]
+    fn history_replaced_payload_used_verbatim() {
+        let envs = envelopes(vec![AgentEvent::HistoryReplaced {
+            messages: vec![Message::system("stale prompt"), Message::user("kept")],
+        }]);
+        assert_eq!(
+            replay_surface_events(&envs),
+            vec![Message::system("stale prompt"), Message::user("kept")]
+        );
     }
 }

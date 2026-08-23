@@ -80,6 +80,14 @@ pub enum AgentEvent {
     MessageRecorded {
         message: crate::message::Message,
     },
+    /// The conversation history was wholesale replaced (context compaction:
+    /// AI summary or sliding window). The replay projection sets its state
+    /// to exactly this payload. Emitted between turn brackets; payload is
+    /// system-stripped at the emit site (resume always prepends a fresh
+    /// system prompt, so stale prompts must not ride along).
+    HistoryReplaced {
+        messages: Vec<crate::message::Message>,
+    },
     /// A turn started: emitted at the beginning of `run_turn`. `turn_id` is
     /// monotonic per agent (1-based) and stays session-unique across resume.
     TurnStarted {
@@ -412,6 +420,23 @@ mod interactive_question_serde_tests {
         let back: AgentEvent = serde_json::from_str(&json).expect("deserialize");
         match back {
             AgentEvent::MessageRecorded { message: m } => assert_eq!(m, message),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn history_replaced_roundtrip() {
+        let messages = vec![
+            crate::message::Message::user("summarized"),
+            crate::message::Message::assistant("the summary"),
+        ];
+        let ev = AgentEvent::HistoryReplaced {
+            messages: messages.clone(),
+        };
+        let json = serde_json::to_string(&ev).expect("serialize");
+        let back: AgentEvent = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            AgentEvent::HistoryReplaced { messages: m } => assert_eq!(m, messages),
             _ => panic!("wrong variant"),
         }
     }
