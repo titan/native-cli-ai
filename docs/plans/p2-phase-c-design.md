@@ -3,7 +3,8 @@
 > Implements §"Non-goals (Phase C)" of `p2-phase-b-design.md`. Prerequisite:
 > Phase B is merged (`6013ced`): the event log is durable at turn boundaries
 > (commit barrier) and resume is replay-authoritative (`select_resume_messages`).
-> Status: design (pre-implementation).
+> Status: implemented (lanes A–B + fix + tests + ponytail pass; oracle review
+> record at the bottom).
 
 ## Problem
 
