@@ -2,6 +2,7 @@ use crate::ipc_pending::{ApprovalPendingMap, QuestionPendingMap};
 use nca_common::config::{NcaConfig, PermissionMode, ProviderKind};
 use nca_common::event::{AgentEvent, EndReason, QuestionSelection};
 use nca_common::session::{OrchestrationContext, SessionSnapshot};
+use nca_core::agent_driver::InboxItem;
 use nca_core::approval::{ApprovalHandler, ApprovalVerdict};
 use nca_core::provider::ProviderError;
 use nca_core::tools::spawn_subagent::SpawnRequest;
@@ -67,6 +68,17 @@ impl SessionRuntime {
 
     pub fn event_log_path(&self) -> std::path::PathBuf {
         self.supervisor.event_log_path()
+    }
+
+    /// Handle for enqueueing user prompts / steering into the running or
+    /// next turn. Delegates to the supervisor's bounded agent inbox; use
+    /// `try_send` and surface "inbox full" to the user.
+    ///
+    /// Wired into the TUI composer's busy-Submit path in the P1 TUI lane;
+    /// retained here (not dead) as the public passthrough surface.
+    #[allow(dead_code)]
+    pub fn inbox_sender(&self) -> tokio::sync::mpsc::Sender<InboxItem> {
+        self.supervisor.inbox_sender()
     }
 
     pub async fn run_turn(&mut self, prompt: &str) -> Result<String, ProviderError> {

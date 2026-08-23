@@ -295,10 +295,7 @@ async fn resume_seeds_turn_ids() {
         .join(format!("{sid}.events.jsonl"));
     let mut lines = String::new();
     for turn_id in [1u64, 2, 3] {
-        let envelope = EventEnvelope::new(
-            turn_id,
-            AgentEvent::TurnStarted { turn_id },
-        );
+        let envelope = EventEnvelope::new(turn_id, AgentEvent::TurnStarted { turn_id });
         lines.push_str(&serde_json::to_string(&envelope).expect("envelope json"));
         lines.push('\n');
     }
@@ -310,16 +307,9 @@ async fn resume_seeds_turn_ids() {
     );
 
     // 3. Resume via the supervisor resume path.
-    let mut sup = Supervisor::resume(
-        offline_config(),
-        ws.path(),
-        true,
-        false,
-        sid,
-        None,
-    )
-    .await
-    .expect("resume must succeed with the offline config");
+    let mut sup = Supervisor::resume(offline_config(), ws.path(), true, false, sid, None)
+        .await
+        .expect("resume must succeed with the offline config");
 
     // 4. Swap in a trivial scripted provider (single text round).
     let provider = Arc::new(ScriptedProvider::new(vec![text_round("resumed")], None));

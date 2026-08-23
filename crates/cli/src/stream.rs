@@ -615,11 +615,39 @@ fn render_event(event: &AgentEvent, stats: &StreamStats) {
                 }
             }
         }
-        AgentEvent::TurnCompleted { duration_ms, .. } => {
+        AgentEvent::StepCompleted {
+            step_index,
+            duration_ms,
+            had_tool_calls,
+            ..
+        } => {
+            let dur = format_duration(*duration_ms);
+            let tools = if *had_tool_calls {
+                " · tool-calls"
+            } else {
+                ""
+            };
+            println!(
+                "  {}",
+                format!("step {step_index} · {dur}{tools}").color(theme::TEXT_DIM)
+            );
+        }
+        AgentEvent::StepFailed { error, .. } => {
+            let msg: String = error.chars().take(120).collect();
+            println!(
+                "  {}",
+                format!("step failed · {msg}").color(theme::TEXT_DIM)
+            );
+        }
+        AgentEvent::TurnCompleted {
+            turn_id,
+            duration_ms,
+            ..
+        } => {
             let dur = format_duration(*duration_ms);
             println!(
                 "  {}",
-                format!("turn completed · {dur}").color(theme::TEXT_DIM)
+                format!("turn completed · {dur} · turn {turn_id}").color(theme::TEXT_DIM)
             );
         }
         _ => {}

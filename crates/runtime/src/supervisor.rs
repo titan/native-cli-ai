@@ -20,11 +20,12 @@ use crate::pty::PtyManager;
 use crate::session_store::SessionStore;
 use chrono::Utc;
 use nca_common::config::{AgentProfileConfig, NcaConfig};
-use nca_common::event::{AgentEvent, EndReason};
+use nca_common::event::{AgentEvent, EndReason, EventEnvelope};
 use nca_common::session::{
     OrchestrationContext, SessionMeta, SessionSnapshot, SessionState, SessionStatus,
 };
 use nca_core::agent::AgentLoop;
+use nca_core::agent_driver::InboxItem;
 use nca_core::approval::{ApprovalHandler, ApprovalPolicy, ApprovalVerdict};
 use nca_core::cache_keepalive;
 use nca_core::harness::build_system_prompt_with_agent;
@@ -166,6 +167,24 @@ fn resolve_resume_workspace_root(current_root: &Path, stored_root: &Path) -> Pat
         return current_root.to_path_buf();
     }
     stored_root.to_path_buf()
+}
+
+/// Scan a session's `events.jsonl` for the max `TurnStarted.turn_id`.
+/// Tolerant of missing files, empty logs, and unparseable lines (skipped) —
+/// seeding the turn counter is best-effort and must never fail a resume.
+fn scan_max_turn_id(log_path: &Path) -> u64 {
+    let Ok(content) = std::fs::read_to_string(log_path) else {
+        return 0;
+    };
+    content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<EventEnvelope>(line).ok())
+        .filter_map(|envelope| match envelope.event {
+            AgentEvent::TurnStarted { turn_id } => Some(turn_id),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// Persist an approved allow pattern to the workspace config file.
@@ -524,6 +543,13 @@ impl Supervisor {
         sup.session_title = loaded.meta.session_title;
         sup.orchestration = loaded.meta.orchestration;
         sup.context_manager = Self::make_context_manager(&sup.config, &sup.model).await;
+        // Seed the turn-id counter from the persisted event log so turn ids
+        // stay session-unique across restarts. Tolerant scan: a missing,
+        // empty, or partially-corrupt log never fails the resume.
+        let max_turn = scan_max_turn_id(&sup.event_log_path());
+        if max_turn > 0 {
+            sup.agent.set_turn_seq_start(max_turn);
+        }
         Ok(sup)
     }
 
@@ -1242,6 +1268,14 @@ impl Supervisor {
 
     pub fn event_tx(&self) -> Option<tokio::sync::mpsc::Sender<AgentEvent>> {
         self.agent.event_sender()
+    }
+
+    /// Handle for enqueueing user prompts / steering into the running or
+    /// next turn. Delegates to the agent loop's bounded inbox (capacity 16);
+    /// `try_send` failure means "inbox full" and should be surfaced by the
+    /// caller.
+    pub fn inbox_sender(&self) -> mpsc::Sender<InboxItem> {
+        self.agent.inbox_sender()
     }
 
     pub fn session_store(&self) -> &SessionStore {
