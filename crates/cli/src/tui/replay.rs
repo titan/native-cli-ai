@@ -83,12 +83,24 @@ mod tests {
         let vals = parse_json_values_on_line(line);
         assert_eq!(vals.len(), 1);
         let ev = value_to_event(&vals[0]).expect("event");
-        assert!(matches!(ev, AgentEvent::MessageReceived { .. }));
+        assert!(matches!(
+            ev,
+            AgentEvent::MessageReceived {
+                steering: false,
+                ..
+            }
+        ));
 
         let line2 = r#"{"type":"MessageReceived","role":"assistant","content":"yo"}"#;
         let vals2 = parse_json_values_on_line(line2);
         let ev2 = value_to_event(&vals2[0]).expect("event");
-        assert!(matches!(ev2, AgentEvent::MessageReceived { .. }));
+        assert!(matches!(
+            ev2,
+            AgentEvent::MessageReceived {
+                steering: false,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -116,6 +128,7 @@ mod tests {
         assert!(!should_skip_on_replay(&AgentEvent::MessageReceived {
             role: "user".into(),
             content: "a".into(),
+            steering: false,
         }));
     }
 }

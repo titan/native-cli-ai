@@ -1061,6 +1061,7 @@ mod tests {
         TuiFeedbackMsg::Agent(AgentEvent::MessageReceived {
             role: "assistant".into(),
             content: content.into(),
+            steering: false,
         })
     }
 

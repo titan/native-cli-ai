@@ -217,6 +217,7 @@ pub fn spawn_command_consumer_with_store(
                             .send(AgentEvent::MessageReceived {
                                 role: "user".into(),
                                 content,
+                                steering: false,
                             })
                             .await;
                     }

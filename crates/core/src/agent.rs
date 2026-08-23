@@ -1,22 +1,20 @@
 use nca_common::config::SmartCompactionMode;
 use nca_common::event::{AgentEvent, BusyState};
-use nca_common::message::{ContentPart, ImageAttachment, Message, MessageToolCall, Role};
-use nca_common::tool::{ToolCall, ToolDefinition};
-use serde_json::json;
+use nca_common::message::{ContentPart, ImageAttachment, Message, Role};
+use nca_common::tool::ToolDefinition;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
+use crate::agent_driver::InboxItem;
 use crate::approval::ApprovalPolicy;
-use crate::cache_keepalive::{CacheKeepalive, KeepaliveProfile, KeepaliveSnapshot};
-use crate::context_view::plan_context_view;
+use crate::cache_keepalive::KeepaliveProfile;
 use crate::cost::CostTracker;
-use crate::hooks::{HookEventKind, HookRunner};
-use crate::provider::{Provider, ProviderError, StreamChunk};
+use crate::hooks::HookRunner;
+use crate::provider::{Provider, ProviderError};
 use crate::tool_guards::RepeatCallGuard;
-use crate::tool_pipeline;
 use crate::tools::ToolRegistry;
 
 /// Drives the multi-turn conversation and tool-use loop.
@@ -27,20 +25,30 @@ pub struct AgentLoop {
     pub messages: Vec<Message>,
     pub model: String,
     pub cost_tracker: CostTracker,
-    event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
-    max_turns: u32,
-    max_tool_calls_per_turn: u32,
-    checkpoint_interval: u32,
-    cancel_flag: Arc<AtomicBool>,
-    hooks: Option<HookRunner>,
+    pub(crate) event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+    pub(crate) max_turns: u32,
+    pub(crate) max_tool_calls_per_turn: u32,
+    pub(crate) checkpoint_interval: u32,
+    pub(crate) cancel_flag: Arc<AtomicBool>,
+    pub(crate) hooks: Option<HookRunner>,
     /// Opt-in provider-request smart compaction (canonical history always kept).
-    smart_compaction_mode: SmartCompactionMode,
+    pub(crate) smart_compaction_mode: SmartCompactionMode,
     /// Start instant per pending tool call_id, for duration tracking.
-    tool_start_times: HashMap<String, Instant>,
+    pub(crate) tool_start_times: HashMap<String, Instant>,
     /// Prompt-cache keepalive profile (per-provider economics).
-    keepalive_profile: KeepaliveProfile,
+    pub(crate) keepalive_profile: KeepaliveProfile,
     /// Session-scoped repeated-call guard (persists across tool batches/turns).
-    repeat_guard: RepeatCallGuard,
+    pub(crate) repeat_guard: RepeatCallGuard,
+    /// Sender half of the single inbox (bounded 16). Cloned out via
+    /// [`AgentLoop::inbox_sender`] for prompts/steering while a turn runs.
+    inbox_tx: tokio::sync::mpsc::Sender<InboxItem>,
+    /// Receiver half of the inbox; drained at step boundaries by the turn
+    /// driver. Survives across turns (leftovers claimed at next turn start).
+    pub(crate) inbox_rx: tokio::sync::mpsc::Receiver<InboxItem>,
+    /// Monotonic per-agent turn counter (last emitted `turn_id`). Starts at 0
+    /// so the first turn is 1; seeded via [`AgentLoop::set_turn_seq_start`] on
+    /// session resume so ids stay session-unique across restarts.
+    turn_seq: u64,
 }
 
 impl AgentLoop {
@@ -56,6 +64,7 @@ impl AgentLoop {
         checkpoint_interval: u32,
         hooks: Option<HookRunner>,
     ) -> Self {
+        let (inbox_tx, inbox_rx) = tokio::sync::mpsc::channel(16);
         Self {
             provider,
             tools,
@@ -73,7 +82,23 @@ impl AgentLoop {
             tool_start_times: HashMap::new(),
             keepalive_profile: KeepaliveProfile::disabled(),
             repeat_guard: RepeatCallGuard::new(),
+            inbox_tx,
+            inbox_rx,
+            turn_seq: 0,
         }
+    }
+
+    /// Handle for enqueueing prompts/steering into the *running or next*
+    /// turn's inbox. Bounded (16); `try_send` failure means "inbox full" and
+    /// is surfaced by the caller.
+    pub fn inbox_sender(&self) -> tokio::sync::mpsc::Sender<InboxItem> {
+        self.inbox_tx.clone()
+    }
+
+    /// Seed the turn-id counter (session resume: max `TurnStarted.turn_id`
+    /// found in the event log) so ids stay session-unique across restarts.
+    pub fn set_turn_seq_start(&mut self, n: u64) {
+        self.turn_seq = n;
     }
 
     pub fn set_smart_compaction_mode(&mut self, mode: SmartCompactionMode) {
@@ -110,6 +135,20 @@ impl AgentLoop {
     ) -> Result<String, ProviderError> {
         let turn_start = Instant::now();
         self.cancel_flag.store(false, Ordering::SeqCst);
+        // Rollback baseline: on failure the history is truncated back to this
+        // length (NOT pop-counted) because claimed inbox messages can sit
+        // mid-history; popping the tail would strip assistant/tool pairs and
+        // orphan tool_calls. Residual orphans are repaired by
+        // `sanitize_tool_call_pairs` on the next request.
+        let baseline = self.messages.len();
+        self.turn_seq += 1;
+        let turn_id = self.turn_seq;
+        self.emit(AgentEvent::TurnStarted { turn_id }).await;
+
+        // Claim leftover inbox items from a previous turn (arrival order),
+        // BEFORE the new user message.
+        self.claim_inbox().await;
+
         let user_msg = if attachments.is_empty() {
             Message::user(user_input)
         } else {
@@ -137,20 +176,25 @@ impl AgentLoop {
         self.emit(AgentEvent::MessageReceived {
             role: "user".into(),
             content: preview,
+            steering: false,
         })
         .await;
 
-        let result = self.run_turn_inner(workspace_root, attachments).await;
+        let result =
+            crate::agent_driver::TurnDriver::new(self, workspace_root, turn_id, attachments)
+                .run(attachments)
+                .await;
 
-        // On failure, remove the user message we just pushed so the message
-        // history isn't left in a corrupted state (consecutive user messages
-        // with no assistant reply confuses providers and causes repeated
-        // empty responses).
+        // On failure, truncate back to the baseline so the message history
+        // isn't left in a corrupted state (consecutive user messages with no
+        // assistant reply confuses providers and causes repeated empty
+        // responses).
         if result.is_err() {
-            self.messages.pop();
+            self.messages.truncate(baseline);
         }
 
         self.emit(AgentEvent::TurnCompleted {
+            turn_id,
             duration_ms: turn_start.elapsed().as_millis() as u64,
         })
         .await;
@@ -161,425 +205,11 @@ impl AgentLoop {
         result
     }
 
-    /// Inner loop for `run_turn`. Separated so the outer function can handle
-    /// cleanup (message removal, busy-state reset) on all error paths.
-    async fn run_turn_inner(
-        &mut self,
-        workspace_root: &Path,
-        attachments: &[ImageAttachment],
-    ) -> Result<String, ProviderError> {
-        let mut turn = 0_u32;
-        let mut empty_retries = 0_u32;
-        let mut attachments_cleaned = attachments.is_empty();
-        const MAX_EMPTY_RETRIES: u32 = 2;
-        // Consecutive failures of the same tool — stops infinite retry loops.
-        let mut consecutive_tool_failures: u32 = 0;
-        let mut last_failed_tool: String = String::new();
-        // Diagnostic details from the most recent failure (populated by the
-        // `all_failed_same_tool` branch; only read when the max is reached).
-        let mut last_failed_output: String = String::new();
-        let mut last_failed_error: Option<String> = None;
-        const MAX_CONSECUTIVE_TOOL_FAILURES: u32 = 3;
-
-        let final_text = loop {
-            if self.is_cancelled() {
-                self.emit(AgentEvent::Error {
-                    message: "Run cancelled".into(),
-                })
-                .await;
-                return Err(ProviderError::Other("run cancelled".into()));
-            }
-            turn += 1;
-            if turn > self.max_turns {
-                let msg = format!("turn budget exceeded (max {})", self.max_turns);
-                self.emit(AgentEvent::Error {
-                    message: msg.clone(),
-                })
-                .await;
-                return Err(ProviderError::Other(msg));
-            }
-
-            self.emit(AgentEvent::BusyStateChanged {
-                state: BusyState::Thinking,
-            })
-            .await;
-            self.emit(AgentEvent::Checkpoint {
-                phase: "provider_request".into(),
-                detail: format!("Starting model turn {turn}"),
-                turn,
-            })
-            .await;
-            self.provider
-                .prepare_messages_for_request(&mut self.messages, workspace_root)
-                .await?;
-            // Repair any orphaned `tool_calls` left by a previously interrupted
-            // turn (budget/pipeline error) so strict providers like DeepSeek don't
-            // reject the request with "tool_calls must be followed by tool
-            // messages". Persisted to `self.messages` so resumed sessions stay valid.
-            sanitize_tool_call_pairs(&mut self.messages);
-
-            // Smart compaction builds a provider-only view; canonical history stays intact.
-            let request_messages = if self.smart_compaction_mode.is_enabled() {
-                let plan = plan_context_view(&self.messages, self.smart_compaction_mode);
-                let report = &plan.report;
-                if report.tokens_after < report.tokens_before
-                    || matches!(self.smart_compaction_mode, SmartCompactionMode::DryRun)
-                {
-                    let phase = match self.smart_compaction_mode {
-                        SmartCompactionMode::DryRun => "dry_run",
-                        SmartCompactionMode::On => "completed",
-                        SmartCompactionMode::Off => "off",
-                    };
-                    self.emit(AgentEvent::ContextCompaction {
-                        phase: phase.into(),
-                        message: report.summary_line(),
-                        tokens_before: Some(report.tokens_before),
-                        tokens_after: Some(report.tokens_after),
-                        retained_groups: Some(report.retained_groups),
-                        dropped_groups: Some(report.dropped_groups),
-                    })
-                    .await;
-                }
-                match self.smart_compaction_mode {
-                    SmartCompactionMode::On => plan.messages,
-                    SmartCompactionMode::DryRun | SmartCompactionMode::Off => self.messages.clone(),
-                }
-            } else {
-                self.messages.clone()
-            };
-
-            let mut stream = self
-                .provider
-                .chat(
-                    &request_messages,
-                    &self.tool_definitions(),
-                    &self.model,
-                    workspace_root,
-                )
-                .await?;
-
-            let mut assistant_text = String::new();
-            let mut reasoning_text = String::new();
-            let mut tool_calls: Vec<ToolCall> = Vec::new();
-            let mut got_usage = false;
-            let mut finish_reason: Option<String> = None;
-
-            let mut cancel_poll = tokio::time::interval(Duration::from_millis(25));
-            cancel_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                let chunk = tokio::select! {
-                    _ = cancel_poll.tick() => {
-                        if self.is_cancelled() {
-                            self.emit(AgentEvent::Error {
-                                message: "Run cancelled while streaming model output".into(),
-                            })
-                            .await;
-                            return Err(ProviderError::Other("run cancelled".into()));
-                        }
-                        continue;
-                    }
-                    chunk = stream.recv() => chunk,
-                };
-                let Some(chunk) = chunk else {
-                    break;
-                };
-                match chunk {
-                    StreamChunk::TextDelta(delta) => {
-                        if assistant_text.is_empty() {
-                            self.emit(AgentEvent::BusyStateChanged {
-                                state: BusyState::Streaming,
-                            })
-                            .await;
-                        }
-                        assistant_text.push_str(&delta);
-                        self.emit(AgentEvent::TokensStreamed { delta }).await;
-                    }
-                    StreamChunk::ReasoningDelta(delta) => {
-                        reasoning_text.push_str(&delta);
-                        self.emit(AgentEvent::ReasoningStreamed { delta }).await;
-                    }
-                    StreamChunk::ToolUse(call) => {
-                        self.tool_start_times
-                            .insert(call.id.clone(), Instant::now());
-                        self.emit(AgentEvent::ToolCallStarted {
-                            call_id: call.id.clone(),
-                            tool: call.name.clone(),
-                            input: call.input.clone(),
-                        })
-                        .await;
-                        tool_calls.push(call);
-                    }
-                    StreamChunk::Usage {
-                        input_tokens,
-                        output_tokens,
-                        cache_creation_tokens,
-                        cache_read_tokens,
-                    } => {
-                        got_usage = true;
-                        self.cost_tracker.add(
-                            input_tokens,
-                            output_tokens,
-                            cache_creation_tokens,
-                            cache_read_tokens,
-                        );
-                        self.emit(AgentEvent::CostUpdated {
-                            input_tokens: self.cost_tracker.input_tokens,
-                            output_tokens: self.cost_tracker.output_tokens,
-                            cache_read_tokens: self.cost_tracker.cache_read_tokens,
-                            estimated_cost_usd: self.cost_tracker.estimated_cost_usd(),
-                        })
-                        .await;
-                    }
-                    StreamChunk::Error(err) => {
-                        self.emit(AgentEvent::Error {
-                            message: err.to_string(),
-                        })
-                        .await;
-                        return Err(err);
-                    }
-                    StreamChunk::Finish { reason } => {
-                        finish_reason = Some(reason);
-                    }
-                    StreamChunk::Done => break,
-                }
-            }
-
-            if !attachments_cleaned {
-                cleanup_processed_attachments(&mut self.messages, workspace_root, attachments);
-                attachments_cleaned = true;
-            }
-
-            if tool_calls.is_empty() {
-                if assistant_text.trim().is_empty() {
-                    // Thinking-locked models (e.g. ZhipuAI GLM-5.3, whose thinking
-                    // cannot be disabled) can spend the entire max_tokens budget on
-                    // reasoning_content and finish with finish_reason="length" and
-                    // an empty content. Retrying with identical parameters almost
-                    // always reproduces the same truncation while re-billing the
-                    // full prompt — fail fast with an actionable message instead.
-                    if finish_reason.as_deref() == Some("length") {
-                        let msg = format!(
-                            "Provider returned empty response: generation hit the max_tokens cap \
-                             while thinking (finish_reason=length, {} chars of reasoning produced, \
-                             no content). Raise [model] max_tokens — GLM-5.x thinking models cannot \
-                             disable thinking and ZhipuAI coding examples use 65536 — or lower the \
-                             reasoning effort.",
-                            reasoning_text.chars().count()
-                        );
-                        self.emit(AgentEvent::Error {
-                            message: msg.clone(),
-                        })
-                        .await;
-                        return Err(ProviderError::Other(msg));
-                    }
-                    empty_retries += 1;
-                    if empty_retries <= MAX_EMPTY_RETRIES && got_usage {
-                        self.emit(AgentEvent::Error {
-                            message: format!(
-                                "Provider returned empty response (retry {empty_retries}/{MAX_EMPTY_RETRIES})"
-                            ),
-                        })
-                        .await;
-                        continue;
-                    }
-                    let diag = format!(
-                        "Provider returned empty response with no tool calls ({} chars of \
-                         reasoning produced, finish_reason={})",
-                        reasoning_text.chars().count(),
-                        finish_reason.as_deref().unwrap_or("unknown"),
-                    );
-                    self.emit(AgentEvent::Error {
-                        message: diag.clone(),
-                    })
-                    .await;
-                    return Err(ProviderError::Other(format!("{diag} after retries",)));
-                }
-                let mut msg = Message::assistant(assistant_text.clone());
-                if !reasoning_text.is_empty() {
-                    msg = msg.with_reasoning(std::mem::take(&mut reasoning_text));
-                }
-                self.messages.push(msg);
-                self.emit(AgentEvent::MessageReceived {
-                    role: "assistant".into(),
-                    content: assistant_text.clone(),
-                })
-                .await;
-                break assistant_text;
-            }
-
-            let replay_tool_calls = tool_calls
-                .iter()
-                .map(|call| MessageToolCall {
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    arguments: call.input.clone(),
-                })
-                .collect();
-
-            let mut msg = Message::assistant_with_tool_calls(assistant_text, replay_tool_calls);
-            if !reasoning_text.is_empty() {
-                msg = msg.with_reasoning(std::mem::take(&mut reasoning_text));
-            }
-            self.messages.push(msg);
-
-            if tool_calls.len() as u32 > self.max_tool_calls_per_turn {
-                return Err(ProviderError::Other(format!(
-                    "tool-call budget exceeded in turn {turn} ({} > {})",
-                    tool_calls.len(),
-                    self.max_tool_calls_per_turn
-                )));
-            }
-
-            // ── Tool pipeline: permission checks + concurrent execution ──
-            // Start cache keepalive for the tool-execution pause.
-            // self.messages now ends with the assistant's tool_calls — the
-            // exact prefix the next request will re-send. Keeping it warm
-            // avoids a full-price re-prefill when the pause exceeds the
-            // provider's cache TTL (~10 min for DeepSeek).
-            let snapshot = KeepaliveSnapshot {
-                messages: self.messages.clone(),
-                tools: self.tool_definitions(),
-                model: self.model.clone(),
-                workspace_root: workspace_root.to_path_buf(),
-            };
-            let keepalive = CacheKeepalive::start(
-                Arc::clone(&self.provider),
-                snapshot,
-                self.keepalive_profile.clone(),
-                self.event_tx.clone(),
-            );
-
-            let pipeline = tool_pipeline::run_tool_pipeline(
-                &self.tools,
-                &mut self.approval,
-                &self.hooks,
-                &self.event_tx,
-                &self.cancel_flag,
-                tool_calls.clone(),
-                &mut self.repeat_guard,
-            )
-            .await
-            .map_err(ProviderError::Other)?;
-
-            // Cancel keepalive — the pause is over, next request is imminent.
-            keepalive.stop().await;
-
-            let n = pipeline.results.len();
-
-            // Checkpoint
-            if self.checkpoint_interval > 0 && n as u32 >= self.checkpoint_interval {
-                self.emit(AgentEvent::Checkpoint {
-                    phase: "tool_execution".into(),
-                    detail: format!("Executed {n} tool calls in turn {turn}"),
-                    turn,
-                })
-                .await;
-            }
-
-            // Track consecutive failures of the same tool to detect infinite retry loops.
-            let all_failed_same_tool = !pipeline.results.is_empty()
-                && pipeline.results.iter().all(|r| !r.success)
-                && tool_calls.len() == 1;
-            if all_failed_same_tool {
-                let tool_name = &tool_calls[0].name;
-                let last_result = &pipeline.results[0];
-                if *tool_name == last_failed_tool {
-                    consecutive_tool_failures += 1;
-                } else {
-                    last_failed_tool = tool_name.clone();
-                    consecutive_tool_failures = 1;
-                }
-                // Capture failure details for diagnostics and the final error message.
-                last_failed_output = last_result.output.clone();
-                last_failed_error = last_result.error.clone();
-                tracing::warn!(
-                    tool = %tool_name,
-                    attempt = consecutive_tool_failures,
-                    max_attempts = MAX_CONSECUTIVE_TOOL_FAILURES,
-                    output = %truncate_str(&last_result.output, 500),
-                    error = ?last_result.error,
-                    "consecutive tool failure detected"
-                );
-            } else {
-                consecutive_tool_failures = 0;
-                last_failed_tool.clear();
-            }
-
-            for result in pipeline.results {
-                let duration_ms = self
-                    .tool_start_times
-                    .remove(&result.call_id)
-                    .map(|t| t.elapsed().as_millis() as u64)
-                    .unwrap_or(0);
-                self.messages.push(Message::tool(
-                    result.call_id.clone(),
-                    format_tool_result(&result),
-                ));
-                self.emit(AgentEvent::ToolCallCompleted {
-                    call_id: result.call_id.clone(),
-                    output: result,
-                    duration_ms,
-                })
-                .await;
-            }
-
-            if consecutive_tool_failures >= MAX_CONSECUTIVE_TOOL_FAILURES {
-                let detail = last_failed_error
-                    .as_deref()
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| truncate_str(&last_failed_output, 300));
-                let msg = format!(
-                    "Tool `{}` failed {} times consecutively — stopping to avoid infinite loop.\n\nLast failure detail:\n{}",
-                    last_failed_tool, consecutive_tool_failures, detail
-                );
-                self.emit(AgentEvent::Error {
-                    message: msg.clone(),
-                })
-                .await;
-                break msg;
-            }
-        };
-
-        if self.cost_tracker.input_tokens == 0 && self.cost_tracker.output_tokens == 0 {
-            let estimated_input = (self
-                .messages
-                .iter()
-                .map(|message| message.content.approx_chars())
-                .sum::<usize>()
-                / 4) as u64;
-            let estimated_output = (final_text.len() / 4) as u64;
-            self.cost_tracker
-                .add(estimated_input, estimated_output, 0, 0);
-            self.emit(AgentEvent::CostUpdated {
-                input_tokens: self.cost_tracker.input_tokens,
-                output_tokens: self.cost_tracker.output_tokens,
-                cache_read_tokens: self.cost_tracker.cache_read_tokens,
-                estimated_cost_usd: self.cost_tracker.estimated_cost_usd(),
-            })
-            .await;
-        }
-
-        if let Some(hooks) = &self.hooks {
-            let response_preview = truncate_str(&final_text, 300);
-            hooks
-                .run_best_effort(
-                    HookEventKind::TurnComplete,
-                    None,
-                    &json!({
-                        "response_preview": response_preview,
-                    }),
-                )
-                .await;
-        }
-
-        Ok(final_text)
-    }
-
-    fn tool_definitions(&self) -> Vec<ToolDefinition> {
+    pub(crate) fn tool_definitions(&self) -> Vec<ToolDefinition> {
         self.tools.definitions()
     }
 
-    async fn emit(&self, event: AgentEvent) {
+    pub(crate) async fn emit(&self, event: AgentEvent) {
         let _ = self.event_tx.send(event).await;
     }
 
@@ -595,7 +225,7 @@ impl AgentLoop {
         self.cancel_flag.clone()
     }
 
-    fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_cancelled(&self) -> bool {
         self.cancel_flag.load(Ordering::SeqCst)
     }
 }
@@ -613,7 +243,7 @@ impl AgentLoop {
 /// This repairs the history in-place by injecting a synthetic error tool
 /// message for every missing `tool_call_id`. The repair is persisted to
 /// `self.messages`, so resumed sessions stay valid.
-fn sanitize_tool_call_pairs(messages: &mut Vec<Message>) {
+pub(crate) fn sanitize_tool_call_pairs(messages: &mut Vec<Message>) {
     const SYNTHETIC_RESULT: &str = "[tool execution interrupted — a budget or \
         pipeline limit was reached before this call ran; synthetic result \
         inserted to keep the message history valid for the provider]";
@@ -660,7 +290,7 @@ fn sanitize_tool_call_pairs(messages: &mut Vec<Message>) {
 }
 
 /// Truncate a string to `max_chars` characters, appending "…" if truncated.
-fn truncate_str(s: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_str(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         s.to_string()
     } else {
@@ -721,7 +351,7 @@ fn truncate_tool_output(output: &str) -> String {
     )
 }
 
-fn cleanup_processed_attachments(
+pub(crate) fn cleanup_processed_attachments(
     messages: &mut [Message],
     workspace_root: &Path,
     attachments: &[ImageAttachment],
@@ -752,7 +382,7 @@ fn cleanup_processed_attachments(
     }
 }
 
-fn format_tool_result(result: &nca_common::tool::ToolResult) -> String {
+pub(crate) fn format_tool_result(result: &nca_common::tool::ToolResult) -> String {
     let raw = if result.success {
         result.output.clone()
     } else {
@@ -771,7 +401,9 @@ mod tests {
     use crate::provider::{Provider, ProviderError, StreamChunk};
     use crate::tools::ToolRegistry;
     use nca_common::config::PermissionConfig;
+    use nca_common::message::MessageToolCall;
     use nca_common::tool::ToolDefinition;
+    use serde_json::json;
     use std::sync::atomic::AtomicU32;
 
     /// Scripted provider: each `chat()` call replays the next round of chunks,

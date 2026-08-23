@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod agent_driver;
 pub mod approval;
 pub mod cache_keepalive;
 pub mod code_intel;

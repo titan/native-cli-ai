@@ -69,6 +69,49 @@ pub enum AgentEvent {
     MessageReceived {
         role: String,
         content: String,
+        /// `true` when this message is mid-turn steering guidance claimed
+        /// from the inbox (as opposed to the turn's initial user prompt).
+        #[serde(default)]
+        steering: bool,
+    },
+    /// A turn started: emitted at the beginning of `run_turn`. `turn_id` is
+    /// monotonic per agent (1-based) and stays session-unique across resume.
+    TurnStarted {
+        #[serde(default)]
+        turn_id: u64,
+    },
+    /// One agent step started (a single provider call plus its tool
+    /// pipeline). `step_index` is 1-based within the turn.
+    StepStarted {
+        #[serde(default)]
+        turn_id: u64,
+        #[serde(default)]
+        step_index: u64,
+    },
+    /// One agent step finished successfully. `had_tool_calls` is true when
+    /// the step executed at least one tool call (i.e. the turn continues).
+    StepCompleted {
+        #[serde(default)]
+        turn_id: u64,
+        #[serde(default)]
+        step_index: u64,
+        #[serde(default)]
+        duration_ms: u64,
+        #[serde(default)]
+        had_tool_calls: bool,
+    },
+    /// One agent step errored (stream error, budget exceeded, pipeline
+    /// failure, empty response after retries). Closes the `StepStarted`
+    /// bracket so replay layers never see a dangling step.
+    StepFailed {
+        #[serde(default)]
+        turn_id: u64,
+        #[serde(default)]
+        step_index: u64,
+        #[serde(default)]
+        duration_ms: u64,
+        #[serde(default)]
+        error: String,
     },
     TokensStreamed {
         delta: String,
@@ -224,6 +267,9 @@ pub enum AgentEvent {
     /// A full turn completed — emitted once at the end of `run_turn` with the
     /// total wall-clock duration (user input → final reply) in milliseconds.
     TurnCompleted {
+        /// Monotonic turn identifier matching the turn's `TurnStarted` event.
+        #[serde(default)]
+        turn_id: u64,
         #[serde(default)]
         duration_ms: u64,
     },

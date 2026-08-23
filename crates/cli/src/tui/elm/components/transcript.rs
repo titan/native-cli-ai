@@ -245,7 +245,7 @@ impl TranscriptState {
                 // force an O(transcript) line-height rebuild for nothing.
                 return TranscriptAction::None;
             }
-            AgentEvent::MessageReceived { role, content } => {
+            AgentEvent::MessageReceived { role, content, .. } => {
                 if role == "user" {
                     self.streaming_assistant = None;
                     self.blocks.push(DisplayBlock::User(content.clone()));
@@ -517,7 +517,7 @@ impl TranscriptState {
                 self.blocks_pushed();
                 self.child_activity_blocks.remove(child_session_id);
             }
-            AgentEvent::TurnCompleted { duration_ms } => {
+            AgentEvent::TurnCompleted { duration_ms, .. } => {
                 self.blocks.push(DisplayBlock::TurnInfo {
                     duration_ms: *duration_ms,
                 });
@@ -1169,6 +1169,7 @@ mod tests {
             t.apply_event(&AgentEvent::MessageReceived {
                 role: "assistant".into(),
                 content: format!("message number {i} with some text"),
+                steering: false,
             });
         }
         let area = Rect::new(0, 1, 80, 12); // content viewport: 78 wide, 10 tall
@@ -1191,6 +1192,7 @@ mod tests {
         t.apply_event(&AgentEvent::MessageReceived {
             role: "assistant".into(),
             content: "a brand new message".into(),
+            steering: false,
         });
 
         let _ = t.render(area);
@@ -1209,6 +1211,7 @@ mod tests {
             t.apply_event(&AgentEvent::MessageReceived {
                 role: "assistant".into(),
                 content: format!("message number {i} with some text"),
+                steering: false,
             });
         }
         let area = Rect::new(0, 1, 80, 12);
@@ -1221,6 +1224,7 @@ mod tests {
         t.apply_event(&AgentEvent::MessageReceived {
             role: "assistant".into(),
             content: "another new message".into(),
+            steering: false,
         });
         let before = t.scroll_lines;
         let _ = t.render(area);
@@ -1240,6 +1244,7 @@ mod tests {
             t.apply_event(&AgentEvent::MessageReceived {
                 role: "assistant".into(),
                 content: format!("message number {i} with some text"),
+                steering: false,
             });
         }
         let area = Rect::new(0, 1, 80, 12);
@@ -1286,6 +1291,7 @@ mod tests {
         t.apply_event(&AgentEvent::MessageReceived {
             role: "assistant".into(),
             content: "hello world".into(),
+            steering: false,
         });
         let gen_after_commit = t.blocks_generation;
         assert!(
@@ -1326,6 +1332,7 @@ mod tests {
         t.apply_event(&AgentEvent::MessageReceived {
             role: "user".into(),
             content: "next turn".into(),
+            steering: false,
         });
         assert_eq!(
             t.blocks_generation,
@@ -1365,6 +1372,7 @@ mod tests {
         t.apply_event(&AgentEvent::MessageReceived {
             role: "assistant".into(),
             content: "hello world".into(),
+            steering: false,
         });
         let total_first = t.total_line_count(78);
         let rebuilt = t.line_cache.rebuild_count;
@@ -1377,6 +1385,7 @@ mod tests {
             t.apply_event(&AgentEvent::MessageReceived {
                 role: "assistant".into(),
                 content: format!("follow-up message {i}"),
+                steering: false,
             });
         }
         let total_after = t.total_line_count(78);
@@ -1397,11 +1406,13 @@ mod tests {
         fresh.apply_event(&AgentEvent::MessageReceived {
             role: "assistant".into(),
             content: "hello world".into(),
+            steering: false,
         });
         for i in 0..5 {
             fresh.apply_event(&AgentEvent::MessageReceived {
                 role: "assistant".into(),
                 content: format!("follow-up message {i}"),
+                steering: false,
             });
         }
         assert_eq!(
@@ -1464,6 +1475,7 @@ mod tests {
         t.apply_event(&AgentEvent::MessageReceived {
             role: "assistant".into(),
             content: "hello world".into(),
+            steering: false,
         });
         t.total_line_count(78);
         let rebuilt = t.line_cache.rebuild_count;
@@ -1582,6 +1594,7 @@ mod tests {
         t.apply_event(&AgentEvent::MessageReceived {
             role: "assistant".into(),
             content: "seed".into(),
+            steering: false,
         });
         spawn_child(&mut t, "child-a-0001");
         t.total_line_count(78);

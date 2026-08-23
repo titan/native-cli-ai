@@ -587,7 +587,7 @@ fn render_event(event: &AgentEvent, stats: &StreamStats) {
                 status.color(theme::TEXT_DIM)
             );
         }
-        AgentEvent::MessageReceived { role, content } => {
+        AgentEvent::MessageReceived { role, content, .. } => {
             println!();
             let header = match role.as_str() {
                 "user" => format!(" {} ", "YOU".to_uppercase())
@@ -615,7 +615,7 @@ fn render_event(event: &AgentEvent, stats: &StreamStats) {
                 }
             }
         }
-        AgentEvent::TurnCompleted { duration_ms } => {
+        AgentEvent::TurnCompleted { duration_ms, .. } => {
             let dur = format_duration(*duration_ms);
             println!(
                 "  {}",

@@ -195,12 +195,11 @@ fn turn_step_seq(events: &[AgentEvent]) -> Vec<TurnStepEvent> {
     events
         .iter()
         .filter_map(|e| match e {
-            AgentEvent::TurnStarted { turn_id } => {
-                Some(TurnStepEvent::TurnStarted(*turn_id))
-            }
-            AgentEvent::StepStarted { turn_id, step_index } => {
-                Some(TurnStepEvent::StepStarted(*turn_id, *step_index))
-            }
+            AgentEvent::TurnStarted { turn_id } => Some(TurnStepEvent::TurnStarted(*turn_id)),
+            AgentEvent::StepStarted {
+                turn_id,
+                step_index,
+            } => Some(TurnStepEvent::StepStarted(*turn_id, *step_index)),
             AgentEvent::StepCompleted {
                 turn_id,
                 step_index,
@@ -494,7 +493,11 @@ async fn leftover_claimed_next_turn() {
         .await
         .expect("turn 1");
     assert_eq!(result, "done");
-    assert_eq!(provider.call_count(), 2, "turn 1 must not extend for the late item");
+    assert_eq!(
+        provider.call_count(),
+        2,
+        "turn 1 must not extend for the late item"
+    );
 
     // The late item must NOT appear in turn 1's chat calls.
     let recorded = provider.recorded();
@@ -527,9 +530,13 @@ async fn leftover_claimed_next_turn() {
     let recorded = provider.recorded();
     assert_eq!(recorded.len(), 3);
     let call3_users = user_texts(&recorded[2]);
+    // Turn-1 history ("start") is retained by design; the contract is that
+    // the leftover is claimed at the START of the next turn, i.e. appended
+    // before that turn's new user message.
+    let tail = call3_users.split_at(call3_users.len().saturating_sub(2)).1;
     assert_eq!(
-        call3_users,
-        vec!["queued-late".to_string(), "again".to_string()],
+        tail,
+        ["queued-late".to_string(), "again".to_string()],
         "leftover must be claimed at the START of the next turn, before its new user message"
     );
 }
