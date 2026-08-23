@@ -145,6 +145,10 @@ serde 全部 `#[serde(default)]`，旧事件日志可继续重放。
 
 ## P3 — 压缩事件化 + 溢出恢复（dsh compaction recovery）
 
+> **状态：已实现（2026-08-24）。** 设计 + oracle 评审 + 实现记录见
+> `docs/plans/p3-compaction-design.md`。三项目标设计均落地，含三项获批偏离
+> （无 plan/apply 拆分、无 Aggressive 模式、supervisor 逻辑不下放改为两臂恢复）。
+
 ### 问题
 
 nca 压缩是 provider-request 前的一次性 plan（`plan_context_view`），不落事件日志，

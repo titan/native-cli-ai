@@ -3,8 +3,8 @@
 > Implements `deepseek-harness-adoption.md` §P3. Prerequisites merged: P1
 > (step boundary in `agent_driver.rs`), P2 (event-sourced sessions,
 > replay-authoritative resume), P4 (middleware chain — this design mounts
-> its first real consumer). Status: **reviewed 2026-08-24 — no P0s;
-> findings applied (§Oracle review record)**.
+> its first real consumer). Status: **implemented 2026-08-24** — module +
+> wiring + tests C1–C11 green; implementation record at the bottom.
 
 ## Problem
 
@@ -488,3 +488,50 @@ compressed):
 Also noted by oracle, no doc change required: `partition_groups` /
 `is_compactible_tool` / `group_must_keep` are private — fine as is since
 `prune_tool_results` lives in the same module (clarified in §3).
+
+## Implementation record (2026-08-24)
+
+Commits (in order):
+
+```
+3f4c7c8 docs(plans): P3 design + oracle review record
+94a580f feat(core): compaction event bracket + overflow recovery (P3)   # fixer lane
+9ec36b2 test(core): P3 overflow recovery integration matrix C6-C8      # tester lane
+875b13a fix(runtime): wire OverflowRecoveryMiddleware at supervisor
+        construction (P3 §6)                                            # merge review
+<this>   docs(architecture): P3 compaction + recovery sync; mark implemented
+```
+
+- **Lanes:** fixer (impl + C1–C5/C9–C11 unit), tester (integration
+  C6/C6b/C7 + C11 strengthening + C9 gap fill — lane hit the 600s timeout
+  AFTER committing; orchestrator validated the commit directly and
+  merged), wiring fix by orchestrator.
+- **Wiring miss caught at merge review (lesson):** the fixer lane's report
+  claimed the supervisor wiring (§6) but its diff did not contain it —
+  C6 masked the gap because integration tests push the middleware
+  manually onto their own `AgentLoop`. Merge review caught it via a
+  `grep OverflowRecoveryMiddleware crates/runtime` (zero hits). Fix:
+  `875b13a`. Future wiring-pinned features: grep the production wiring
+  site as an explicit merge-review step, or add a supervisor-level
+  construction test.
+- **Accepted deviations (beyond the §Deviation trio):**
+  1. No-progress escalation DOES emit the bracket pair (End
+     `kv_prefix_broken=false`) — matches §4 pseudocode as written; C5a
+     pins it.
+  2. `perform_auto_summarize(reason)` threads the reason for diagnostics
+     only (`End` carries no reason field, per §1).
+  3. C2's fixture omits injected orphans (logically incompatible with
+     `orphaned_tool_results == 0`); orphan protection is covered by
+     `partition_groups`' existing must_keep tests.
+- C6b pinned the design-intended count: no-progress escalation makes
+  exactly **1** provider call (prune runs offline, never re-calls).
+- Validation at merge: `cargo fmt --all -- --check` ✅, `cargo clippy
+  --workspace -- -D warnings` ✅, `cargo test --workspace` **513 passed /
+  0 failed** (was 488 at P4; +25: unit C1–C5/C8–C11, integration
+  C6/C6b/C7, C9, C10).
+- Environment notes for the next session: `/dev/shm` quota (os error 122)
+  hit twice during full-workspace gates. Remedies that worked: `rm -rf
+  /dev/shm/debug/incremental` AND purging stale `nca-*` artifacts from
+  `/dev/shm/debug/deps` (worktree builds accumulate multiple hashes;
+  525 files / ~1.3G recovered). Full-workspace test with
+  `CARGO_INCREMENTAL=0` after cleanup.
