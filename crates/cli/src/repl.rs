@@ -867,7 +867,6 @@ impl Repl {
                     .append_memory_note("session-summary", Some(summary.clone()))
                     .await
                     .map_err(anyhow::Error::msg)?;
-                self.runtime.save().await.map_err(anyhow::Error::msg)?;
                 out.println(&format!("saved session summary:\n{}", summary));
             }
             "/models" => {
@@ -1343,7 +1342,6 @@ impl Repl {
                     .append_memory_note("session-summary", Some(summary))
                     .await
                     .map_err(anyhow::Error::msg)?;
-                self.runtime.save().await.map_err(anyhow::Error::msg)?;
                 self.runtime.new_session().await.map_err(anyhow::Error::msg)?;
                 let new_id = self.runtime.session_id().to_string();
                 if let ReplOutput::Tui(st) = &out {

@@ -309,6 +309,28 @@ fn seed_cost_tracker_from_log(agent: &mut AgentLoop, envelopes: &[EventEnvelope]
     }
 }
 
+/// Fold lineage at resume (`docs/plans/p2-phase-c-design.md` §3): union the
+/// child session ids persisted in the json snapshot (order first) with every
+/// `ChildSessionSpawned` id found in the event log (appended), deduplicated.
+/// The log-derived ids recover lineage for crashed parents whose json was
+/// never re-written after a spawn.
+pub(crate) fn fold_child_session_ids(
+    meta_ids: &[String],
+    envelopes: &[EventEnvelope],
+) -> Vec<String> {
+    let mut folded = meta_ids.to_vec();
+    for envelope in envelopes {
+        if let AgentEvent::ChildSessionSpawned {
+            child_session_id, ..
+        } = &envelope.event
+            && !folded.contains(child_session_id)
+        {
+            folded.push(child_session_id.clone());
+        }
+    }
+    folded
+}
+
 /// Persist an approved allow pattern to the workspace config file.
 fn persist_allow_pattern(workspace_root: &Path, pattern: String) {
     let root = workspace_root.to_path_buf();
@@ -773,6 +795,11 @@ impl Supervisor {
         if max_turn > 0 {
             sup.agent.set_turn_seq_start(max_turn);
         }
+
+        // Fold lineage from ChildSessionSpawned envelopes (P2 Phase C §3) so
+        // the union of json + log ids persists with the resume save below —
+        // recovering children of a parent that crashed before a finish() save.
+        sup.child_session_ids = fold_child_session_ids(&sup.child_session_ids, &envelopes);
 
         // Re-save immediately after restore: closes the create()-saves-empty-
         // state window so a crash right after resume no longer wipes the json.
@@ -1725,6 +1752,59 @@ pub(crate) fn register_skill_agents(config: &mut NcaConfig, workspace_root: &Pat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn spawned_envelope(id: u64, child: &str) -> EventEnvelope {
+        EventEnvelope::new(
+            id,
+            AgentEvent::ChildSessionSpawned {
+                parent_session_id: "parent".into(),
+                child_session_id: child.into(),
+                task: "t".into(),
+                workspace: PathBuf::from("/ws"),
+                branch: None,
+            },
+        )
+    }
+
+    #[test]
+    fn fold_child_session_ids_unions_deduped_and_ordered() {
+        let meta = vec!["a".to_string(), "b".to_string()];
+        let envelopes = vec![
+            spawned_envelope(1, "b"), // duplicate of json — deduped
+            spawned_envelope(2, "c"), // log-only — appended
+            spawned_envelope(3, "a"), // duplicate — deduped
+        ];
+        let folded = fold_child_session_ids(&meta, &envelopes);
+        assert_eq!(
+            folded,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+    }
+
+    #[test]
+    fn fold_child_session_ids_empty_cases() {
+        assert!(fold_child_session_ids(&[], &[]).is_empty());
+        assert_eq!(
+            fold_child_session_ids(&[], &[spawned_envelope(1, "x")]),
+            vec!["x".to_string()]
+        );
+        assert_eq!(
+            fold_child_session_ids(&["y".to_string()], &[]),
+            vec!["y".to_string()]
+        );
+    }
+
+    #[test]
+    fn fold_child_session_ids_ignores_other_events() {
+        let envelopes = vec![EventEnvelope::new(
+            1,
+            AgentEvent::TurnStarted { turn_id: 1 },
+        )];
+        assert_eq!(
+            fold_child_session_ids(&["z".to_string()], &envelopes),
+            vec!["z".to_string()]
+        );
+    }
 
     #[test]
     fn select_resume_messages_replaces_stale_system_prompts_with_fresh() {

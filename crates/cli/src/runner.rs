@@ -99,10 +99,6 @@ impl SessionRuntime {
         self.supervisor.finish(reason).await;
     }
 
-    pub async fn save(&self) -> Result<(), String> {
-        self.supervisor.save().await
-    }
-
     pub fn take_ipc_handle(&mut self) -> Option<IpcHandle> {
         self.handle.as_mut()?.take_ipc_handle()
     }
@@ -308,20 +304,21 @@ impl SessionRuntime {
         self.supervisor.memory_store_path()
     }
 
-    /// Start a fresh session: save the current one, generate a new ID, clear messages.
+    /// Start a fresh session: finish the current one (which persists the
+    /// json — the single-writer discipline keeps saves at
+    /// create/resume/finish only), generate a new ID, clear messages.
     pub async fn new_session(&mut self) -> Result<(), String> {
         self.supervisor.finish(EndReason::Completed).await;
-        self.supervisor.save().await?;
         self.supervisor.reset_for_new_session();
         Ok(())
     }
 
     /// Switch to a different existing session in-place (no process restart).
-    /// Saves the current session, then resumes the target session, rebuilding
+    /// Finishes the current session (which persists the json), then resumes
+    /// the target session, rebuilding
     /// handle and question-pending channels so the caller can rewire its event loop.
     pub async fn switch_to(&mut self, session_id: &str) -> Result<(), String> {
         self.supervisor.finish(EndReason::Completed).await;
-        self.supervisor.save().await?;
 
         let mut supervisor = Supervisor::resume(
             self.config.clone(),

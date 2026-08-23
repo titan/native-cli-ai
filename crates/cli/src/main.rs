@@ -941,6 +941,10 @@ async fn run_one_shot(
             runtime.take_turn_commit_tx().map(|(tx, _flag)| tx),
         );
 
+        // Wire the parent's own event channel into the spawn consumer so
+        // ChildSessionSpawned/Completed reach the parent's event log in
+        // one-shot mode too (P2 Phase C §3 — mirrors repl/service wiring).
+        let event_tx = runtime.event_tx();
         let spawn_task = runtime.take_spawn_rx().map(|spawn_rx| {
             nca_runtime::supervisor::spawn_subagent_consumer(
                 spawn_rx,
@@ -948,7 +952,7 @@ async fn run_one_shot(
                 runtime.workspace_root().to_path_buf(),
                 config.clone(),
                 runtime.messages().to_vec(),
-                None,
+                event_tx,
                 runtime.fs(),
             )
         });

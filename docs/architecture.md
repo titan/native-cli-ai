@@ -357,6 +357,17 @@ projections; corrupt json is rescued by the replay. Durability:
 returning — "model-visible means logged". Divergence between the two truths
 is warned, never silently trusted.
 
+Session json is written under a **single-writer discipline** (P2 Phase C,
+`docs/plans/p2-phase-c-design.md`): `<id>.json` is written only by the owning
+`Supervisor`, at `create()` (bootstrap), `resume()` (restore-close window),
+and `finish()` (clean shutdown). Everything model-visible mid-session lives
+exclusively in the event log — json display meta (title, status, cost) may go
+stale for crashed sessions; resume correctness is unaffected. Session lineage
+(`child_session_ids`) is recorded via `ChildSessionSpawned` events on the
+parent's event channel and folded back into the json (union with existing ids,
+deduped) at `resume()`, replacing the old second-writer append from the
+subagent spawn consumer.
+
 ### Lifecycle
 
 ```mermaid

@@ -1,4 +1,3 @@
-use crate::session_store::SessionStore;
 use crate::session_utils::spawn_event_fanout;
 use crate::supervisor::{AutoDenyHandler, Supervisor, SupervisorConfig};
 use nca_common::config::{NcaConfig, ProviderKind};
@@ -75,19 +74,6 @@ pub(crate) fn build_parent_summary(messages: &[nca_common::message::Message]) ->
     }
 
     summary
-}
-
-/// Append a child session ID to the parent session's metadata on disk.
-async fn append_child_to_parent(store: &SessionStore, parent_id: &str, child_id: &str) {
-    if let Ok(mut parent) = store.load(parent_id).await
-        && !parent
-            .meta
-            .child_session_ids
-            .contains(&child_id.to_string())
-    {
-        parent.meta.child_session_ids.push(child_id.to_string());
-        let _ = store.save(&parent).await;
-    }
 }
 
 /// Spawn a child session that inherits parent context and runs to completion.
@@ -290,7 +276,6 @@ pub fn spawn_subagent_consumer(
     parent_fs: Arc<dyn WorkspaceFs>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let parent_sessions_dir = workspace_root.join(&config.session.history_dir);
         let parent_summary = build_parent_summary(&parent_messages);
 
         while let Some(req) = spawn_rx.recv().await {
@@ -306,7 +291,6 @@ pub fn spawn_subagent_consumer(
                 config.extra_paths = live_mounts;
             }
             let event_tx = event_tx.clone();
-            let parent_store = SessionStore::new(parent_sessions_dir.clone());
             let parent_summary = parent_summary.clone();
 
             let child_cfg = ChildSessionConfig {
@@ -343,13 +327,9 @@ pub fn spawn_subagent_consumer(
                 let result = spawn_child_session(child_cfg, event_tx.clone()).await;
                 match result {
                     Ok(res) => {
-                        append_child_to_parent(
-                            &parent_store,
-                            &parent_session_id,
-                            &res.child_session_id,
-                        )
-                        .await;
-
+                        // Lineage is recorded via ChildSessionSpawned on the
+                        // parent's event channel (folded into meta at resume —
+                        // P2 Phase C §3); no direct parent-json write here.
                         if let Some(ref tx) = event_tx {
                             let _ = tx
                                 .send(AgentEvent::ChildSessionCompleted {
