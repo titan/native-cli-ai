@@ -1587,6 +1587,7 @@ impl Repl {
         let busy_flag = tui_feedback.busy_flag_handle();
         let inbox_tx = self.runtime.inbox_sender();
 
+        let commit_tx = self.runtime.take_turn_commit_tx().map(|(tx, _flag)| tx);
         let _bridge = spawn_tui_bridge(
             rx,
             log_path,
@@ -1594,6 +1595,7 @@ impl Repl {
             approval.clone(),
             question.clone(),
             feedback_tx.clone(),
+            commit_tx,
         );
 
         let _spawn_task = {

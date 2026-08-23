@@ -6,6 +6,7 @@ use crate::format::format_duration;
 use crate::ipc_pending::{ApprovalPendingMap, QuestionPendingMap};
 use colored::Colorize;
 use nca_common::event::{AgentEvent, EventEnvelope, InteractiveQuestionPayload, QuestionSelection};
+use nca_runtime::event_log::EventLogWriter;
 use nca_runtime::ipc::IpcHandle;
 use nca_runtime::supervisor;
 use std::io::{self, IsTerminal, Write};
@@ -149,6 +150,7 @@ struct IpcRebroadcast {
 }
 
 /// Spawns the stream task: event fanout (disk + IPC + rendering) and command consumer.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_stream_task(
     rx: tokio::sync::mpsc::Receiver<AgentEvent>,
     mode: StreamMode,
@@ -157,6 +159,7 @@ pub fn spawn_stream_task(
     approval_pending: Option<ApprovalPendingMap>,
     question_pending: Option<QuestionPendingMap>,
     cancel_tx: Option<oneshot::Sender<()>>,
+    commit_tx: Option<tokio::sync::watch::Sender<u64>>,
 ) -> tokio::task::JoinHandle<()> {
     let qp = question_pending.clone();
     let (event_tx_ipc, command_rx) = match ipc_handle {
@@ -171,7 +174,7 @@ pub fn spawn_stream_task(
         supervisor::spawn_command_consumer(crx, approval_pending, question_pending, cancel_tx);
     }
 
-    spawn_event_fanout_task(rx, mode, log_path, event_tx_ipc, qp)
+    spawn_event_fanout_task(rx, mode, log_path, event_tx_ipc, qp, commit_tx)
 }
 
 pub fn spawn_event_fanout_task(
@@ -180,6 +183,7 @@ pub fn spawn_event_fanout_task(
     log_path: std::path::PathBuf,
     event_tx_ipc: Option<tokio::sync::broadcast::Sender<String>>,
     question_pending: Option<QuestionPendingMap>,
+    commit_tx: Option<tokio::sync::watch::Sender<u64>>,
 ) -> tokio::task::JoinHandle<()> {
     let stats = StreamStats::new();
 
@@ -202,33 +206,33 @@ pub fn spawn_event_fanout_task(
 
     tokio::spawn(async move {
         use nca_common::event::EventEnvelope;
-        use tokio::fs::OpenOptions;
-        use tokio::io::AsyncWriteExt;
 
-        let mut log_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .await
-            .ok();
-
-        let mut event_id: u64 = 0;
+        let mut writer = EventLogWriter::open(&log_path).await;
         let mut rx = rx;
         let qp = question_pending;
         while let Some(event) = rx.recv().await {
-            event_id += 1;
-            let envelope = EventEnvelope::new(event_id, event.clone());
+            let id = writer.next_id();
+            let envelope = EventEnvelope::new(id, event.clone());
 
             if let Some(ref ipc) = ipc_handle_rebuilt {
                 let line = serde_json::to_string(&envelope).unwrap_or_default();
                 let _ = ipc.event_tx.send(line);
             }
 
-            if let Some(file) = log_file.as_mut()
-                && let Ok(line) = serde_json::to_string(&envelope)
-            {
-                let _ = file.write_all(line.as_bytes()).await;
-                let _ = file.write_all(b"\n").await;
+            if let Err(e) = writer.append(&envelope).await {
+                tracing::error!("failed to append event {} to log: {}", id, e);
+            }
+
+            // Durability barrier (P2 Phase B): commit at TurnCompleted and
+            // signal the supervisor's run_turn barrier. Liveness over false
+            // durability — fires even if the append above failed.
+            if let AgentEvent::TurnCompleted { turn_id, .. } = &envelope.event {
+                if let Err(e) = writer.commit().await {
+                    tracing::error!("event-log commit at turn {turn_id} failed: {e}");
+                }
+                if let Some(tx) = &commit_tx {
+                    let _ = tx.send(*turn_id);
+                }
             }
 
             if let Some(ref cb) = on_event {
@@ -681,5 +685,65 @@ mod tests {
             },
         };
         render_human_event(&ev);
+    }
+
+    // T21: the CLI fanout shares the runtime EventLogWriter semantics — ids
+    // seed from the existing log (pre-written envelope id 5 → next 6), and
+    // TurnCompleted triggers a commit + watch signal with the turn id.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fanout_task_seeds_ids_and_signals_commit() {
+        use nca_common::message::Message;
+        use nca_runtime::session_store::read_event_log;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("log.events.jsonl");
+        std::fs::write(
+            &log,
+            format!(
+                "{}\n",
+                serde_json::to_string(&EventEnvelope::new(
+                    5,
+                    AgentEvent::TurnStarted { turn_id: 5 },
+                ))
+                .expect("seed envelope")
+            ),
+        )
+        .expect("seed log");
+
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let (commit_tx, commit_rx) = tokio::sync::watch::channel(0u64);
+        let task = spawn_event_fanout_task(
+            rx,
+            StreamMode::Off,
+            log.clone(),
+            None,
+            None,
+            Some(commit_tx),
+        );
+        tx.send(AgentEvent::TurnStarted { turn_id: 6 })
+            .await
+            .expect("send");
+        tx.send(AgentEvent::MessageRecorded {
+            message: Message::user("hi"),
+        })
+        .await
+        .expect("send");
+        tx.send(AgentEvent::TurnCompleted {
+            turn_id: 6,
+            duration_ms: 1,
+        })
+        .await
+        .expect("send");
+        drop(tx);
+        task.await.expect("fanout task");
+
+        let envelopes = read_event_log(&log);
+        let ids: Vec<u64> = envelopes.iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec![5, 6, 7, 8], "ids continue from the seeded log");
+        assert!(matches!(
+            envelopes[3].event,
+            AgentEvent::TurnCompleted { .. }
+        ));
+        assert!(*commit_rx.borrow() >= 6, "commit watch carries the turn id");
     }
 }

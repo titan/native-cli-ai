@@ -7,9 +7,7 @@ use nca_core::approval::ApprovalVerdict;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 pub(crate) type ApprovalPendingMap = Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalVerdict>>>>;
 pub(crate) type QuestionPendingMap =
@@ -81,47 +79,54 @@ fn tool_input_one_line(input: &serde_json::Value) -> String {
     truncate_child_detail(&s, 120)
 }
 
-/// Spawns the event fanout task: writes events to disk as `EventEnvelope`,
-/// broadcasts over IPC, and renders to the provided callback.
+/// Optional durability barrier for `run_turn`: the fanout sends the
+/// `turn_id` of each `TurnCompleted` it has committed (flush + fsync) to the
+/// log. The supervisor's `run_turn` waits on this watch so a turn's events
+/// are durable before it returns. See `Supervisor::await_turn_commit`.
+pub(crate) type TurnCommitTx = watch::Sender<u64>;
+
+/// Spawns the event fanout task: writes events to disk as `EventEnvelope`
+/// (via [`crate::event_log::EventLogWriter`], which seeds ids from the
+/// existing log), broadcasts over IPC, renders to the provided callback,
+/// and fsync-commits at every `TurnCompleted` before signalling `commit_tx`.
 pub fn spawn_event_fanout(
     mut event_rx: mpsc::Receiver<AgentEvent>,
     log_path: PathBuf,
     ipc_tx: Option<tokio::sync::broadcast::Sender<String>>,
     on_event: Option<EventFanoutCallback>,
     parent_forward: Option<(String, mpsc::Sender<AgentEvent>)>,
+    commit_tx: Option<TurnCommitTx>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut log_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .await
-            .ok();
+        let mut writer = crate::event_log::EventLogWriter::open(&log_path).await;
 
-        let mut event_id: u64 = 0;
         while let Some(event) = event_rx.recv().await {
-            event_id += 1;
+            let id = writer.next_id();
             if let Some((ref child_id, ref ptx)) = parent_forward
                 && let Some(fwd) = map_child_event_for_parent_broadcast(child_id, &event)
             {
                 let _ = ptx.send(fwd).await;
             }
-            let envelope = EventEnvelope::new(event_id, event);
+            let envelope = EventEnvelope::new(id, event);
             if let Some(ref tx) = ipc_tx {
                 let line = serde_json::to_string(&envelope).unwrap_or_default();
                 let _ = tx.send(line);
             }
 
-            if let Some(file) = log_file.as_mut()
-                && let Ok(line) = serde_json::to_string(&envelope)
-            {
-                // Single write of line+"\n": a torn tail can only ever be a
-                // partial line, which the tolerant reader (`read_event_log`)
-                // skips. Two separate writes could leave a complete-but-
-                // newline-less line that still parses as an envelope.
-                let mut buf = line.into_bytes();
-                buf.push(b'\n');
-                let _ = file.write_all(&buf).await;
+            if let Err(e) = writer.append(&envelope).await {
+                tracing::error!("failed to append event {} to log: {}", id, e);
+            }
+
+            // Liveness over false durability: the commit barrier fires even
+            // if the append failed — a stuck barrier would be worse than a
+            // missing line (the tolerant reader skips gaps).
+            if let AgentEvent::TurnCompleted { turn_id, .. } = &envelope.event {
+                if let Err(e) = writer.commit().await {
+                    tracing::error!("event-log commit at turn {turn_id} failed: {e}");
+                }
+                if let Some(tx) = &commit_tx {
+                    let _ = tx.send(*turn_id);
+                }
             }
 
             if let Some(ref cb) = on_event {

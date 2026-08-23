@@ -148,12 +148,14 @@ async fn run_service_session_with_startup(
         command_rx = Some(crx);
     }
 
+    let commit_tx = handle.take_turn_commit_tx().map(|(tx, _flag)| tx);
     let fanout_task = spawn_event_fanout(
         event_rx,
         info.event_log_path.clone(),
         event_tx_ipc,
         None,
         None,
+        commit_tx,
     );
 
     let subagent_task = if let Some(spawn_rx) = handle.take_spawn_rx() {

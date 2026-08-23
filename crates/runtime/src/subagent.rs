@@ -199,8 +199,10 @@ pub async fn spawn_child_session(
     let event_rx = handle.take_event_rx();
     let log_path = handle.event_log_path.clone();
 
+    let commit_tx = handle.take_turn_commit_tx().map(|(tx, _flag)| tx);
     let parent_forward = event_tx.map(|tx| (child_id.clone(), tx));
-    let fanout = event_rx.map(|rx| spawn_event_fanout(rx, log_path, None, None, parent_forward));
+    let fanout =
+        event_rx.map(|rx| spawn_event_fanout(rx, log_path, None, None, parent_forward, commit_tx));
 
     let result = sup.run_turn(&context_prompt).await;
 

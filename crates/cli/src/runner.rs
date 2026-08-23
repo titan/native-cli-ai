@@ -156,6 +156,14 @@ impl SessionRuntime {
         self.handle.as_mut()?.take_spawn_rx()
     }
 
+    /// Takes the turn-commit watch sender for the CLI event fanout
+    /// (durability barrier wiring, P2 Phase B).
+    pub fn take_turn_commit_tx(
+        &mut self,
+    ) -> Option<(tokio::sync::watch::Sender<u64>, Arc<AtomicBool>)> {
+        self.handle.as_mut()?.take_turn_commit_tx()
+    }
+
     pub fn messages(&self) -> &[nca_common::message::Message] {
         &self.supervisor.agent().messages
     }

@@ -721,6 +721,7 @@ async fn try_main() -> anyhow::Result<()> {
                             approval_pending,
                             runtime.question_pending(),
                             None,
+                            runtime.take_turn_commit_tx().map(|(tx, _flag)| tx),
                         );
                         let _ = runtime.run_turn(prompt).await;
                         let mut repl = Repl::new(runtime, cli.safe, true);
@@ -807,6 +808,7 @@ async fn try_main() -> anyhow::Result<()> {
                             approval_pending,
                             runtime.question_pending(),
                             None,
+                            runtime.take_turn_commit_tx().map(|(tx, _flag)| tx),
                         );
                     }
                     let mut repl = Repl::new(runtime, cli.safe, cli.run);
@@ -875,6 +877,7 @@ async fn try_main() -> anyhow::Result<()> {
                                 approval_pending,
                                 runtime.question_pending(),
                                 None,
+                                runtime.take_turn_commit_tx().map(|(tx, _flag)| tx),
                             );
                         }
                         let mut repl = Repl::new(runtime, cli.safe, cli.run);
@@ -935,6 +938,7 @@ async fn run_one_shot(
             approval_pending,
             runtime.question_pending(),
             None,
+            runtime.take_turn_commit_tx().map(|(tx, _flag)| tx),
         );
 
         let spawn_task = runtime.take_spawn_rx().map(|spawn_rx| {
@@ -1218,6 +1222,7 @@ async fn resume_session(
                 approval_pending,
                 runtime.question_pending(),
                 None,
+                runtime.take_turn_commit_tx().map(|(tx, _flag)| tx),
             );
         }
         let output = runtime
@@ -1239,6 +1244,7 @@ async fn resume_session(
             approval_pending,
             runtime.question_pending(),
             None,
+            runtime.take_turn_commit_tx().map(|(tx, _flag)| tx),
         );
     }
     let mut repl = Repl::new(runtime, safe, true);

@@ -47,7 +47,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 /// Reusable runtime supervisor that owns session lifecycle, IPC, event fanout,
 /// and command handling.
@@ -91,6 +91,14 @@ pub struct Supervisor {
     last_summary_at_tokens: usize,
     fs: Arc<dyn WorkspaceFs>,
     pty: Arc<PtyManager>,
+    /// Sender half of the turn-commit watch, handed to the fanout via
+    /// [`SupervisorHandle::take_turn_commit_tx`]. `None` once taken.
+    turn_commit_tx: Option<(watch::Sender<u64>, Arc<AtomicBool>)>,
+    /// Receiver half used by `run_turn`'s durability barrier.
+    turn_commit_rx: Option<watch::Receiver<u64>>,
+    /// Wiring marker: `true` once a fanout has taken the sender. The barrier
+    /// skips waiting when nobody was wired (liveness over false durability).
+    turn_commit_wired: Arc<AtomicBool>,
 }
 
 /// Configuration for creating a new supervised session.
@@ -122,6 +130,9 @@ pub struct SupervisorHandle {
     approval_pending: Option<ApprovalPendingMap>,
     question_pending: Option<QuestionPendingMap>,
     spawn_rx: Option<mpsc::Receiver<SpawnRequest>>,
+    /// Turn-commit watch sender + wiring flag for the event fanout (P2
+    /// Phase B). Wiring marker for the `run_turn` durability barrier.
+    turn_commit_tx: Option<(watch::Sender<u64>, Arc<AtomicBool>)>,
 }
 
 impl SupervisorHandle {
@@ -143,6 +154,18 @@ impl SupervisorHandle {
 
     pub fn take_spawn_rx(&mut self) -> Option<mpsc::Receiver<SpawnRequest>> {
         self.spawn_rx.take()
+    }
+
+    /// Takes the turn-commit watch sender for the event fanout.
+    ///
+    /// Wiring marker for the `run_turn` durability barrier: taking it marks
+    /// the writer as wired (flag set BEFORE returning) so `run_turn` starts
+    /// waiting on turn commits as soon as anyone owns the sender.
+    pub fn take_turn_commit_tx(&mut self) -> Option<(watch::Sender<u64>, Arc<AtomicBool>)> {
+        self.turn_commit_tx.take().map(|(tx, flag)| {
+            flag.store(true, Ordering::SeqCst);
+            (tx, flag)
+        })
     }
 }
 
@@ -528,6 +551,12 @@ impl Supervisor {
         let context_manager =
             Self::make_context_manager(&config, &config.model.default_model).await;
 
+        // Turn-commit durability wiring (P2 Phase B): the fanout signals each
+        // committed TurnCompleted on the watch; run_turn waits for it.
+        let (commit_tx, commit_rx) = watch::channel::<u64>(0);
+        let turn_commit_wired = Arc::new(AtomicBool::new(false));
+        let turn_commit_tx = Some((commit_tx, turn_commit_wired.clone()));
+
         let sup = Self {
             session_id,
             workspace_root,
@@ -563,6 +592,9 @@ impl Supervisor {
             last_summary_at_tokens: 0,
             fs: fs_for_supervisor,
             pty: pty_for_supervisor,
+            turn_commit_tx,
+            turn_commit_rx: Some(commit_rx),
+            turn_commit_wired,
         };
         sup.save().await.map_err(ProviderError::Other)?;
         sup.update_last_session()
@@ -723,6 +755,7 @@ impl Supervisor {
             approval_pending: self.approval_pending.take(),
             question_pending: self.question_pending.take(),
             spawn_rx: self.spawn_rx.take(),
+            turn_commit_tx: self.turn_commit_tx.take(),
         }
     }
 
@@ -758,10 +791,20 @@ impl Supervisor {
         // Check context before running turn
         self.maybe_compact_context().await;
 
-        let output = self
+        // Durability barrier (P2 Phase B): capture the last committed turn
+        // before the turn runs, then wait for this turn's TurnCompleted to be
+        // flushed+fsynced to the event log before returning.
+        let before = self
+            .turn_commit_rx
+            .as_ref()
+            .map(|rx| *rx.borrow())
+            .unwrap_or(0);
+        let result = self
             .agent
             .run_turn(prompt, self.workspace_root.as_path(), attachments)
-            .await?;
+            .await;
+        self.await_turn_commit(before).await;
+        let output = result?;
 
         // Check context after turn
         self.check_and_summarize_context().await;
@@ -788,6 +831,47 @@ impl Supervisor {
             .await
             .map_err(ProviderError::Other)?;
         Ok(output)
+    }
+
+    /// Clone of the turn-commit watch receiver (observability for tests and
+    /// future UI progress indicators).
+    pub fn turn_commit_rx(&self) -> Option<watch::Receiver<u64>> {
+        self.turn_commit_rx.clone()
+    }
+
+    /// Waits (bounded) until the fanout has committed a turn with id greater
+    /// than `before` to the event log. Skips entirely when no fanout was
+    /// wired (`take_turn_commit_tx` never called) or the receiver is gone;
+    /// times out after 5s with an error log — the barrier must never fail
+    /// the turn (liveness over false durability).
+    async fn await_turn_commit(&self, before: u64) {
+        if !self.turn_commit_wired.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(rx) = self.turn_commit_rx.clone() else {
+            return;
+        };
+        let mut rx = rx;
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            rx.wait_for(|v| *v > before),
+        )
+        .await
+        {
+            Ok(Ok(value)) => {
+                tracing::debug!("event log committed through turn {}", *value);
+            }
+            Ok(Err(_)) => {
+                tracing::error!(
+                    "event-log turn commit channel closed; turn data may not be durable"
+                );
+            }
+            Err(_) => {
+                tracing::error!(
+                    "event-log turn commit barrier timed out; turn data may not be durable"
+                );
+            }
+        }
     }
 
     /// Get current context statistics with model info.

@@ -3,15 +3,18 @@
 use crate::ipc_pending::{ApprovalPendingMap, QuestionPendingMap};
 use crate::tui::elm::feedback::TuiFeedbackMsg;
 use nca_common::event::{AgentEvent, EventEnvelope};
+use nca_runtime::event_log::EventLogWriter;
 use nca_runtime::ipc::IpcHandle;
 use nca_runtime::supervisor;
-use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 
 struct IpcFanout {
     tx: tokio::sync::broadcast::Sender<String>,
 }
 
 /// Disk + IPC + TUI state; starts IPC command consumer when needed.
+/// `commit_tx` receives the turn id of each `TurnCompleted` committed
+/// (flush + fsync) to the log — the supervisor's `run_turn` barrier.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_tui_bridge(
     mut rx: tokio::sync::mpsc::Receiver<AgentEvent>,
     log_path: std::path::PathBuf,
@@ -19,6 +22,7 @@ pub fn spawn_tui_bridge(
     approval_pending: Option<ApprovalPendingMap>,
     question_pending: Option<QuestionPendingMap>,
     feedback_tx: tokio::sync::mpsc::UnboundedSender<TuiFeedbackMsg>,
+    commit_tx: Option<tokio::sync::watch::Sender<u64>>,
 ) -> tokio::task::JoinHandle<()> {
     let (event_tx_ipc, command_rx) = match ipc_handle {
         Some(h) => {
@@ -35,17 +39,11 @@ pub fn spawn_tui_bridge(
     let ipc = event_tx_ipc.map(|tx| IpcFanout { tx });
 
     tokio::spawn(async move {
-        let mut log_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .await
-            .ok();
+        let mut writer = EventLogWriter::open(&log_path).await;
 
-        let mut event_id: u64 = 0;
         while let Some(event) = rx.recv().await {
-            event_id += 1;
-            let envelope = EventEnvelope::new(event_id, event.clone());
+            let id = writer.next_id();
+            let envelope = EventEnvelope::new(id, event.clone());
 
             if let Some(ref fan) = ipc {
                 let line = serde_json::to_string(&envelope).unwrap_or_default();
@@ -59,11 +57,19 @@ pub fn spawn_tui_bridge(
             // agent by hundreds of milliseconds during high-frequency streaming.
             let _ = feedback_tx.send(TuiFeedbackMsg::Agent(event));
 
-            if let Some(file) = log_file.as_mut()
-                && let Ok(line) = serde_json::to_string(&envelope)
-            {
-                let _ = file.write_all(line.as_bytes()).await;
-                let _ = file.write_all(b"\n").await;
+            if let Err(e) = writer.append(&envelope).await {
+                tracing::error!("failed to append event {} to log: {}", id, e);
+            }
+
+            // Durability barrier (P2 Phase B): commit at TurnCompleted and
+            // signal the supervisor's run_turn barrier.
+            if let AgentEvent::TurnCompleted { turn_id, .. } = &envelope.event {
+                if let Err(e) = writer.commit().await {
+                    tracing::error!("event-log commit at turn {turn_id} failed: {e}");
+                }
+                if let Some(tx) = &commit_tx {
+                    let _ = tx.send(*turn_id);
+                }
             }
         }
     })
