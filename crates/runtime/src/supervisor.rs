@@ -1829,6 +1829,10 @@ mod tests {
             !should_overflow_retry(&other, false),
             "non-overflow never retries"
         );
+        assert!(
+            !should_overflow_retry(&other, true),
+            "non-overflow + already-retried never retries"
+        );
     }
 
     #[test]

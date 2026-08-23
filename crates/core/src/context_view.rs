@@ -742,8 +742,10 @@ mod tests {
         assert_eq!(out.messages, minimal);
     }
 
-    // C11 — post-summarize fixture: the summary system message is never
-    // pruned and nothing is orphaned.
+    // C11 — oracle Q1 post-summarize fixture: the summary system message is
+    // never pruned, every summary-era tool group IS pruned (deletion always
+    // has material even after compaction — compaction truncates, never
+    // deletes), the recent window survives, and nothing is orphaned.
     #[test]
     fn prune_never_deletes_post_summarize_summary() {
         let mut messages = vec![
@@ -767,11 +769,72 @@ mod tests {
             out.messages
                 .iter()
                 .any(|m| m.role == Role::System
-                    && message_text(m).contains("## Conversation Summary"))
+                    && message_text(m).contains("## Conversation Summary")),
+            "the summary system message must survive the prune"
         );
         assert!(
-            out.pruned_groups > 0,
-            "summary-era tool groups are prunable"
+            out.messages
+                .iter()
+                .any(|m| m.role == Role::System && message_text(m) == "You are nca."),
+            "the bootstrap system prompt must survive"
+        );
+        // All 10 summary-era tool groups sit outside the recent-2 window and
+        // are compactible ⇒ every one is deleted (nothing half-kept).
+        assert_eq!(
+            out.pruned_groups, 10,
+            "all summary-era tool groups are prunable: got {}",
+            out.pruned_groups
+        );
+        assert!(
+            out.messages
+                .iter()
+                .filter(|m| message_text(m).contains("summary-era output"))
+                .count()
+                == 0,
+            "no summary-era tool output may survive"
+        );
+        // Recent window intact: every recent user message survives.
+        for i in 0..8 {
+            assert!(
+                out.messages
+                    .iter()
+                    .any(|m| m.role == Role::User && message_text(m) == format!("u{i}")),
+                "recent user message u{i} must survive"
+            );
+        }
+        assert_no_orphaned_tool_results(&out.messages);
+    }
+
+    // C11 (oracle Q1 companion): a summary surfaced as an ASSISTANT message
+    // (no tool_calls) is `GroupKind::Assistant` — never a prunable
+    // `ToolGroup` — so it survives the prune like the system-carrier form.
+    #[test]
+    fn prune_never_deletes_assistant_carrier_summary() {
+        let mut messages = vec![Message::system("You are nca.")];
+        messages.push(Message::assistant(
+            "## Conversation Summary\nEarlier context is summarized here.",
+        ));
+        for i in 0..10 {
+            messages.extend(tool_group(
+                &format!("s{i}"),
+                "read_file",
+                "summary-era output",
+            ));
+        }
+        for i in 0..8 {
+            messages.push(Message::user(format!("u{i}")));
+            messages.push(Message::assistant(format!("a{i}")));
+        }
+
+        let out = prune_tool_results(&messages, 2);
+        assert!(
+            out.messages.iter().any(|m| m.role == Role::Assistant
+                && message_text(m).contains("## Conversation Summary")),
+            "assistant-carrier summary must never be pruned"
+        );
+        assert_eq!(
+            out.pruned_groups, 10,
+            "the tool groups around the summary are still prunable"
         );
         assert_no_orphaned_tool_results(&out.messages);
     }
