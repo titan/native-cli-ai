@@ -647,7 +647,6 @@ fn render_event(event: &AgentEvent, stats: &StreamStats) {
             );
         }
         AgentEvent::ContextCompaction {
-            phase: _,
             message,
             tokens_before,
             tokens_after,

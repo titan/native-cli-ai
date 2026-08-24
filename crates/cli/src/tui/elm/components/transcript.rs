@@ -559,14 +559,9 @@ impl TranscriptState {
                 tokens_after,
                 kv_prefix_broken,
             } => {
-                let tokens_before = self.compaction_block.and_then(|(idx, before)| {
-                    if idx < self.blocks.len()
+                let tokens_before = self.compaction_block.filter(|&(idx, _)| {
+                    idx < self.blocks.len()
                         && matches!(&self.blocks[idx], DisplayBlock::System(s) if s.starts_with("⧗ compacting context"))
-                    {
-                        Some((idx, before))
-                    } else {
-                        None
-                    }
                 });
                 let mut text = match tokens_before {
                     Some((_, before)) if before > *tokens_after => {
@@ -596,7 +591,6 @@ impl TranscriptState {
                 self.compaction_block = None;
             }
             AgentEvent::ContextCompaction {
-                phase: _,
                 message,
                 tokens_before,
                 tokens_after,
