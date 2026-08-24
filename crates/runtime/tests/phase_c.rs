@@ -24,8 +24,8 @@
 //!   counts stay exact, no duplication (Supervisor-level, not a TUI test).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;

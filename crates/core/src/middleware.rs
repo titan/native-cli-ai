@@ -271,19 +271,9 @@ mod tests {
             model: &str,
             workspace_root: &Path,
         ) -> Result<tokio::sync::mpsc::Receiver<StreamChunk>, ProviderError> {
-            if self.fail_first && self.calls.lock().unwrap().is_empty() {
-                self.calls.lock().unwrap().push((
-                    messages
-                        .iter()
-                        .map(|m| m.content.to_summary_text())
-                        .collect(),
-                    tools.iter().map(|t| t.name.clone()).collect(),
-                    model.to_string(),
-                    workspace_root.to_path_buf(),
-                ));
-                return Err(ProviderError::Other("first attempt fails".into()));
-            }
-            self.calls.lock().unwrap().push((
+            let mut calls = self.calls.lock().unwrap();
+            let is_first = calls.is_empty();
+            calls.push((
                 messages
                     .iter()
                     .map(|m| m.content.to_summary_text())
@@ -292,6 +282,10 @@ mod tests {
                 model.to_string(),
                 workspace_root.to_path_buf(),
             ));
+            drop(calls);
+            if self.fail_first && is_first {
+                return Err(ProviderError::Other("first attempt fails".into()));
+            }
             Ok(text_stream())
         }
     }
@@ -433,13 +427,6 @@ mod tests {
             }
         }
         out
-    }
-
-    fn texts(messages: &[Message]) -> Vec<String> {
-        messages
-            .iter()
-            .map(|m| m.content.to_summary_text())
-            .collect()
     }
 
     // M1 — empty chain: terminal called once, observes everything untouched.
