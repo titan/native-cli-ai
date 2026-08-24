@@ -26,7 +26,7 @@ native-cli-ai/
 │   │       ├── lib.rs
 │   │       ├── agent.rs        # AgentLoop: drives conversation + tool execution
 │   │       ├── agent_driver.rs # TurnDriver: turn/step loop, inbox claiming (P1)
-│   │       ├── middleware.rs   # Waterfall middleware chain (P4) + OverflowRecoveryMiddleware (P3)
+│   │       ├── middleware.rs   # Waterfall chain (P4) + default_chain: cost-guard → compaction → overflow-recovery → retry
 │   │       ├── provider.rs     # Provider trait + provider modules
 │   │       ├── provider/
 │   │       │   ├── factory.rs  # Selects the configured provider adapter
@@ -192,7 +192,17 @@ auto-summarize (bracket events `ContextCompactionStart/End`) and retries
 the turn exactly once. Replacement-type compactions emit the
 `ContextCompactionStart → HistoryReplaced → ContextCompactionEnd` bracket
 on the event log; routine per-step smart compaction keeps the single
-`ContextCompaction` event.
+`ContextCompaction` event (emitted by `CompactionMiddleware` since the
+chain-composition phase — the driver's `step()` hands the canonical
+post-prepare/sanitize history to the chain and owns no view shaping).
+
+Chain composition (`default_chain`, wired by the supervisor for every
+session incl. subagent children): `cost-guard → compaction →
+overflow-recovery → retry`, code-fixed order honoring P3's
+outermost-of-retry contract. Knobs in `[middleware]`
+(`retry_max_attempts`, `retry_delay_cap_ms`, `cost_budget_usd`);
+cost-guard trips loudly (`Err`, zero provider calls) on estimated
+session spend ≥ budget.
 
 Provider responses are streamed token-by-token via `tokio::sync::mpsc` using MiniMax SSE. The CLI can render:
 

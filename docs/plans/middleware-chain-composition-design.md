@@ -422,6 +422,31 @@ nestings traced functionally correct; all findings applied:
   forward-looking, R4 marked test-only, header parsing added to
   non-goals.
 
-## Implementation record
+## Implementation record (2026-08-24)
 
-(to be filled at lane completion)
+- Lanes: oracle (design review — record above), fixer (impl + K1–G4
+  unit, `d5114d7`), tester (W1–W4 integration; lane hit the 600 s
+  timeout with complete green files left in the worktree — recovered,
+  validated, and committed by the orchestrator per the lane-timeout
+  lesson, `22ee4ef`), ponytail (verdict `net: -25 possible`; test-side
+  pair-helper shrink applied as `aef1105`, the
+  `SessionUsage::estimated_cost_usd` delete rejected with rationale).
+- **Accepted deviation from §2:** `default_chain` takes a second
+  parameter `compaction_mode: SmartCompactionMode` — as literally
+  specified (middleware-config-only) the configured mode would be
+  silently dropped (compaction always Off). The supervisor passes
+  `config.memory.context.smart_compaction_mode`; `[memory]` stays the
+  mode's config home.
+- **W4 exceeded spec:** the tester found the supervisor-level resume
+  harness (phase_c/inbox patterns) and wrote the real
+  `seed_cost_tracker_from_log` path as
+  `crates/runtime/tests/cost_guard_resume.rs` (spec's fallback was a
+  core-level essence only, which also landed as `w4_reeseed_*` in
+  `core/tests/middleware_composition.rs`).
+- Validation at merge: `cargo fmt --all -- --check` ✅, `cargo clippy
+  --workspace -- -D warnings` ✅, `cargo test --workspace` **527 passed
+  / 0 failed** (511 baseline + 11 unit + 5 integration). One mid-run
+  `/dev/shm` quota hit (os error 122, known environment issue) cleared
+  by removing `target/debug/incremental`; rerun green.
+- Doc sync: `docs/architecture.md` (module map + streaming section),
+  roadmap §P4 status note — this commit. No dep changes.

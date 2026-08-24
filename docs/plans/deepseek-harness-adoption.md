@@ -259,6 +259,12 @@ run_turn_inner 内联代码移出。
 - core ~350 行。依赖：P1（StepRequest 定义需要 step 边界存在）；P3 可作为其首个消费者
   一起做或随后。**建议 P1 → P4 → P3**（P3 的恢复循环在 middleware 里更干净）。
 
+> **状态（2026-08-24）**：P4 seam + P3 均已落地后，链组合也已实现
+> （`docs/plans/middleware-chain-composition-design.md`）：`default_chain`
+> 组装 cost-guard → compaction → overflow-recovery → retry，观测性中��件
+> 经 oracle 确认跳过（driver 事件已覆盖）；旋钮在 `[middleware]` 配置段。
+> P4 验收标准 1/3 达成；标准 2（溢出恢复在 middleware.rs）由 P3 达成。
+
 ---
 
 ## P5 — 内核级沙箱（Landlock，Rust 原生）
