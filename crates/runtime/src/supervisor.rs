@@ -5,9 +5,8 @@ pub use crate::subagent::{
 
 pub(crate) use crate::session_utils::{ApprovalPendingMap, QuestionPendingMap};
 pub use crate::session_utils::{
-    SessionControlCommand, cleanup_stale_sessions, get_last_session_id, list_sessions,
-    query_session_state, spawn_command_consumer, spawn_command_consumer_with_store,
-    spawn_event_fanout,
+    SessionControlCommand, get_last_session_id, spawn_command_consumer,
+    spawn_command_consumer_with_store, spawn_event_fanout,
 };
 
 use crate::context_manager::{ContextManager, ContextManagerConfig, ContextStats};

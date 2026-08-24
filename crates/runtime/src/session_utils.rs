@@ -1,8 +1,6 @@
 use crate::session_store::SessionStore;
-use chrono::Utc;
 use nca_common::config::NcaConfig;
 use nca_common::event::{AgentCommand, AgentEvent, EndReason, EventEnvelope, QuestionSelection};
-use nca_common::session::{SessionState, SessionStatus};
 use nca_core::approval::ApprovalVerdict;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -270,69 +268,6 @@ pub fn spawn_command_consumer_with_store(
             }
         }
     })
-}
-
-/// Query the current state of a session from its store.
-pub async fn query_session_state(
-    session_store: &SessionStore,
-    session_id: &str,
-) -> Result<SessionState, String> {
-    session_store
-        .load(session_id)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// List all session IDs in a workspace.
-pub async fn list_sessions(session_store: &SessionStore) -> Result<Vec<String>, String> {
-    session_store.list().await.map_err(|e| e.to_string())
-}
-
-/// Clean up stale sessions: sessions marked as Running whose PID is no longer alive
-/// and whose socket no longer exists. Marks them as Error.
-pub async fn cleanup_stale_sessions(session_store: &SessionStore) {
-    let ids = match session_store.list().await {
-        Ok(ids) => ids,
-        Err(_) => return,
-    };
-
-    for id in ids {
-        let mut session = match session_store.load(&id).await {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-
-        if session.meta.status != SessionStatus::Running {
-            continue;
-        }
-
-        let pid_alive = session.meta.pid.map(is_pid_alive).unwrap_or(false);
-
-        let socket_exists = session
-            .meta
-            .socket_path
-            .as_ref()
-            .map(|p| p.exists())
-            .unwrap_or(false);
-
-        if !pid_alive && !socket_exists {
-            session.meta.status = SessionStatus::Error;
-            session.meta.updated_at = Utc::now();
-            let _ = session_store.save(&session).await;
-        }
-    }
-}
-
-fn is_pid_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        unsafe { libc::kill(pid as i32, 0) == 0 }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false
-    }
 }
 
 /// Get the last session ID from `.nca/.last_session`, if it exists and is valid.
