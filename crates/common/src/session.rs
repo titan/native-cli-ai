@@ -243,6 +243,49 @@ mod tests {
     }
 
     #[test]
+    fn session_state_snapshot_mirrors_agent_name_and_orchestration() {
+        // The snapshot surface (hook payloads, orchestration consumers) must
+        // see the same agent/orchestration identity the meta carries.
+        let now = chrono::Utc::now();
+        let meta = SessionMeta {
+            id: "s-mirror".into(),
+            created_at: now,
+            updated_at: now,
+            workspace: "/tmp/ws".into(),
+            model: "deepseek-chat".into(),
+            status: crate::session::SessionStatus::Running,
+            pid: None,
+            socket_path: None,
+            agent_name: Some("oracle".into()),
+            orchestration: Some(OrchestrationContext {
+                orchestrator: Some("wrapper".into()),
+                ..Default::default()
+            }),
+            worktree_path: None,
+            branch: None,
+            base_branch: None,
+            parent_session_id: None,
+            child_session_ids: Vec::new(),
+            inherited_summary: None,
+            spawn_reason: None,
+            session_summary: None,
+            session_title: None,
+        };
+        let state = super::SessionState {
+            meta,
+            messages: Vec::new(),
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            estimated_cost_usd: 0.0,
+        };
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.id, "s-mirror");
+        assert_eq!(snapshot.agent_name.as_deref(), Some("oracle"));
+        let orchestration = snapshot.orchestration.expect("orchestration mirrored");
+        assert_eq!(orchestration.orchestrator.as_deref(), Some("wrapper"));
+    }
+
+    #[test]
     fn orchestration_context_reads_env_contract() {
         let vars = [
             ("NCA_ORCH_NAME", "paperclip-wrapper"),

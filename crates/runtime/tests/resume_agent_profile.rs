@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use nca_common::config::{AgentProfileConfig, NcaConfig, PermissionMode, ProviderKind};
 use nca_common::event::EndReason;
 use nca_common::message::{ContentPart, Message, MessageContent, Role};
+use nca_common::session::OrchestrationContext;
 use nca_common::tool::ToolDefinition;
 use nca_core::provider::{Provider, ProviderError, StreamChunk};
 use nca_runtime::session_utils::spawn_event_fanout;
@@ -178,6 +179,53 @@ async fn drain_fanout(sup: Supervisor, fanout: tokio::task::JoinHandle<()>) {
         .await
         .expect("fanout must drain and exit within 5s of the sender drop")
         .expect("fanout task must complete without panicking");
+}
+
+// ---------------------------------------------------------------------------
+// R6 — orchestration context survives resume (system-prompt section)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn r6_resume_restores_orchestration_context_section() {
+    let ws = tempfile::tempdir().expect("tempdir");
+    let config = offline_config_no_key();
+    let orchestration = OrchestrationContext {
+        orchestrator: Some("probe-wrapper".into()),
+        run_id: Some("run-1".into()),
+        ..Default::default()
+    };
+
+    let mut sup = Supervisor::create(SupervisorConfig {
+        config: config.clone(),
+        workspace_root: ws.path().to_path_buf(),
+        safe_mode: true,
+        interactive_approvals: false,
+        session_id: Some("r6".into()),
+        approval_handler: None,
+        orchestration_context: Some(orchestration),
+        agent_name: None,
+        provider: None,
+    })
+    .await
+    .expect("create with orchestration must succeed");
+    sup.set_session_title(Some("r6".into()));
+    let created_prompt = system_prompt_of(&sup);
+    assert!(
+        created_prompt.contains("Execution Context:"),
+        "create builds the orchestration section"
+    );
+    sup.finish(EndReason::Completed).await;
+    drop(sup);
+
+    let sup2 = resume_sup(ws.path(), "r6", config, None).await;
+    let resumed_prompt = system_prompt_of(&sup2);
+    assert!(
+        resumed_prompt.contains("Execution Context:"),
+        "resumed system prompt must rebuild the orchestration section"
+    );
+    assert!(resumed_prompt.contains("probe-wrapper"));
+    assert!(resumed_prompt.contains("run-1"));
+    drop(sup2);
 }
 
 // ---------------------------------------------------------------------------
