@@ -47,6 +47,11 @@ pub struct SessionMeta {
     /// External orchestration metadata for headless worker runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestration: Option<OrchestrationContext>,
+    /// Active agent profile name (`[agents.<name>]` or skill-discovered) at
+    /// the time this session was last saved. Resume re-resolves it against
+    /// the current config, so profile edits take effect on resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
 }
 
 /// Full session state, including conversation history and cost tracking.
@@ -90,6 +95,9 @@ pub struct SessionSnapshot {
     pub session_title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestration: Option<OrchestrationContext>,
+    /// Active agent profile name mirrored from [`SessionMeta::agent_name`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub estimated_cost_usd: f64,
@@ -135,6 +143,7 @@ impl SessionState {
             session_summary: self.meta.session_summary.clone(),
             session_title: self.meta.session_title.clone(),
             orchestration: self.meta.orchestration.clone(),
+            agent_name: self.meta.agent_name.clone(),
             total_input_tokens: self.total_input_tokens,
             total_output_tokens: self.total_output_tokens,
             estimated_cost_usd: self.estimated_cost_usd,
@@ -200,7 +209,38 @@ pub enum SessionStatus {
 #[cfg(test)]
 mod tests {
     use super::OrchestrationContext;
+    use crate::session::SessionMeta;
     use std::env;
+
+    #[test]
+    fn session_meta_legacy_json_without_agent_name_deserializes() {
+        // Pre-agent_name session json: every field the old writer emitted,
+        // no `agent_name`. Serde's field default must yield `None` so old
+        // sessions keep resuming (design doc §1, U1).
+        let legacy = r#"{
+            "id": "s-legacy",
+            "created_at": "2026-08-24T00:00:00Z",
+            "updated_at": "2026-08-24T00:00:00Z",
+            "workspace": "/tmp/ws",
+            "model": "deepseek-chat",
+            "status": "completed",
+            "pid": null,
+            "socket_path": null
+        }"#;
+        let meta: SessionMeta = serde_json::from_str(legacy).expect("legacy meta parses");
+        assert_eq!(meta.id, "s-legacy");
+        assert_eq!(
+            meta.agent_name, None,
+            "missing agent_name must default to None"
+        );
+
+        // Round-trip: `None` is skipped on serialize, so new jsons written by
+        // this version still load in binaries that predate the field.
+        let serialized = serde_json::to_string(&meta).expect("serialize");
+        assert!(!serialized.contains("agent_name"));
+        let back: SessionMeta = serde_json::from_str(&serialized).expect("round-trip");
+        assert_eq!(back.agent_name, None);
+    }
 
     #[test]
     fn orchestration_context_reads_env_contract() {

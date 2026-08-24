@@ -49,6 +49,7 @@ fn write_session(
             session_summary: None,
             session_title: None,
             orchestration: None,
+            agent_name: None,
         },
         messages: vec![Message::user("hello")],
         total_input_tokens: 0,

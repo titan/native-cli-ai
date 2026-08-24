@@ -84,6 +84,12 @@ pub struct Supervisor {
     /// Active agent profile (if any). Stored so `reset_for_new_session` can
     /// rebuild the system prompt with the same specialist persona.
     agent_profile: Option<AgentProfileConfig>,
+    /// Name of the active agent profile, as last selected (`[agents.<name>]`
+    /// key or skill-discovered name). Persisted into `SessionMeta::agent_name`
+    /// so `resume` can re-resolve the persona against the current config.
+    /// Recorded verbatim, even when the name no longer resolves (resume then
+    /// warns and falls back to the default harness prompt).
+    active_agent_name: Option<String>,
     hooks: Option<HookRunner>,
     plugins: PluginRegistry,
     #[allow(dead_code)] // retained for RAII — drop cleans up child plugin processes.
@@ -424,10 +430,18 @@ impl Supervisor {
         let base_config = config.clone();
 
         // Resolve the agent profile (if any) and apply its overrides to the config.
-        let agent_profile = cfg
-            .agent_name
+        let requested_agent_name = cfg.agent_name.clone();
+        let agent_profile = requested_agent_name
             .as_deref()
             .and_then(|name| config.agent_profile(name).cloned());
+        if let Some(name) = requested_agent_name.as_deref()
+            && agent_profile.is_none()
+        {
+            tracing::warn!(
+                agent = name,
+                "agent profile not found; using the default harness prompt"
+            );
+        }
         if let Some(ref profile) = agent_profile {
             if let Some(provider) = profile.resolve_provider() {
                 config.set_default_provider(provider);
@@ -653,6 +667,7 @@ impl Supervisor {
             config,
             base_config,
             agent_profile,
+            active_agent_name: requested_agent_name,
             hooks: hook_runner,
             plugins,
             plugin_host,
@@ -705,7 +720,12 @@ impl Supervisor {
             session_id: Some(session_id.into()),
             approval_handler,
             orchestration_context: None,
-            agent_name: None,
+            // Restore the persisted agent profile so the specialist persona
+            // (prompt, provider/permission overrides, tool gating) survives
+            // resume. Threaded through `create`'s pipeline — not a post-hoc
+            // `apply_agent_profile` — so an injected provider still wins
+            // verbatim and unresolvable names degrade to the default prompt.
+            agent_name: loaded.as_ref().and_then(|l| l.meta.agent_name.clone()),
             provider,
         })
         .await?;
@@ -1324,6 +1344,7 @@ impl Supervisor {
                 session_summary: self.session_summary.clone(),
                 session_title: self.session_title.clone(),
                 orchestration: self.orchestration.clone(),
+                agent_name: self.active_agent_name.clone(),
             },
             messages: self.agent.messages.clone(),
             total_input_tokens: self.agent.cost_tracker.input_tokens,
@@ -1428,6 +1449,14 @@ impl Supervisor {
         // Start from the clean base config (before any agent overrides).
         let mut config = self.base_config.clone();
         let profile = name.and_then(|n| config.agent_profile(n).cloned());
+        if let Some(name) = name
+            && profile.is_none()
+        {
+            tracing::warn!(
+                agent = name,
+                "agent profile not found; switching to the default harness prompt"
+            );
+        }
 
         if let Some(ref p) = profile {
             if let Some(provider) = p.resolve_provider() {
@@ -1456,8 +1485,13 @@ impl Supervisor {
             ));
         self.agent.approval.set_mode(self.config.permissions.mode);
 
-        // Store profile and rebuild system prompt.
+        // Store profile and rebuild system prompt. `active_agent_name` is
+        // assigned HERE, on the success path only: a failed switch above
+        // (e.g. `build_provider` error) must not persist the new name — the
+        // next resume would re-resolve it into an unbuildable provider and
+        // fail loudly on a session whose switch merely failed.
         self.agent_profile = profile;
+        self.active_agent_name = name.map(str::to_string);
         self.rebuild_system_prompt();
         self.rebuild_context_manager_sync();
         Ok(())

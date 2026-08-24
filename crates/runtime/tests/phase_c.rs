@@ -279,6 +279,7 @@ fn write_session_json(ws: &Path, session_id: &str, child_ids: Vec<String>) {
             session_summary: None,
             session_title: None,
             orchestration: None,
+            agent_name: None,
         },
         messages: vec![
             Message::user("persisted question"),
