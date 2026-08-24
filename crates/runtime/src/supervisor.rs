@@ -719,7 +719,7 @@ impl Supervisor {
             interactive_approvals,
             session_id: Some(session_id.into()),
             approval_handler,
-            orchestration_context: None,
+            orchestration_context: loaded.as_ref().and_then(|l| l.meta.orchestration.clone()),
             // Restore the persisted agent profile so the specialist persona
             // (prompt, provider/permission overrides, tool gating) survives
             // resume. Threaded through `create`'s pipeline — not a post-hoc
