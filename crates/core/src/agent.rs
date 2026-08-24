@@ -1,4 +1,3 @@
-use nca_common::config::SmartCompactionMode;
 use nca_common::event::{AgentEvent, BusyState};
 use nca_common::message::{ContentPart, ImageAttachment, Message, Role};
 use nca_common::tool::ToolDefinition;
@@ -31,8 +30,6 @@ pub struct AgentLoop {
     pub(crate) checkpoint_interval: u32,
     pub(crate) cancel_flag: Arc<AtomicBool>,
     pub(crate) hooks: Option<HookRunner>,
-    /// Opt-in provider-request smart compaction (canonical history always kept).
-    pub(crate) smart_compaction_mode: SmartCompactionMode,
     /// Start instant per pending tool call_id, for duration tracking.
     pub(crate) tool_start_times: HashMap<String, Instant>,
     /// Prompt-cache keepalive profile (per-provider economics).
@@ -81,7 +78,6 @@ impl AgentLoop {
             checkpoint_interval,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             hooks,
-            smart_compaction_mode: SmartCompactionMode::Off,
             tool_start_times: HashMap::new(),
             keepalive_profile: KeepaliveProfile::disabled(),
             repeat_guard: RepeatCallGuard::new(),
@@ -116,18 +112,20 @@ impl AgentLoop {
         self.middleware.push(middleware);
     }
 
+    /// Drain a composed [`crate::middleware::MiddlewareChain`] into this
+    /// agent's chain, outermost first (e.g.
+    /// `crate::middleware::default_chain`). Knob-bearing composition entry
+    /// point for the supervisor wiring.
+    pub fn extend_middleware(&mut self, chain: crate::middleware::MiddlewareChain) {
+        for middleware in chain.into_middlewares() {
+            self.middleware.push(middleware);
+        }
+    }
+
     /// Seed the turn-id counter (session resume: max `TurnStarted.turn_id`
     /// found in the event log) so ids stay session-unique across restarts.
     pub fn set_turn_seq_start(&mut self, n: u64) {
         self.turn_seq = n;
-    }
-
-    pub fn set_smart_compaction_mode(&mut self, mode: SmartCompactionMode) {
-        self.smart_compaction_mode = mode;
-    }
-
-    pub fn smart_compaction_mode(&self) -> SmartCompactionMode {
-        self.smart_compaction_mode
     }
 
     /// Set the prompt-cache keepalive profile (called by supervisor after

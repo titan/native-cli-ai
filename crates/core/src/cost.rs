@@ -30,17 +30,36 @@ impl CostTracker {
         self.cache_read_tokens as f64 / cached as f64
     }
 
-    /// Rough cost estimate in USD based on Claude Sonnet pricing.
+    /// Rough cost estimate in USD based on hard-coded Claude-Sonnet-class
+    /// rates (3.0/1M input, 15.0/1M output, 3.0/1M cache creation,
+    /// 3.0/50M cache read) — the single rate table in the codebase.
     ///
-    /// NOTE: `input_tokens` from OpenAI-compatible providers (DeepSeek,
-    /// OpenAI) includes cached tokens, so they are double-counted here (full
-    /// input rate + cache_read rate). A per-model pricing lookup would fix
-    /// this, but for now this is a rough estimate only.
-    pub fn estimated_cost_usd(&self) -> f64 {
-        let input_cost = self.input_tokens as f64 * 3.0 / 1_000_000.0;
-        let output_cost = self.output_tokens as f64 * 15.0 / 1_000_000.0;
-        let cache_creation_cost = self.cache_creation_tokens as f64 * 3.0 / 1_000_000.0;
-        let cache_read_cost = self.cache_read_tokens as f64 * 3.0 / (1_000_000.0 * 50.0);
+    /// Estimate-grade by construction: OpenAI-compatible `input_tokens`
+    /// (DeepSeek, OpenAI) includes cached tokens, so cache reads are
+    /// double-counted (full input rate + cache_read rate), and Sonnet rates
+    /// overstate actual spend roughly 10× for DeepSeek — the primary
+    /// provider. Adequate as a threshold, not an invoice.
+    pub fn estimated_cost_for(
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_creation_tokens: u64,
+        cache_read_tokens: u64,
+    ) -> f64 {
+        let input_cost = input_tokens as f64 * 3.0 / 1_000_000.0;
+        let output_cost = output_tokens as f64 * 15.0 / 1_000_000.0;
+        let cache_creation_cost = cache_creation_tokens as f64 * 3.0 / 1_000_000.0;
+        let cache_read_cost = cache_read_tokens as f64 * 3.0 / (1_000_000.0 * 50.0);
         input_cost + output_cost + cache_creation_cost + cache_read_cost
+    }
+
+    /// Session cost estimate in USD (delegates to the shared rate table,
+    /// [`CostTracker::estimated_cost_for`]). See that fn's caveats.
+    pub fn estimated_cost_usd(&self) -> f64 {
+        Self::estimated_cost_for(
+            self.input_tokens,
+            self.output_tokens,
+            self.cache_creation_tokens,
+            self.cache_read_tokens,
+        )
     }
 }

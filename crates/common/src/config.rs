@@ -15,6 +15,9 @@ pub struct NcaConfig {
     pub memory: MemoryConfig,
     pub hooks: HookConfig,
     pub web: WebConfig,
+    /// Step-request middleware knobs (`[middleware]`): retry, cost guard.
+    #[serde(default)]
+    pub middleware: MiddlewareConfig,
     /// CLI/TUI preferences (e.g. external editor).
     #[serde(default)]
     pub ui: UiConfig,
@@ -192,6 +195,9 @@ impl NcaConfig {
         }
         if let Some(ui) = partial.ui {
             self.ui.merge(ui);
+        }
+        if let Some(middleware) = partial.middleware {
+            self.middleware.merge(middleware);
         }
         if let Some(agents) = partial.agents {
             self.merge_agents(agents);
@@ -1697,6 +1703,50 @@ impl PermissionMode {
     }
 }
 
+/// Middleware chain configuration (`[middleware]` section). Order of the
+/// chain itself is code-fixed; this carries knobs only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MiddlewareConfig {
+    /// Max retries after a `RateLimited` rejection (0 disables the retry
+    /// middleware entirely).
+    pub retry_max_attempts: u32,
+    /// Upper bound on the server-provided retry-after wait, in
+    /// milliseconds. Forward-looking: production parsers hard-code
+    /// `retry_after_ms = 1000` today; the cap guards future header
+    /// parsing.
+    pub retry_delay_cap_ms: u64,
+    /// Session spend cap in USD. Estimated with hard-coded Sonnet-class
+    /// rates, which overstate actual spend for most providers — roughly
+    /// 10× for DeepSeek, the primary provider — and double-count cache
+    /// reads on OpenAI-compatible usage. Absent = no cost guard.
+    pub cost_budget_usd: Option<f64>,
+}
+
+impl Default for MiddlewareConfig {
+    fn default() -> Self {
+        Self {
+            retry_max_attempts: 2,
+            retry_delay_cap_ms: 30_000,
+            cost_budget_usd: None,
+        }
+    }
+}
+
+impl MiddlewareConfig {
+    fn merge(&mut self, partial: PartialMiddlewareConfig) {
+        if let Some(retry_max_attempts) = partial.retry_max_attempts {
+            self.retry_max_attempts = retry_max_attempts;
+        }
+        if let Some(retry_delay_cap_ms) = partial.retry_delay_cap_ms {
+            self.retry_delay_cap_ms = retry_delay_cap_ms;
+        }
+        if let Some(cost_budget_usd) = partial.cost_budget_usd {
+            self.cost_budget_usd = Some(cost_budget_usd);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
     pub history_dir: PathBuf,
@@ -2099,6 +2149,7 @@ struct PartialNcaConfig {
     hooks: Option<PartialHookConfig>,
     web: Option<PartialWebConfig>,
     ui: Option<PartialUiConfig>,
+    middleware: Option<PartialMiddlewareConfig>,
     agents: Option<BTreeMap<String, PartialAgentProfileConfig>>,
     extra_paths: Option<Vec<PathBuf>>,
 }
@@ -2252,6 +2303,13 @@ struct PartialSessionConfig {
     checkpoint_interval: Option<u32>,
     last_session_file: Option<PathBuf>,
     auto_compact_on_finish: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PartialMiddlewareConfig {
+    retry_max_attempts: Option<u32>,
+    retry_delay_cap_ms: Option<u64>,
+    cost_budget_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

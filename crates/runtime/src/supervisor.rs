@@ -30,7 +30,7 @@ use nca_core::approval::{ApprovalHandler, ApprovalPolicy, ApprovalVerdict};
 use nca_core::cache_keepalive;
 use nca_core::harness::build_system_prompt_with_agent;
 use nca_core::hooks::{HookEventKind, HookRunner};
-use nca_core::middleware::OverflowRecoveryMiddleware;
+use nca_core::middleware::default_chain;
 use nca_core::plugin::PluginRegistry;
 use nca_core::provider::ProviderError;
 use nca_core::provider::factory::build_provider;
@@ -584,13 +584,17 @@ impl Supervisor {
             &fs.mounted_paths(),
         );
         agent.set_system_prompt(system_prompt);
-        agent.set_smart_compaction_mode(config.memory.context.smart_compaction_mode);
         agent.set_keepalive_profile(cache_keepalive::resolve_profile(config.provider.default));
-        // P3 §6: overflow recovery middleware — view-level prune + retry at
-        // the `chat()` seam. Wired at the single construction site so parent,
-        // resumed, and subagent-child sessions all get it; `AgentLoop::new`
-        // default chain stays empty (P4 invariant).
-        agent.push_middleware(Arc::new(OverflowRecoveryMiddleware::default()));
+        // Middleware chain composition (roadmap initial order, knobs from
+        // `[middleware]`, compaction mode from `[memory.context]`):
+        // cost-guard → compaction → overflow-recovery → retry. Wired at the
+        // single construction site so parent, resumed, and subagent-child
+        // sessions all get it; `AgentLoop::new` default chain stays empty
+        // (P4 invariant).
+        agent.extend_middleware(default_chain(
+            &config.middleware,
+            config.memory.context.smart_compaction_mode,
+        ));
 
         let context_manager =
             Self::make_context_manager(&config, &config.model.default_model).await;

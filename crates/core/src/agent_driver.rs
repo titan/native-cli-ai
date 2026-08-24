@@ -9,7 +9,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nca_common::config::SmartCompactionMode;
 use nca_common::event::{AgentEvent, BusyState};
 use nca_common::message::{ImageAttachment, Message, MessageToolCall};
 use nca_common::tool::ToolCall;
@@ -17,7 +16,6 @@ use serde_json::json;
 
 use crate::agent::AgentLoop;
 use crate::cache_keepalive::{CacheKeepalive, KeepaliveSnapshot};
-use crate::context_view::plan_context_view;
 use crate::hooks::HookEventKind;
 use crate::middleware::{StepReply, StepRequest};
 use crate::provider::{ProviderError, StreamChunk};
@@ -296,48 +294,26 @@ impl<'a> TurnDriver<'a> {
         // messages". Persisted to `agent.messages` so resumed sessions stay valid.
         crate::agent::sanitize_tool_call_pairs(&mut agent.messages);
 
-        // Smart compaction builds a provider-only view; canonical history stays intact.
-        let request_messages = if agent.smart_compaction_mode.is_enabled() {
-            let plan = plan_context_view(&agent.messages, agent.smart_compaction_mode);
-            let report = &plan.report;
-            if report.tokens_after < report.tokens_before
-                || matches!(agent.smart_compaction_mode, SmartCompactionMode::DryRun)
-            {
-                let phase = match agent.smart_compaction_mode {
-                    SmartCompactionMode::DryRun => "dry_run",
-                    SmartCompactionMode::On => "completed",
-                    SmartCompactionMode::Off => "off",
-                };
-                agent
-                    .emit(AgentEvent::ContextCompaction {
-                        phase: phase.into(),
-                        message: report.summary_line(),
-                        tokens_before: Some(report.tokens_before),
-                        tokens_after: Some(report.tokens_after),
-                        retained_groups: Some(report.retained_groups),
-                        dropped_groups: Some(report.dropped_groups),
-                    })
-                    .await;
-            }
-            match agent.smart_compaction_mode {
-                SmartCompactionMode::On => plan.messages,
-                SmartCompactionMode::DryRun | SmartCompactionMode::Off => agent.messages.clone(),
-            }
-        } else {
-            agent.messages.clone()
+        // The chain owns request-view shaping now (CompactionMiddleware);
+        // the driver hands the canonical post-prepare/sanitize history.
+        let session_usage = crate::middleware::SessionUsage {
+            input_tokens: agent.cost_tracker.input_tokens,
+            output_tokens: agent.cost_tracker.output_tokens,
+            cache_creation_tokens: agent.cost_tracker.cache_creation_tokens,
+            cache_read_tokens: agent.cost_tracker.cache_read_tokens,
         };
-
         let reply = agent
             .middleware
             .call(
                 &agent.provider,
                 StepRequest {
-                    messages: request_messages,
+                    messages: agent.messages.clone(),
                     tools: agent.tool_definitions(),
                     model: agent.model.clone(),
                     workspace_root: self.workspace_root.to_path_buf(),
                     turn_id: self.turn_id,
                     step_index: self.step_index,
+                    session_usage,
                     event_tx: agent.event_tx.clone(),
                 },
             )

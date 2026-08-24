@@ -16,11 +16,40 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use nca_common::config::{MiddlewareConfig, SmartCompactionMode};
 use nca_common::event::AgentEvent;
 use nca_common::message::Message;
 use nca_common::tool::ToolDefinition;
 
 use crate::provider::{Provider, ProviderError, StreamChunk};
+
+/// Session usage accumulated so far (driver-materialized snapshot,
+/// re-built from the cost tracker for every `StepRequest` — zero
+/// staleness across steps, no shared mutable state in middlewares).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SessionUsage {
+    /// Cumulative input tokens billed this session.
+    pub input_tokens: u64,
+    /// Cumulative output tokens billed this session.
+    pub output_tokens: u64,
+    /// Cumulative cache-creation tokens billed this session.
+    pub cache_creation_tokens: u64,
+    /// Cumulative cache-read tokens billed this session.
+    pub cache_read_tokens: u64,
+}
+
+impl SessionUsage {
+    /// Estimated session cost via the shared rate table
+    /// ([`crate::cost::CostTracker::estimated_cost_for`]).
+    fn estimated_cost_usd(self) -> f64 {
+        crate::cost::CostTracker::estimated_cost_for(
+            self.input_tokens,
+            self.output_tokens,
+            self.cache_creation_tokens,
+            self.cache_read_tokens,
+        )
+    }
+}
 
 /// The canonical step request: everything the terminal provider call needs.
 #[derive(Clone, Debug)]
@@ -38,6 +67,9 @@ pub struct StepRequest {
     pub turn_id: u64,
     /// 1-based step index within the turn.
     pub step_index: u64,
+    /// Driver-materialized snapshot of session usage so far. Read-only for
+    /// middlewares (e.g. the cost guard); the driver re-fills it per step.
+    pub session_usage: SessionUsage,
     /// Informational-event handle. Middlewares MAY emit events, but MUST
     /// NOT emit `MessageRecorded` (projection is driver-owned; see design
     /// §4). Enforcement is convention-only (raw sender).
@@ -134,6 +166,17 @@ impl MiddlewareChain {
         self.middlewares.is_empty()
     }
 
+    /// Middleware names, outermost first (same order [`MiddlewareChain::into_middlewares`] drains).
+    pub fn names(&self) -> Vec<&str> {
+        self.middlewares.iter().map(|m| m.name()).collect()
+    }
+
+    /// Drain the chain into its middlewares, outermost first. Used by
+    /// [`crate::agent::AgentLoop::extend_middleware`] to compose chains.
+    pub fn into_middlewares(self) -> Vec<Arc<dyn AgentMiddleware>> {
+        self.middlewares
+    }
+
     /// Run `req` through the chain; index 0 is outermost. Empty chain =
     /// direct terminal call, observably identical to a bare `provider.chat`
     /// (same arguments at the same point in time; `model`/`workspace_root`
@@ -222,6 +265,183 @@ impl AgentMiddleware for OverflowRecoveryMiddleware {
             }
         }
     }
+}
+
+/// Routine smart-compaction middleware: owns the `SmartCompactionMode`
+/// that used to live on `AgentLoop`. Verbatim relocation of the driver's
+/// former inline block — gates on `mode.is_enabled()`, plans the context
+/// view, emits the legacy `ContextCompaction` event when a decrease is
+/// planned (or always in DryRun), and rewrites the request view only when
+/// the mode is `On`. Canonical history is never touched (view-only).
+pub struct CompactionMiddleware {
+    /// Compaction mode: `Off` = pass-through, `DryRun` = report-only,
+    /// `On` = send the pruned view.
+    mode: SmartCompactionMode,
+}
+
+impl CompactionMiddleware {
+    /// Create a compaction middleware for `mode`.
+    pub fn new(mode: SmartCompactionMode) -> Self {
+        Self { mode }
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentMiddleware for CompactionMiddleware {
+    fn name(&self) -> &str {
+        "compaction"
+    }
+
+    async fn call(&self, mut req: StepRequest, next: Next<'_>) -> Result<StepReply, ProviderError> {
+        if !self.mode.is_enabled() {
+            return next.run(req).await;
+        }
+        let plan = crate::context_view::plan_context_view(&req.messages, self.mode);
+        let report = &plan.report;
+        if report.tokens_after < report.tokens_before || self.mode == SmartCompactionMode::DryRun {
+            let phase = match self.mode {
+                SmartCompactionMode::DryRun => "dry_run",
+                SmartCompactionMode::On => "completed",
+                SmartCompactionMode::Off => "off",
+            };
+            let _ = req
+                .event_tx
+                .send(AgentEvent::ContextCompaction {
+                    phase: phase.into(),
+                    message: report.summary_line(),
+                    tokens_before: Some(report.tokens_before),
+                    tokens_after: Some(report.tokens_after),
+                    retained_groups: Some(report.retained_groups),
+                    dropped_groups: Some(report.dropped_groups),
+                })
+                .await;
+        }
+        if self.mode == SmartCompactionMode::On {
+            req.messages = plan.messages;
+        }
+        next.run(req).await
+    }
+}
+
+/// Retry middleware for transient provider failures. Classification is
+/// deliberately tight: **only [`ProviderError::RateLimited`]** — the variant
+/// is structurally unambiguous and carries `retry_after_ms`. On a match with
+/// attempts remaining it sleeps `min(retry_after_ms, delay_cap_ms)` via
+/// `tokio::time::sleep`, then re-runs the rest of the chain with the
+/// **unmodified** request (`Next` is `Clone`). Non-retryable errors and
+/// exhausted attempts pass the `Err` through unchanged.
+///
+/// Note: both compat parsers hard-code `retry_after_ms: 1000` today (no
+/// `Retry-After` header is parsed), so the production sleep is a fixed 1 s
+/// and the cap is forward-looking protection.
+pub struct RetryMiddleware {
+    /// Retries after the first attempt.
+    max_attempts: u32,
+    /// Upper bound on the per-retry sleep (server-provided value wins below it).
+    delay_cap_ms: u64,
+}
+
+impl RetryMiddleware {
+    /// Create a retry middleware: at most `max_attempts` retries after the
+    /// first attempt, each waiting at most `delay_cap_ms`.
+    pub fn new(max_attempts: u32, delay_cap_ms: u64) -> Self {
+        Self {
+            max_attempts,
+            delay_cap_ms,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentMiddleware for RetryMiddleware {
+    fn name(&self) -> &str {
+        "retry"
+    }
+
+    async fn call(&self, req: StepRequest, next: Next<'_>) -> Result<StepReply, ProviderError> {
+        let mut attempt: u32 = 0;
+        loop {
+            match next.clone().run(req.clone()).await {
+                Ok(reply) => return Ok(reply),
+                Err(ProviderError::RateLimited { retry_after_ms })
+                    if attempt < self.max_attempts =>
+                {
+                    let delay = retry_after_ms.min(self.delay_cap_ms);
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+/// Session spend cap: fails the step loudly (as an `Err`, never a
+/// short-circuit `FinalText`) when the estimated session cost reaches the
+/// budget, BEFORE the provider is called — zero provider calls after the
+/// trip. The estimate uses the shared Sonnet-class rate table and is
+/// therefore conservative; the error text carries the caveat.
+pub struct CostGuardMiddleware {
+    /// Budget in USD (estimate-grade comparison: `>=` trips).
+    budget_usd: f64,
+}
+
+impl CostGuardMiddleware {
+    /// Create a cost guard that trips at `budget_usd` of estimated spend.
+    pub fn new(budget_usd: f64) -> Self {
+        Self { budget_usd }
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentMiddleware for CostGuardMiddleware {
+    fn name(&self) -> &str {
+        "cost-guard"
+    }
+
+    async fn call(&self, req: StepRequest, next: Next<'_>) -> Result<StepReply, ProviderError> {
+        let estimated = req.session_usage.estimated_cost_usd();
+        if estimated >= self.budget_usd {
+            return Err(ProviderError::Other(format!(
+                "estimated session cost budget exhausted: ${estimated:.4} >= ${:.4} \
+                 (Sonnet-class rate estimate; actual spend may be lower, e.g. ~10× \
+                 for DeepSeek; config: [middleware] cost_budget_usd)",
+                self.budget_usd
+            )));
+        }
+        next.run(req).await
+    }
+}
+
+/// Compose the roadmap's initial chain (fixed order, knob-bearing
+/// middlewares conditional on config): cost-guard → compaction →
+/// overflow-recovery → retry (innermost, wraps `chat()` directly).
+///
+/// The order is load-bearing (P3's nesting contract: recovery goes
+/// innermost-of-policy / outermost-of-retry) — recovery is *policy* (it
+/// changes what is sent), retry is *mechanism* (it re-sends the same thing
+/// after a wait), so each prune rung gets rate-limit protection for free
+/// while a rate-limit retry preserves prune state. `cost-guard` is pushed
+/// only when `cost_budget_usd = Some(_)`; `retry` only when
+/// `retry_max_attempts > 0`; compaction and overflow-recovery always
+/// (Off = pass-through).
+pub fn default_chain(
+    cfg: &MiddlewareConfig,
+    compaction_mode: SmartCompactionMode,
+) -> MiddlewareChain {
+    let mut chain = MiddlewareChain::new();
+    if let Some(budget) = cfg.cost_budget_usd {
+        chain.push(Arc::new(CostGuardMiddleware::new(budget)));
+    }
+    chain.push(Arc::new(CompactionMiddleware::new(compaction_mode)));
+    chain.push(Arc::new(OverflowRecoveryMiddleware::default()));
+    if cfg.retry_max_attempts > 0 {
+        chain.push(Arc::new(RetryMiddleware::new(
+            cfg.retry_max_attempts,
+            cfg.retry_delay_cap_ms,
+        )));
+    }
+    chain
 }
 
 #[cfg(test)]
@@ -402,6 +622,7 @@ mod tests {
             workspace_root: PathBuf::from("/tmp/nca-p4-test"),
             turn_id: 1,
             step_index: 1,
+            session_usage: SessionUsage::default(),
             event_tx,
         }
     }
@@ -672,6 +893,7 @@ mod tests {
             workspace_root: PathBuf::from("/tmp/nca-p3-test"),
             turn_id: 1,
             step_index: 1,
+            session_usage: SessionUsage::default(),
             event_tx,
         };
 
@@ -738,6 +960,7 @@ mod tests {
             workspace_root: PathBuf::from("/tmp/nca-p3-test"),
             turn_id: 1,
             step_index: 1,
+            session_usage: SessionUsage::default(),
             event_tx,
         };
 
@@ -784,6 +1007,7 @@ mod tests {
             workspace_root: PathBuf::from("/tmp/nca-p3-test"),
             turn_id: 1,
             step_index: 1,
+            session_usage: SessionUsage::default(),
             event_tx,
         };
 
@@ -795,6 +1019,412 @@ mod tests {
         assert!(
             event_rx.try_recv().is_err(),
             "non-overflow errors must not emit events"
+        );
+    }
+
+    // --- Middleware chain composition: Compaction (K1-K3), Retry (R1-R4),
+    // CostGuard (G1-G4) ---
+
+    use nca_common::config::{MiddlewareConfig, SmartCompactionMode};
+
+    fn mw_req(messages: Vec<Message>, session_usage: SessionUsage) -> StepRequest {
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(16);
+        StepRequest {
+            messages,
+            tools: vec![],
+            model: "test-model".into(),
+            workspace_root: PathBuf::from("/tmp/nca-mw-test"),
+            turn_id: 1,
+            step_index: 1,
+            session_usage,
+            event_tx,
+        }
+    }
+
+    // K1 — compaction On + compactible history: provider sees the pruned
+    // view; ContextCompaction{phase:"completed"} fires; canonical untouched.
+    #[tokio::test]
+    async fn k1_compaction_on_prunes_view_and_emits_completed() {
+        let provider = Arc::new(RecordingProvider::new());
+        let dyn_provider: Arc<dyn Provider> = provider.clone();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut chain = MiddlewareChain::new();
+        chain.push(Arc::new(Recorder {
+            name: "outer",
+            log: Arc::clone(&log),
+        }));
+        chain.push(Arc::new(CompactionMiddleware::new(SmartCompactionMode::On)));
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        // Compactible material: a big tool output that crosses the
+        // compaction threshold (mirrors the c7 DryRun fixture).
+        let big_output = "x".repeat(2_000);
+        let mut fixture = vec![Message::system("sys")];
+        fixture.push(Message::assistant_with_tool_calls(
+            "",
+            vec![read_call("c1")],
+        ));
+        fixture.push(Message::tool("c1", &big_output));
+        for i in 0..10 {
+            fixture.push(Message::user(format!("u{i}")));
+            fixture.push(Message::assistant(format!("a{i}")));
+        }
+        let request = StepRequest {
+            messages: fixture.clone(),
+            tools: vec![],
+            model: "test-model".into(),
+            workspace_root: PathBuf::from("/tmp/nca-mw-test"),
+            turn_id: 1,
+            step_index: 1,
+            session_usage: SessionUsage::default(),
+            event_tx,
+        };
+
+        chain
+            .call(&dyn_provider, request)
+            .await
+            .expect("compaction chain must succeed");
+
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            !calls[0].0.iter().any(|t| t.contains(&big_output)),
+            "provider must see the pruned view: {:?}",
+            calls[0].0
+        );
+        // Canonical (outer) messages untouched.
+        let log = log.lock().unwrap();
+        assert_eq!(log[0].messages.len(), fixture.len());
+
+        let mut saw_completed = false;
+        while let Ok(ev) = event_rx.try_recv() {
+            if let AgentEvent::ContextCompaction { phase, .. } = ev {
+                assert_eq!(phase, "completed");
+                saw_completed = true;
+            }
+        }
+        assert!(saw_completed, "ContextCompaction(phase=completed) emitted");
+    }
+
+    // K2 — compaction Off: provider sees canonical, zero events.
+    #[tokio::test]
+    async fn k2_compaction_off_passes_canonical_with_zero_events() {
+        let provider = Arc::new(RecordingProvider::new());
+        let dyn_provider: Arc<dyn Provider> = provider.clone();
+        let mut chain = MiddlewareChain::new();
+        chain.push(Arc::new(CompactionMiddleware::new(
+            SmartCompactionMode::Off,
+        )));
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let fixture = overflow_fixture();
+        let request = StepRequest {
+            messages: fixture,
+            tools: vec![],
+            model: "test-model".into(),
+            workspace_root: PathBuf::from("/tmp/nca-mw-test"),
+            turn_id: 1,
+            step_index: 1,
+            session_usage: SessionUsage::default(),
+            event_tx,
+        };
+
+        chain
+            .call(&dyn_provider, request)
+            .await
+            .expect("off chain must succeed");
+
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0].0.iter().any(|t| t.contains("read output")),
+            "provider must see the canonical history"
+        );
+        assert!(event_rx.try_recv().is_err(), "zero events when Off");
+    }
+
+    // K3 — compaction DryRun: provider sees canonical, event phase "dry_run".
+    #[tokio::test]
+    async fn k3_compaction_dry_run_reports_without_pruning() {
+        let provider = Arc::new(RecordingProvider::new());
+        let dyn_provider: Arc<dyn Provider> = provider.clone();
+        let mut chain = MiddlewareChain::new();
+        chain.push(Arc::new(CompactionMiddleware::new(
+            SmartCompactionMode::DryRun,
+        )));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+        let request = StepRequest {
+            messages: overflow_fixture(),
+            tools: vec![],
+            model: "test-model".into(),
+            workspace_root: PathBuf::from("/tmp/nca-mw-test"),
+            turn_id: 1,
+            step_index: 1,
+            session_usage: SessionUsage::default(),
+            event_tx: tx,
+        };
+        chain
+            .call(&dyn_provider, request)
+            .await
+            .expect("dry-run chain must succeed");
+
+        let calls = provider.calls.lock().unwrap();
+        assert!(
+            calls[0].0.iter().any(|t| t.contains("read output")),
+            "DryRun must send the canonical view"
+        );
+        let mut saw_dry_run = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let AgentEvent::ContextCompaction { phase, .. } = ev {
+                assert_eq!(phase, "dry_run");
+                saw_dry_run = true;
+            }
+        }
+        assert!(saw_dry_run, "ContextCompaction(phase=dry_run) emitted");
+    }
+
+    /// Scripted rate-limit provider: fails the first `fail_calls` calls with
+    /// `RateLimited { retry_after_ms }`, then succeeds. Records message texts.
+    struct RateLimitThenOkProvider {
+        calls: Mutex<Vec<Vec<String>>>,
+        fail_calls: usize,
+        retry_after_ms: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for RateLimitThenOkProvider {
+        async fn chat(
+            &self,
+            messages: &[Message],
+            _tools: &[ToolDefinition],
+            _model: &str,
+            _workspace_root: &Path,
+        ) -> Result<tokio::sync::mpsc::Receiver<StreamChunk>, ProviderError> {
+            self.calls.lock().unwrap().push(
+                messages
+                    .iter()
+                    .map(|m| m.content.to_summary_text())
+                    .collect(),
+            );
+            if self.calls.lock().unwrap().len() <= self.fail_calls {
+                return Err(ProviderError::RateLimited {
+                    retry_after_ms: self.retry_after_ms,
+                });
+            }
+            Ok(text_stream())
+        }
+    }
+
+    // R1 — RateLimited once → retry succeeds: 2 provider calls, identical request.
+    #[tokio::test]
+    async fn r1_rate_limited_once_retries_with_identical_request() {
+        let provider = Arc::new(RateLimitThenOkProvider {
+            calls: Mutex::new(Vec::new()),
+            fail_calls: 1,
+            retry_after_ms: 1,
+        });
+        let dyn_provider: Arc<dyn Provider> = provider.clone();
+        let mut chain = MiddlewareChain::new();
+        chain.push(Arc::new(RetryMiddleware::new(2, 1_000)));
+
+        let reply = chain
+            .call(
+                &dyn_provider,
+                mw_req(vec![Message::user("go")], SessionUsage::default()),
+            )
+            .await
+            .expect("retry must succeed");
+        assert!(matches!(reply, StepReply::Stream(_)));
+
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "exactly two provider calls");
+        assert_eq!(calls[0], calls[1], "request must be re-sent unmodified");
+    }
+
+    // R2 — non-retryable error: single attempt, Err unchanged.
+    #[tokio::test]
+    async fn r2_non_retryable_error_single_attempt_unchanged() {
+        struct AlwaysAuthFail;
+        #[async_trait::async_trait]
+        impl Provider for AlwaysAuthFail {
+            async fn chat(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolDefinition],
+                _model: &str,
+                _workspace_root: &Path,
+            ) -> Result<tokio::sync::mpsc::Receiver<StreamChunk>, ProviderError> {
+                Err(ProviderError::AuthError("invalid api key".into()))
+            }
+        }
+        let dyn_provider: Arc<dyn Provider> = Arc::new(AlwaysAuthFail);
+        let mut chain = MiddlewareChain::new();
+        chain.push(Arc::new(RetryMiddleware::new(3, 1_000)));
+
+        let err = chain
+            .call(
+                &dyn_provider,
+                mw_req(vec![Message::user("go")], SessionUsage::default()),
+            )
+            .await
+            .expect_err("auth error must not be retried");
+        assert!(matches!(err, ProviderError::AuthError(_)));
+    }
+
+    // R3 — attempts exhausted: Err after 1 + max_attempts calls.
+    #[tokio::test]
+    async fn r3_attempts_exhausted_errors_after_bound() {
+        let provider = Arc::new(RateLimitThenOkProvider {
+            calls: Mutex::new(Vec::new()),
+            fail_calls: usize::MAX,
+            retry_after_ms: 1,
+        });
+        let dyn_provider: Arc<dyn Provider> = provider.clone();
+        let mut chain = MiddlewareChain::new();
+        chain.push(Arc::new(RetryMiddleware::new(2, 1_000)));
+
+        let err = chain
+            .call(
+                &dyn_provider,
+                mw_req(vec![Message::user("go")], SessionUsage::default()),
+            )
+            .await
+            .expect_err("persistent rate limit must surface");
+        assert!(matches!(err, ProviderError::RateLimited { .. }));
+        assert_eq!(
+            provider.calls.lock().unwrap().len(),
+            3,
+            "1 initial + 2 retries"
+        );
+    }
+
+    // R4 — retry-after respected but capped: server says 10 min, cap 50 ms →
+    // elapsed ≪ 600 s (test-only scenario; parsers hard-code 1000 ms today).
+    #[tokio::test]
+    async fn r4_retry_after_capped_by_delay_cap() {
+        let provider = Arc::new(RateLimitThenOkProvider {
+            calls: Mutex::new(Vec::new()),
+            fail_calls: 1,
+            retry_after_ms: 600_000,
+        });
+        let dyn_provider: Arc<dyn Provider> = provider.clone();
+        let mut chain = MiddlewareChain::new();
+        chain.push(Arc::new(RetryMiddleware::new(1, 50)));
+
+        let start = std::time::Instant::now();
+        chain
+            .call(
+                &dyn_provider,
+                mw_req(vec![Message::user("go")], SessionUsage::default()),
+            )
+            .await
+            .expect("capped retry must succeed");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "cap must bound the sleep: {:?}",
+            start.elapsed()
+        );
+        assert_eq!(provider.calls.lock().unwrap().len(), 2);
+    }
+
+    // G1 — usage snapshot over budget: Err naming the budget, provider never called.
+    #[tokio::test]
+    async fn g1_over_budget_trips_before_provider_call() {
+        let provider = Arc::new(RecordingProvider::new());
+        let dyn_provider: Arc<dyn Provider> = provider.clone();
+        let mut chain = MiddlewareChain::new();
+        chain.push(Arc::new(CostGuardMiddleware::new(1.0)));
+
+        let usage = SessionUsage {
+            input_tokens: 1_000_000, // 3.0 USD at Sonnet-class rates
+            ..Default::default()
+        };
+        let err = chain
+            .call(&dyn_provider, mw_req(vec![Message::user("go")], usage))
+            .await
+            .expect_err("budget must trip");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("estimated session cost budget exhausted"),
+            "error must name the budget: {msg}"
+        );
+        assert!(
+            msg.contains("cost_budget_usd"),
+            "must point at config: {msg}"
+        );
+        assert!(msg.contains("~10×"), "must carry the caveat: {msg}");
+        assert!(
+            provider.calls.lock().unwrap().is_empty(),
+            "provider must never be called after the trip"
+        );
+    }
+
+    // G2 — under budget: pass-through, provider called once, request untouched.
+    #[tokio::test]
+    async fn g2_under_budget_passes_through_untouched() {
+        let provider = Arc::new(RecordingProvider::new());
+        let dyn_provider: Arc<dyn Provider> = provider.clone();
+        let mut chain = MiddlewareChain::new();
+        chain.push(Arc::new(CostGuardMiddleware::new(100.0)));
+
+        let usage = SessionUsage {
+            input_tokens: 1_000, // ~0.003 USD
+            ..Default::default()
+        };
+        chain
+            .call(&dyn_provider, mw_req(vec![Message::user("hi")], usage))
+            .await
+            .expect("under budget must pass through");
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, vec!["hi".to_string()]);
+    }
+
+    // G3 — default_chain composition and knob gating.
+    #[test]
+    fn g3_default_chain_composition_and_gating() {
+        let all_on = MiddlewareConfig {
+            retry_max_attempts: 2,
+            retry_delay_cap_ms: 30_000,
+            cost_budget_usd: Some(5.0),
+        };
+        assert_eq!(
+            default_chain(&all_on, SmartCompactionMode::On).names(),
+            vec!["cost-guard", "compaction", "overflow-recovery", "retry"]
+        );
+
+        let all_off = MiddlewareConfig {
+            retry_max_attempts: 0,
+            retry_delay_cap_ms: 30_000,
+            cost_budget_usd: None,
+        };
+        assert_eq!(
+            default_chain(&all_off, SmartCompactionMode::Off).names(),
+            vec!["compaction", "overflow-recovery"],
+            "guard and retry absent when disabled"
+        );
+    }
+
+    // G4 — shared rate table: estimated_cost_for == estimated_cost_usd.
+    #[test]
+    fn g4_shared_rate_table_matches_tracker() {
+        let usage = SessionUsage {
+            input_tokens: 123_456,
+            output_tokens: 7_890,
+            cache_creation_tokens: 1_024,
+            cache_read_tokens: 99_999,
+        };
+        let mut tracker = crate::cost::CostTracker::default();
+        tracker.add(
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cache_creation_tokens,
+            usage.cache_read_tokens,
+        );
+        assert_eq!(
+            SessionUsage::estimated_cost_usd(usage),
+            tracker.estimated_cost_usd()
         );
     }
 }

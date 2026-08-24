@@ -19,7 +19,7 @@ use nca_common::message::{Message, MessageToolCall};
 use nca_common::tool::ToolDefinition;
 use nca_core::agent::AgentLoop;
 use nca_core::approval::ApprovalPolicy;
-use nca_core::middleware::OverflowRecoveryMiddleware;
+use nca_core::middleware::{CompactionMiddleware, OverflowRecoveryMiddleware};
 use nca_core::provider::{Provider, ProviderError, StreamChunk};
 use nca_core::tools::ToolRegistry;
 use serde_json::json;
@@ -373,7 +373,9 @@ async fn c7_dry_run_reports_decrease_and_provider_gets_uncompacted_view() {
         agent.messages.push(Message::user(format!("u{i}")));
         agent.messages.push(Message::assistant(format!("a{i}")));
     }
-    agent.set_smart_compaction_mode(SmartCompactionMode::DryRun);
+    agent.push_middleware(Arc::new(CompactionMiddleware::new(
+        SmartCompactionMode::DryRun,
+    )));
 
     let result = agent
         .run_turn("final", Path::new("."), &[])
