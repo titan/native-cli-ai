@@ -1027,18 +1027,24 @@ mod tests {
 
     use nca_common::config::{MiddlewareConfig, SmartCompactionMode};
 
-    fn mw_req(messages: Vec<Message>, session_usage: SessionUsage) -> StepRequest {
-        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(16);
-        StepRequest {
-            messages,
-            tools: vec![],
-            model: "test-model".into(),
-            workspace_root: PathBuf::from("/tmp/nca-mw-test"),
-            turn_id: 1,
-            step_index: 1,
-            session_usage,
-            event_tx,
-        }
+    fn mw_req(
+        messages: Vec<Message>,
+        session_usage: SessionUsage,
+    ) -> (StepRequest, tokio::sync::mpsc::Receiver<AgentEvent>) {
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        (
+            StepRequest {
+                messages,
+                tools: vec![],
+                model: "test-model".into(),
+                workspace_root: PathBuf::from("/tmp/nca-mw-test"),
+                turn_id: 1,
+                step_index: 1,
+                session_usage,
+                event_tx,
+            },
+            event_rx,
+        )
     }
 
     // K1 — compaction On + compactible history: provider sees the pruned
@@ -1055,7 +1061,6 @@ mod tests {
         }));
         chain.push(Arc::new(CompactionMiddleware::new(SmartCompactionMode::On)));
 
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
         // Compactible material: a big tool output that crosses the
         // compaction threshold (mirrors the c7 DryRun fixture).
         let big_output = "x".repeat(2_000);
@@ -1069,16 +1074,7 @@ mod tests {
             fixture.push(Message::user(format!("u{i}")));
             fixture.push(Message::assistant(format!("a{i}")));
         }
-        let request = StepRequest {
-            messages: fixture.clone(),
-            tools: vec![],
-            model: "test-model".into(),
-            workspace_root: PathBuf::from("/tmp/nca-mw-test"),
-            turn_id: 1,
-            step_index: 1,
-            session_usage: SessionUsage::default(),
-            event_tx,
-        };
+        let (request, mut event_rx) = mw_req(fixture.clone(), SessionUsage::default());
 
         chain
             .call(&dyn_provider, request)
@@ -1116,18 +1112,7 @@ mod tests {
             SmartCompactionMode::Off,
         )));
 
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
-        let fixture = overflow_fixture();
-        let request = StepRequest {
-            messages: fixture,
-            tools: vec![],
-            model: "test-model".into(),
-            workspace_root: PathBuf::from("/tmp/nca-mw-test"),
-            turn_id: 1,
-            step_index: 1,
-            session_usage: SessionUsage::default(),
-            event_tx,
-        };
+        let (request, mut event_rx) = mw_req(overflow_fixture(), SessionUsage::default());
 
         chain
             .call(&dyn_provider, request)
@@ -1153,17 +1138,7 @@ mod tests {
             SmartCompactionMode::DryRun,
         )));
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
-        let request = StepRequest {
-            messages: overflow_fixture(),
-            tools: vec![],
-            model: "test-model".into(),
-            workspace_root: PathBuf::from("/tmp/nca-mw-test"),
-            turn_id: 1,
-            step_index: 1,
-            session_usage: SessionUsage::default(),
-            event_tx: tx,
-        };
+        let (request, mut rx) = mw_req(overflow_fixture(), SessionUsage::default());
         chain
             .call(&dyn_provider, request)
             .await
@@ -1228,11 +1203,9 @@ mod tests {
         let mut chain = MiddlewareChain::new();
         chain.push(Arc::new(RetryMiddleware::new(2, 1_000)));
 
+        let (request, _event_rx) = mw_req(vec![Message::user("go")], SessionUsage::default());
         let reply = chain
-            .call(
-                &dyn_provider,
-                mw_req(vec![Message::user("go")], SessionUsage::default()),
-            )
+            .call(&dyn_provider, request)
             .await
             .expect("retry must succeed");
         assert!(matches!(reply, StepReply::Stream(_)));
@@ -1262,11 +1235,9 @@ mod tests {
         let mut chain = MiddlewareChain::new();
         chain.push(Arc::new(RetryMiddleware::new(3, 1_000)));
 
+        let (request, _event_rx) = mw_req(vec![Message::user("go")], SessionUsage::default());
         let err = chain
-            .call(
-                &dyn_provider,
-                mw_req(vec![Message::user("go")], SessionUsage::default()),
-            )
+            .call(&dyn_provider, request)
             .await
             .expect_err("auth error must not be retried");
         assert!(matches!(err, ProviderError::AuthError(_)));
@@ -1284,11 +1255,9 @@ mod tests {
         let mut chain = MiddlewareChain::new();
         chain.push(Arc::new(RetryMiddleware::new(2, 1_000)));
 
+        let (request, _event_rx) = mw_req(vec![Message::user("go")], SessionUsage::default());
         let err = chain
-            .call(
-                &dyn_provider,
-                mw_req(vec![Message::user("go")], SessionUsage::default()),
-            )
+            .call(&dyn_provider, request)
             .await
             .expect_err("persistent rate limit must surface");
         assert!(matches!(err, ProviderError::RateLimited { .. }));
@@ -1312,12 +1281,10 @@ mod tests {
         let mut chain = MiddlewareChain::new();
         chain.push(Arc::new(RetryMiddleware::new(1, 50)));
 
+        let (request, _event_rx) = mw_req(vec![Message::user("go")], SessionUsage::default());
         let start = std::time::Instant::now();
         chain
-            .call(
-                &dyn_provider,
-                mw_req(vec![Message::user("go")], SessionUsage::default()),
-            )
+            .call(&dyn_provider, request)
             .await
             .expect("capped retry must succeed");
         assert!(
@@ -1340,8 +1307,9 @@ mod tests {
             input_tokens: 1_000_000, // 3.0 USD at Sonnet-class rates
             ..Default::default()
         };
+        let (request, _event_rx) = mw_req(vec![Message::user("go")], usage);
         let err = chain
-            .call(&dyn_provider, mw_req(vec![Message::user("go")], usage))
+            .call(&dyn_provider, request)
             .await
             .expect_err("budget must trip");
         let msg = err.to_string();
@@ -1372,8 +1340,9 @@ mod tests {
             input_tokens: 1_000, // ~0.003 USD
             ..Default::default()
         };
+        let (request, _event_rx) = mw_req(vec![Message::user("hi")], usage);
         chain
-            .call(&dyn_provider, mw_req(vec![Message::user("hi")], usage))
+            .call(&dyn_provider, request)
             .await
             .expect("under budget must pass through");
         let calls = provider.calls.lock().unwrap();
