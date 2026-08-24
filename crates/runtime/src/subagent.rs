@@ -113,6 +113,7 @@ pub async fn spawn_child_session(
         approval_handler: Some(Arc::new(AutoDenyHandler) as Arc<dyn ApprovalHandler>),
         orchestration_context: None,
         agent_name: cfg.specialist.clone(),
+        provider: None,
     })
     .await
     .map_err(|e| e.to_string())?;

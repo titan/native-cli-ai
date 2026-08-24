@@ -71,6 +71,7 @@ async fn create_sup(ws: &Path, session_id: &str) -> Supervisor {
         approval_handler: None,
         orchestration_context: None,
         agent_name: None,
+        provider: None,
     })
     .await
     .expect("supervisor create must succeed with the offline config")
@@ -329,7 +330,7 @@ async fn t24_resume_folds_child_lineage_crashed_parent() {
     write_session_json(ws.path(), sid, Vec::new());
     write_spawn_log(ws.path(), sid, &["child-1", "child-2"]);
 
-    let sup = Supervisor::resume(offline_config(), ws.path(), true, false, sid, None)
+    let sup = Supervisor::resume(offline_config(), ws.path(), true, false, sid, None, None)
         .await
         .expect("resume must succeed with a stale json + spawned events in the log");
 
@@ -361,7 +362,7 @@ async fn t24_resume_folds_child_lineage_union_deduped() {
     write_session_json(ws.path(), sid, vec!["a".to_string()]);
     write_spawn_log(ws.path(), sid, &["a", "b"]);
 
-    let sup = Supervisor::resume(offline_config(), ws.path(), true, false, sid, None)
+    let sup = Supervisor::resume(offline_config(), ws.path(), true, false, sid, None, None)
         .await
         .expect("resume must succeed");
     assert_eq!(
@@ -631,7 +632,7 @@ async fn t28_switch_round_trip_replaces_history_without_duplication() {
     drain_fanout(sup_b, fanout_b).await;
 
     // Round-trip A → B → A via resume (the core of runner.rs `switch_to`).
-    let sup_a2 = Supervisor::resume(offline_config(), ws.path(), true, false, sid_a, None)
+    let sup_a2 = Supervisor::resume(offline_config(), ws.path(), true, false, sid_a, None, None)
         .await
         .expect("resume A");
     assert_eq!(
@@ -677,7 +678,7 @@ async fn t28_switch_round_trip_replaces_history_without_duplication() {
         "a-second appears exactly once after resume"
     );
 
-    let sup_b2 = Supervisor::resume(offline_config(), ws.path(), true, false, sid_b, None)
+    let sup_b2 = Supervisor::resume(offline_config(), ws.path(), true, false, sid_b, None, None)
         .await
         .expect("resume B");
     assert_eq!(
@@ -695,7 +696,7 @@ async fn t28_switch_round_trip_replaces_history_without_duplication() {
 
     // Second resume of A after B has been in play: still exact, no
     // accumulation across switches.
-    let sup_a3 = Supervisor::resume(offline_config(), ws.path(), true, false, sid_a, None)
+    let sup_a3 = Supervisor::resume(offline_config(), ws.path(), true, false, sid_a, None, None)
         .await
         .expect("resume A again");
     assert_eq!(

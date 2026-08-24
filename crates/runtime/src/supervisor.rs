@@ -32,6 +32,7 @@ use nca_core::harness::build_system_prompt_with_agent;
 use nca_core::hooks::{HookEventKind, HookRunner};
 use nca_core::middleware::default_chain;
 use nca_core::plugin::PluginRegistry;
+use nca_core::provider::Provider;
 use nca_core::provider::ProviderError;
 use nca_core::provider::factory::build_provider;
 use nca_core::skills::SkillCatalog;
@@ -114,6 +115,12 @@ pub struct SupervisorConfig {
     /// profile is loaded and its provider/model/permission/tool overrides are
     /// applied to this session.
     pub agent_name: Option<String>,
+    /// Optional pre-built provider. When `Some`, `create` uses it verbatim and
+    /// skips `build_provider` entirely (test seam — production passes `None`).
+    ///
+    /// Construction-only: `apply_agent_profile` and `apply_nca_config` rebuild
+    /// the provider from config and discard any injected provider.
+    pub provider: Option<Arc<dyn Provider>>,
 }
 
 /// A handle returned to callers for interacting with a running supervisor.
@@ -377,6 +384,19 @@ fn persist_mounted_paths(workspace_root: &Path, paths: Vec<PathBuf>) {
     }));
 }
 
+/// Resolve the session's provider: an injected provider wins verbatim, else
+/// build from config. `create` uses this so tests can supply a mock `Provider`
+/// and skip `build_provider` entirely.
+fn resolve_provider(
+    injected: Option<Arc<dyn Provider>>,
+    config: &NcaConfig,
+) -> Result<Arc<dyn Provider>, ProviderError> {
+    match injected {
+        Some(provider) => Ok(provider),
+        None => build_provider(config),
+    }
+}
+
 impl Supervisor {
     /// Create a new supervised session. This sets up the agent loop, IPC server,
     /// event channels, and persists initial session metadata.
@@ -422,7 +442,7 @@ impl Supervisor {
             }
         }
 
-        let provider = build_provider(&config)?;
+        let provider = resolve_provider(cfg.provider, &config)?;
         let fs: Arc<dyn WorkspaceFs> = Arc::new(RealFs::new(workspace_root.clone()));
         let fs_for_supervisor = fs.clone();
         // Restore mounts persisted in the workspace-local config. A missing or
@@ -662,6 +682,7 @@ impl Supervisor {
         interactive_approvals: bool,
         session_id: &str,
         approval_handler: Option<Arc<dyn ApprovalHandler>>,
+        provider: Option<Arc<dyn Provider>>,
     ) -> Result<Self, ProviderError> {
         // Load the original session state BEFORE create() overwrites the file.
         // create() calls save() with an empty message list, which would destroy
@@ -685,6 +706,7 @@ impl Supervisor {
             approval_handler,
             orchestration_context: None,
             agent_name: None,
+            provider,
         })
         .await?;
 
@@ -1401,6 +1423,7 @@ impl Supervisor {
     /// provider, model, and permission overrides are applied.
     ///
     /// This rebuilds the LLM provider if the profile changes provider/model.
+    /// An injected test provider (via `SupervisorConfig::provider`) is discarded here.
     pub fn apply_agent_profile(&mut self, name: Option<&str>) -> Result<(), ProviderError> {
         // Start from the clean base config (before any agent overrides).
         let mut config = self.base_config.clone();
@@ -1481,6 +1504,7 @@ impl Supervisor {
     }
 
     /// Apply a new [`NcaConfig`] and rebuild the active LLM provider (in-session provider switch).
+    /// An injected test provider (via `SupervisorConfig::provider`) is discarded here.
     pub fn apply_nca_config(&mut self, config: NcaConfig) -> Result<(), ProviderError> {
         let provider = build_provider(&config)?;
         self.base_config = config.clone();
@@ -2229,5 +2253,48 @@ mod tests {
             profile.system_prompt.as_deref(),
             Some("User-defined oracle.")
         );
+    }
+
+    struct StubProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for StubProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[nca_common::tool::ToolDefinition],
+            _model: &str,
+            _workspace_root: &Path,
+        ) -> Result<tokio::sync::mpsc::Receiver<nca_core::provider::StreamChunk>, ProviderError>
+        {
+            unreachable!("resolve_provider does not call chat")
+        }
+    }
+
+    #[test]
+    fn resolve_provider_uses_injected_verbatim_else_builds() {
+        // (a) injected provider is returned verbatim — `build_provider` skipped.
+        let mock: Arc<dyn Provider> = Arc::new(StubProvider);
+        let injected = match resolve_provider(Some(mock.clone()), &NcaConfig::default()) {
+            Ok(p) => p,
+            Err(e) => panic!("injected provider should be used verbatim, got: {e}"),
+        };
+        assert!(Arc::ptr_eq(&injected, &mock));
+
+        // (b) no injection → builds from config (DeepSeek default needs a key).
+        let mut with_key = NcaConfig::default();
+        with_key.provider.deepseek.api_key = Some("test-key".into());
+        assert!(resolve_provider(None, &with_key).is_ok());
+
+        // (c) no injection + keyless config → loud configuration error.
+        // DeepSeek (the default) validates its key lazily at request time, so
+        // use OpenAI here — its `from_config` fails loudly on a missing key.
+        let mut keyless = NcaConfig::default();
+        keyless.provider.default = nca_common::config::ProviderKind::OpenAi;
+        let err = match resolve_provider(None, &keyless) {
+            Ok(_) => panic!("keyless config should fail to build a provider"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, ProviderError::Configuration(_)));
     }
 }

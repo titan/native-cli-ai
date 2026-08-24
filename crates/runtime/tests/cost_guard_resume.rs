@@ -66,6 +66,7 @@ async fn create_sup(ws: &Path, session_id: &str) -> Supervisor {
         approval_handler: None,
         orchestration_context: None,
         agent_name: None,
+        provider: None,
     })
     .await
     .expect("supervisor create must succeed with the offline config")
@@ -247,6 +248,7 @@ async fn w4_resume_re_seeds_cost_tracker_from_log_and_guard_retrips() {
         true,
         false,
         sid,
+        None,
         None,
     )
     .await

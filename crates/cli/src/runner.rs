@@ -327,6 +327,7 @@ impl SessionRuntime {
             self.interactive_approvals,
             session_id,
             None,
+            None,
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -396,6 +397,7 @@ pub async fn build_session_runtime(
         approval_handler,
         orchestration_context,
         agent_name: None,
+        provider: None,
     })
     .await?;
 
@@ -426,6 +428,7 @@ pub async fn build_resumed_session_runtime(
         interactive_approvals,
         session_id,
         approval_handler,
+        None,
     )
     .await?;
     let mut handle = supervisor.take_handle();

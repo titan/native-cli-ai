@@ -110,6 +110,7 @@ async fn turn_bracket_written_with_increasing_ids() {
         approval_handler: None,
         orchestration_context: None,
         agent_name: None,
+        provider: None,
     })
     .await
     .expect("supervisor create");
@@ -164,6 +165,7 @@ async fn run_turn_returns_after_turn_committed() {
         approval_handler: None,
         orchestration_context: None,
         agent_name: None,
+        provider: None,
     })
     .await
     .expect("supervisor create");

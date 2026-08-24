@@ -104,6 +104,7 @@ async fn run_service_session_with_startup(
                 approval_handler: None,
                 orchestration_context: request.orchestration_context.clone(),
                 agent_name: None,
+                provider: None,
             })
             .await
         }
@@ -114,6 +115,7 @@ async fn run_service_session_with_startup(
                 request.safe_mode,
                 true,
                 session_id,
+                None,
                 None,
             )
             .await

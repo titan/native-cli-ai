@@ -74,6 +74,7 @@ async fn create_supervisor(ws: &Path, session_id: Option<String>) -> Supervisor 
         approval_handler: None,
         orchestration_context: None,
         agent_name: None,
+        provider: None,
     })
     .await
     .expect("supervisor create must succeed with the offline config")
@@ -307,7 +308,7 @@ async fn resume_seeds_turn_ids() {
     );
 
     // 3. Resume via the supervisor resume path.
-    let mut sup = Supervisor::resume(offline_config(), ws.path(), true, false, sid, None)
+    let mut sup = Supervisor::resume(offline_config(), ws.path(), true, false, sid, None, None)
         .await
         .expect("resume must succeed with the offline config");
 

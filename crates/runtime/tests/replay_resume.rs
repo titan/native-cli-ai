@@ -183,7 +183,7 @@ async fn t7_corrupt_json_resumes_from_event_log_replay() {
     );
     write_corrupt_json(ws.path(), sid);
 
-    let sup = Supervisor::resume(offline_config(), ws.path(), true, false, sid, None)
+    let sup = Supervisor::resume(offline_config(), ws.path(), true, false, sid, None, None)
         .await
         .expect("resume must succeed via event-log fallback despite corrupt json");
 
@@ -239,7 +239,7 @@ async fn t8_crash_cutoff_log_lands_on_last_completed_turn() {
     write_event_log(ws.path(), sid, events);
     write_corrupt_json(ws.path(), sid);
 
-    let sup = Supervisor::resume(offline_config(), ws.path(), true, false, sid, None)
+    let sup = Supervisor::resume(offline_config(), ws.path(), true, false, sid, None, None)
         .await
         .expect("resume from crash-cutoff log");
 
@@ -282,7 +282,7 @@ async fn t9_resume_resaves_without_wiping_json() {
         completed_turn_events(1, "persisted question", "persisted answer"),
     );
 
-    let sup = Supervisor::resume(offline_config(), ws.path(), true, false, sid, None)
+    let sup = Supervisor::resume(offline_config(), ws.path(), true, false, sid, None, None)
         .await
         .expect("resume must succeed");
 
@@ -346,7 +346,7 @@ async fn t11_stale_system_prompts_replaced_on_snapshot_path() {
         ],
     );
 
-    let sup = Supervisor::resume(offline_config(), ws.path(), true, false, sid, None)
+    let sup = Supervisor::resume(offline_config(), ws.path(), true, false, sid, None, None)
         .await
         .expect("resume must succeed");
 
@@ -393,7 +393,7 @@ async fn t18_fresh_log_replay_beats_divergent_json() {
         .concat(),
     );
 
-    let sup = Supervisor::resume(offline_config(), ws.path(), true, false, sid, None)
+    let sup = Supervisor::resume(offline_config(), ws.path(), true, false, sid, None, None)
         .await
         .expect("resume must succeed");
 
@@ -460,7 +460,7 @@ async fn t20_history_replaced_checkpoint_wins_over_stale_json() {
         .collect::<Vec<_>>(),
     );
 
-    let sup = Supervisor::resume(offline_config(), ws.path(), true, false, sid, None)
+    let sup = Supervisor::resume(offline_config(), ws.path(), true, false, sid, None, None)
         .await
         .expect("resume must succeed");
 
