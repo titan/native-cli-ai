@@ -317,7 +317,23 @@ impl<'a> TurnDriver<'a> {
                     event_tx: agent.event_tx.clone(),
                 },
             )
-            .await?;
+            .await;
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(e) => {
+                // Pre-stream provider failures (e.g. DeepSeek HTTP 402
+                // "Insufficient Balance") must reach event consumers — the
+                // TUI transcript and orchestrator LLMs only see `AgentEvent`s,
+                // not tracing. The `StepFailed` emitted by `TurnDriver::run`'s
+                // `Err` branch remains the last word (replay bracket parity).
+                agent
+                    .emit(AgentEvent::Error {
+                        message: e.to_string(),
+                    })
+                    .await;
+                return Err(e);
+            }
+        };
 
         let mut stream = match reply {
             StepReply::Stream(stream) => stream,
@@ -770,5 +786,78 @@ mod tests {
             step_failed.expect("cancel branch must also emit StepFailed");
         assert_eq!((turn_id, step_index, duration_ms), (1, 0, 0));
         assert_eq!(error, "run cancelled");
+    }
+
+    /// T15 — a pre-stream provider failure (chat() returns Err immediately,
+    /// e.g. DeepSeek HTTP 402 "Insufficient Balance") must emit
+    /// `AgentEvent::Error` before `run`'s `StepFailed`, so the failure is
+    /// visible to event consumers (TUI transcript, orchestrator LLMs) and
+    /// not only in tracing logs.
+    #[tokio::test]
+    async fn t15_pre_stream_provider_error_emits_error_and_step_failed() {
+        struct FailProvider;
+
+        #[async_trait::async_trait]
+        impl Provider for FailProvider {
+            async fn chat(
+                &self,
+                _messages: &[Message],
+                _tools: &[nca_common::tool::ToolDefinition],
+                _model: &str,
+                _workspace_root: &Path,
+            ) -> Result<tokio::sync::mpsc::Receiver<StreamChunk>, ProviderError> {
+                Err(ProviderError::RequestFailed(
+                    "{\"error\":{\"message\":\"Insufficient Balance\"}}".into(),
+                ))
+            }
+        }
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+        let mut agent = AgentLoop::new(
+            Arc::new(FailProvider),
+            ToolRegistry::new(),
+            ApprovalPolicy::new(PermissionConfig {
+                mode: PermissionMode::BypassPermissions,
+                ..Default::default()
+            }),
+            "test-model".into(),
+            event_tx,
+            10,
+            16,
+            0,
+            None,
+        );
+
+        let err = agent
+            .run_turn("do it", Path::new("."), &[])
+            .await
+            .expect_err("pre-stream provider failure must propagate");
+        assert!(
+            err.to_string().contains("Insufficient Balance"),
+            "got: {err}"
+        );
+
+        // Collect events in order; find positions of the Error and StepFailed.
+        let mut events = Vec::new();
+        while let Ok(e) = event_rx.try_recv() {
+            events.push(e);
+        }
+        let error_pos = events.iter().position(|e| {
+            matches!(e, AgentEvent::Error { message } if message.contains("Insufficient Balance"))
+        });
+        let step_failed_pos = events.iter().position(|e| {
+            matches!(e, AgentEvent::StepFailed { turn_id, step_index, error, .. }
+                    if *turn_id == 1 && *step_index == 1 && error.contains("Insufficient Balance"))
+        });
+        assert!(
+            error_pos.is_some(),
+            "Error event must be emitted: {events:?}"
+        );
+        let step_failed_pos =
+            step_failed_pos.expect("StepFailed with turn_id=1 step_index=1 must be emitted");
+        assert!(
+            error_pos.unwrap() < step_failed_pos,
+            "Error must arrive BEFORE StepFailed"
+        );
     }
 }

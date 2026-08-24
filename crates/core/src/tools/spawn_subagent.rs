@@ -152,10 +152,22 @@ impl ToolExecutor for SpawnSubagentTool {
                     error: if success {
                         None
                     } else {
-                        Some(format!(
-                            "Sub-agent finished with status: {}",
-                            response.status
-                        ))
+                        // Surface the child's actual failure reason (e.g. the
+                        // provider error like "API request failed: …Insufficient
+                        // Balance…") in `error` — orchestrator LLMs reading the
+                        // spawn tool result key off `error`, not `output`.
+                        let reason = crate::agent::truncate_str(response.output.trim(), 300);
+                        if reason.is_empty() {
+                            Some(format!(
+                                "Sub-agent finished with status: {}",
+                                response.status
+                            ))
+                        } else {
+                            Some(format!(
+                                "Sub-agent finished with status: {} — {}",
+                                response.status, reason
+                            ))
+                        }
                     },
                 }
             }
@@ -174,5 +186,88 @@ impl ToolExecutor for SpawnSubagentTool {
                 error: Some("Sub-agent timed out after 600 seconds".into()),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::ToolExecutor;
+
+    fn tool_call() -> ToolCall {
+        ToolCall {
+            id: "call-1".into(),
+            name: "spawn_subagent".into(),
+            input: serde_json::json!({ "task": "do the thing" }),
+        }
+    }
+
+    /// Spawn a responder that replies to the next `SpawnRequest` with the
+    /// given status/output.
+    fn spawn_responder(mut spawn_rx: mpsc::Receiver<SpawnRequest>, response: SpawnResponse) {
+        tokio::spawn(async move {
+            if let Some(req) = spawn_rx.recv().await {
+                let _ = req.reply.send(response);
+            }
+        });
+    }
+
+    fn response(status: &str, output: &str) -> SpawnResponse {
+        SpawnResponse {
+            child_session_id: "sess-1".into(),
+            status: status.into(),
+            output: output.into(),
+            workspace: "/tmp/ws".into(),
+            branch: None,
+            worktree_path: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn error_field_carries_child_failure_reason() {
+        let (spawn_tx, spawn_rx) = mpsc::channel(1);
+        spawn_responder(
+            spawn_rx,
+            response(
+                "error",
+                "API request failed: {\"error\":{\"message\":\"Insufficient Balance\"}}",
+            ),
+        );
+        let tool = SpawnSubagentTool::new(spawn_tx);
+        let result = tool.execute(&tool_call()).await;
+        assert!(!result.success);
+        let error = result.error.expect("error must be set on failure");
+        assert!(error.contains("error"), "status must appear: {error}");
+        assert!(
+            error.contains("Insufficient Balance"),
+            "child reason must appear: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_output_keeps_status_only_and_long_output_is_truncated() {
+        // Empty output: status-only message.
+        let (spawn_tx, spawn_rx) = mpsc::channel(1);
+        spawn_responder(spawn_rx, response("error", "   "));
+        let tool = SpawnSubagentTool::new(spawn_tx);
+        let result = tool.execute(&tool_call()).await;
+        assert_eq!(
+            result.error.as_deref(),
+            Some("Sub-agent finished with status: error")
+        );
+
+        // 5000-char output: error stays within the 300-char truncation bound
+        // (plus the fixed prefix).
+        let (spawn_tx, spawn_rx) = mpsc::channel(1);
+        spawn_responder(spawn_rx, response("error", &"x".repeat(5000)));
+        let tool = SpawnSubagentTool::new(spawn_tx);
+        let result = tool.execute(&tool_call()).await;
+        let error = result.error.expect("error must be set on failure");
+        assert!(
+            error.chars().count() <= 400,
+            "error must be bounded, got {} chars",
+            error.chars().count()
+        );
+        assert!(error.ends_with('…'));
     }
 }
