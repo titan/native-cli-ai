@@ -205,6 +205,12 @@ pub(crate) struct TranscriptState {
     /// parallel subagent runs).
     pub(crate) child_activity_blocks: HashMap<String, usize>,
 
+    /// Index of the rolling compaction-bracket block plus the token count
+    /// captured at `ContextCompactionStart`. Lets `ContextCompactionEnd`
+    /// replace the in-progress line in place instead of pushing a second
+    /// block per bracket (cache stays incremental).
+    pub(crate) compaction_block: Option<(usize, usize)>,
+
     // ── Active question for answer routing ──
     pub(crate) _active_question: Option<InteractiveQuestionPayload>,
 
@@ -229,6 +235,7 @@ impl TranscriptState {
             last_visible_hits: Vec::new(),
             last_width: 0,
             child_activity_blocks: HashMap::new(),
+            compaction_block: None,
             _active_question: None,
             reasoning_started_at: None,
         }
@@ -534,6 +541,78 @@ impl TranscriptState {
                 });
                 self.blocks_pushed();
             }
+            AgentEvent::ContextCompactionStart {
+                tokens_before,
+                reason,
+            } => {
+                // Open the bracket as a rolling in-place block (same idiom as
+                // ChildSessionActivity): the End event replaces this line
+                // instead of pushing a second block.
+                self.blocks.push(DisplayBlock::System(format!(
+                    "⧗ compacting context · {reason} · ~{tokens_before} tokens"
+                )));
+                let idx = self.blocks.len() - 1;
+                self.blocks_pushed();
+                self.compaction_block = Some((idx, *tokens_before));
+            }
+            AgentEvent::ContextCompactionEnd {
+                tokens_after,
+                kv_prefix_broken,
+            } => {
+                let tokens_before = self.compaction_block.and_then(|(idx, before)| {
+                    if idx < self.blocks.len()
+                        && matches!(&self.blocks[idx], DisplayBlock::System(s) if s.starts_with("⧗ compacting context"))
+                    {
+                        Some((idx, before))
+                    } else {
+                        None
+                    }
+                });
+                let mut text = match tokens_before {
+                    Some((_, before)) if before > *tokens_after => {
+                        let saved = (before.saturating_sub(*tokens_after)) * 100 / before;
+                        format!(
+                            "✓ context compacted · ~{before} → ~{tokens_after} tokens (-{saved}%)"
+                        )
+                    }
+                    Some((_, before)) => {
+                        format!("✓ context compacted · ~{before} → ~{tokens_after} tokens")
+                    }
+                    None => format!("✓ context compacted · ~{tokens_after} tokens"),
+                };
+                if *kv_prefix_broken {
+                    text.push_str(" · cache prefix broken");
+                }
+                match tokens_before {
+                    Some((idx, _)) => {
+                        self.blocks[idx] = DisplayBlock::System(text);
+                        self.block_mutated_at(idx);
+                    }
+                    None => {
+                        self.blocks.push(DisplayBlock::System(text));
+                        self.blocks_pushed();
+                    }
+                }
+                self.compaction_block = None;
+            }
+            AgentEvent::ContextCompaction {
+                phase: _,
+                message,
+                tokens_before,
+                tokens_after,
+                ..
+            } => {
+                // Legacy single-shot event from old session logs (attach /
+                // replay). One fresh block; never touches the rolling slot.
+                let stats = match (tokens_before, tokens_after) {
+                    (Some(before), Some(after)) => format!(" · ~{before} → ~{after} tokens"),
+                    _ => String::new(),
+                };
+                self.blocks.push(DisplayBlock::System(format!(
+                    "✓ context compacted · {message}{stats}"
+                )));
+                self.blocks_pushed();
+            }
             AgentEvent::CostUpdated { .. }
             | AgentEvent::ContextStatsUpdated { .. }
             | AgentEvent::BusyStateChanged { .. }
@@ -655,6 +734,7 @@ impl TranscriptState {
         self.transcript_dragging = false;
         self.transcript_drag_anchor = None;
         self.child_activity_blocks.clear();
+        self.compaction_block = None;
         self.line_cache.reset();
         self.blocks_generation = self.blocks_generation.wrapping_add(1);
     }
@@ -1628,5 +1708,104 @@ mod tests {
             3,
             "seed message + spawn banner + one rolling block"
         );
+    }
+
+    // ── Context compaction bracket ──
+
+    #[test]
+    fn compaction_bracket_collapses_to_single_block() {
+        let mut t = TranscriptState::new();
+        t.apply_event(&AgentEvent::ContextCompactionStart {
+            tokens_before: 10_000,
+            reason: "auto_summarize".into(),
+        });
+        t.apply_event(&AgentEvent::ContextCompactionEnd {
+            tokens_after: 3_700,
+            kv_prefix_broken: true,
+        });
+        let systems = system_blocks(&t);
+        assert_eq!(systems.len(), 1, "bracket must collapse to ONE block");
+        assert!(
+            matches!(systems[0], DisplayBlock::System(s) if s.contains("→") && s.contains("3700") && s.contains("cache prefix broken")),
+            "summary must include the arrow, tokens_after, and kv note"
+        );
+        assert!(
+            matches!(systems[0], DisplayBlock::System(s) if s.contains("-63%")),
+            "reduction percentage must be computed"
+        );
+        assert!(t.compaction_block.is_none(), "slot cleared after bracket");
+
+        // A second bracket adds exactly one more block.
+        t.apply_event(&AgentEvent::ContextCompactionStart {
+            tokens_before: 9_000,
+            reason: "overflow_prune".into(),
+        });
+        t.apply_event(&AgentEvent::ContextCompactionEnd {
+            tokens_after: 9_500,
+            kv_prefix_broken: false,
+        });
+        assert_eq!(system_blocks(&t).len(), 2, "second bracket adds one block");
+    }
+
+    #[test]
+    fn compaction_end_without_start_still_renders() {
+        let mut t = TranscriptState::new();
+        t.apply_event(&AgentEvent::ContextCompactionEnd {
+            tokens_after: 4_000,
+            kv_prefix_broken: false,
+        });
+        let systems = system_blocks(&t);
+        assert_eq!(systems.len(), 1);
+        assert!(matches!(systems[0], DisplayBlock::System(s) if s.contains("4000")));
+    }
+
+    #[test]
+    fn legacy_context_compaction_renders() {
+        let mut t = TranscriptState::new();
+        t.apply_event(&AgentEvent::ContextCompaction {
+            phase: "completed".into(),
+            message: "summarized old turns".into(),
+            tokens_before: Some(12_000),
+            tokens_after: Some(4_000),
+            retained_groups: Some(5),
+            dropped_groups: Some(3),
+        });
+        let systems = system_blocks(&t);
+        assert_eq!(systems.len(), 1);
+        assert!(
+            matches!(systems[0], DisplayBlock::System(s) if s.contains("summarized old turns") && s.contains("→")),
+            "legacy event must render message + token stats"
+        );
+        assert!(
+            t.compaction_block.is_none(),
+            "legacy event must not touch the rolling slot"
+        );
+    }
+
+    #[test]
+    fn compaction_bracket_no_cache_rebuild() {
+        let mut t = TranscriptState::new();
+        t.apply_event(&AgentEvent::MessageReceived {
+            role: "assistant".into(),
+            content: "seed".into(),
+            steering: false,
+        });
+        t.total_line_count(78);
+        let rebuilt = t.line_cache.rebuild_count;
+
+        t.apply_event(&AgentEvent::ContextCompactionStart {
+            tokens_before: 10_000,
+            reason: "auto_summarize".into(),
+        });
+        t.apply_event(&AgentEvent::ContextCompactionEnd {
+            tokens_after: 3_000,
+            kv_prefix_broken: true,
+        });
+        t.total_line_count(78);
+        assert_eq!(
+            t.line_cache.rebuild_count, rebuilt,
+            "the compaction bracket must stay fully incremental"
+        );
+        assert_eq!(t.blocks.len(), 2, "seed message + one compacted block");
     }
 }

@@ -619,6 +619,51 @@ fn render_event(event: &AgentEvent, stats: &StreamStats) {
                 }
             }
         }
+        AgentEvent::ContextCompactionStart {
+            tokens_before,
+            reason,
+        } => {
+            print!("{}", theme::CLEAR_LINE);
+            println!(
+                "  {}",
+                format!("… compacting context ({reason}) · ~{tokens_before} tokens")
+                    .color(theme::TEXT_DIM)
+            );
+        }
+        AgentEvent::ContextCompactionEnd {
+            tokens_after,
+            kv_prefix_broken,
+        } => {
+            print!("{}", theme::CLEAR_LINE);
+            let kv = if *kv_prefix_broken {
+                " · cache prefix broken"
+            } else {
+                ""
+            };
+            println!(
+                "  {} {}",
+                "✓".color(theme::SUCCESS),
+                format!("context compacted → ~{tokens_after} tokens{kv}").color(theme::TEXT_DIM)
+            );
+        }
+        AgentEvent::ContextCompaction {
+            phase: _,
+            message,
+            tokens_before,
+            tokens_after,
+            ..
+        } => {
+            print!("{}", theme::CLEAR_LINE);
+            let stats = match (tokens_before, tokens_after) {
+                (Some(before), Some(after)) => format!(" · ~{before} → ~{after} tokens"),
+                _ => String::new(),
+            };
+            println!(
+                "  {} {}",
+                "✓".color(theme::SUCCESS),
+                format!("context compacted · {message}{stats}").color(theme::TEXT_DIM)
+            );
+        }
         AgentEvent::StepCompleted {
             step_index,
             duration_ms,
@@ -685,6 +730,38 @@ mod tests {
             },
         };
         render_human_event(&ev);
+    }
+
+    #[test]
+    fn render_compaction_events_do_not_panic() {
+        render_human_event(&AgentEvent::ContextCompactionStart {
+            tokens_before: 12_345,
+            reason: "auto_summarize".into(),
+        });
+        render_human_event(&AgentEvent::ContextCompactionEnd {
+            tokens_after: 4_000,
+            kv_prefix_broken: true,
+        });
+        render_human_event(&AgentEvent::ContextCompactionEnd {
+            tokens_after: 4_000,
+            kv_prefix_broken: false,
+        });
+        render_human_event(&AgentEvent::ContextCompaction {
+            phase: "completed".into(),
+            message: "summarized".into(),
+            tokens_before: Some(10_000),
+            tokens_after: Some(3_000),
+            retained_groups: None,
+            dropped_groups: None,
+        });
+        render_human_event(&AgentEvent::ContextCompaction {
+            phase: "completed".into(),
+            message: "pruned".into(),
+            tokens_before: None,
+            tokens_after: None,
+            retained_groups: None,
+            dropped_groups: None,
+        });
     }
 
     // T21: the CLI fanout shares the runtime EventLogWriter semantics — ids
