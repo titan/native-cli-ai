@@ -131,7 +131,7 @@ The Elm TUI (`tui/elm/model.rs::NcaModel`) runs inside `spawn_blocking` on a ded
 - Ratatui rendering must use `is_dirty()` guards to skip frames when nothing changed — without this, idle CPU stays at 7%+ instead of target <1%. The Elm architecture has a `redraw` guard and `BlockLineCache` for incremental rendering.
 - IPC channels must be bounded (buffer=100) to prevent unbounded message accumulation.
 - Use `Vec::with_capacity` when size is known at allocation time.
-- Bash PTY does not inherit environment variables; only an explicit whitelist passes through.
+- When the Landlock sandbox confines a PTY command, its environment is cleared and only an allowlisted set of variables (PATH, HOME, TERM, cargo/toolchain vars, any `LC_*`) passes through; the list is configurable via `[permissions.sandbox] env_allow` in config.
 
 ## System Dependencies
 

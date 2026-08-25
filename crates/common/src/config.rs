@@ -1615,10 +1615,40 @@ pub struct SandboxConfig {
     /// the Landlock `net` scope only covers abstract UNIX sockets).
     #[serde(default = "default_sandbox_net")]
     pub net: bool,
+    /// Environment variables passed through to sandbox-confined PTY commands.
+    /// Exact names are matched; additionally any variable whose name starts
+    /// with `LC_` is always allowed. Setting this in config REPLACES the
+    /// default list (it does not append). An empty list passes only `PATH`
+    /// (structurally required to locate executables).
+    #[serde(default = "default_sandbox_env_allow")]
+    pub env_allow: Vec<String>,
 }
 
 fn default_sandbox_net() -> bool {
     true
+}
+
+/// Default env allowlist for sandbox-confined PTY commands.
+pub fn default_sandbox_env_allow() -> Vec<String> {
+    [
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TERM",
+        "LANG",
+        "TZ",
+        "TMPDIR",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "CC",
+        "CXX",
+        "PKG_CONFIG_PATH",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
 }
 
 impl Default for SandboxConfig {
@@ -1628,6 +1658,7 @@ impl Default for SandboxConfig {
             ro_paths: Vec::new(),
             rw_paths: Vec::new(),
             net: true,
+            env_allow: default_sandbox_env_allow(),
         }
     }
 }
@@ -2274,6 +2305,9 @@ impl SandboxConfig {
         if let Some(net) = partial.net {
             self.net = net;
         }
+        if let Some(env_allow) = partial.env_allow {
+            self.env_allow = env_allow;
+        }
     }
 }
 
@@ -2292,6 +2326,7 @@ struct PartialSandboxConfig {
     ro_paths: Option<Vec<PathBuf>>,
     rw_paths: Option<Vec<PathBuf>>,
     net: Option<bool>,
+    env_allow: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

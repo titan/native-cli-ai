@@ -361,6 +361,7 @@ mod tests {
             ro_paths: vec![PathBuf::from("/opt/tools")],
             rw_paths: vec![PathBuf::from("/data")],
             net: false,
+            env_allow: nca_common::config::default_sandbox_env_allow(),
         };
         let p = SandboxPolicy::from_config(&config, std::path::Path::new("/work/root"));
 

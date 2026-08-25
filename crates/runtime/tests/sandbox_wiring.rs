@@ -49,6 +49,7 @@ fn required_config() -> SandboxConfig {
         ro_paths: Vec::new(),
         rw_paths: Vec::new(),
         net: true,
+        env_allow: nca_common::config::default_sandbox_env_allow(),
     }
 }
 

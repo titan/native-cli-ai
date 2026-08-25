@@ -5,7 +5,7 @@ use std::sync::atomic::AtomicBool;
 use tokio::io::AsyncReadExt;
 use tokio::time::{Duration, Instant};
 
-use nca_common::config::SandboxConfig;
+use nca_common::config::{SandboxConfig, default_sandbox_env_allow};
 use nca_common::event::AgentEvent;
 use nca_core::tools::ToolProgress;
 
@@ -16,6 +16,21 @@ use crate::sandbox::{self, SandboxPolicy};
 /// mode via the tracing file writer).
 static SANDBOX_WARNED: AtomicBool = AtomicBool::new(false);
 
+/// Strip `cmd`'s environment down to the allowlist: exact-name matches plus
+/// any `LC_*` variable always pass. `PATH` is passed unconditionally (it is
+/// structurally required to locate executables), so even an empty allowlist
+/// leaves the child a working shell.
+fn apply_env_allow(cmd: &mut std::process::Command, allow: &[String]) {
+    cmd.env_clear();
+    for (key, value) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        let allowed = allow.iter().any(|a| *a == name) || name.starts_with("LC_");
+        if allowed || name == "PATH" {
+            cmd.env(key, value);
+        }
+    }
+}
+
 /// Runs shell commands in their own process group: streams stdout, and on
 /// completion or timeout kills the entire process group (clearing any
 /// backgrounded survivors) so a lingering child can never pin a worker or
@@ -25,6 +40,9 @@ pub struct PtyManager {
     /// Resolved confinement policy; `None` = run unconfined (sandbox off,
     /// auto-degraded, or never configured).
     sandbox: Mutex<Option<SandboxPolicy>>,
+    /// Env names allowed through to confined commands (see
+    /// [`Self::set_sandbox_config`]); ignored on the unconfined branch.
+    env_allow: Mutex<Vec<String>>,
 }
 
 impl PtyManager {
@@ -32,6 +50,7 @@ impl PtyManager {
         Self {
             workspace_root: Mutex::new(workspace_root.as_ref().to_path_buf()),
             sandbox: Mutex::new(None),
+            env_allow: Mutex::new(default_sandbox_env_allow()),
         }
     }
 
@@ -58,6 +77,7 @@ impl PtyManager {
             }
         };
         *self.sandbox.lock().expect("sandbox lock poisoned") = policy;
+        *self.env_allow.lock().expect("env_allow lock poisoned") = cfg.env_allow.clone();
     }
 
     pub fn workspace_root(&self) -> std::path::PathBuf {
@@ -88,9 +108,15 @@ impl PtyManager {
     ) -> Result<PtyOutput, PtyError> {
         let root = self.workspace_root();
         let sandbox_policy = self.sandbox.lock().expect("sandbox lock poisoned").clone();
+        let env_allow = self
+            .env_allow
+            .lock()
+            .expect("env_allow lock poisoned")
+            .clone();
         let mut cmd = if let Some(policy) = sandbox_policy {
             // Confined path: build the command as std::process::Command (same
-            // sh -c / cwd / piped stdio / own process group), attach the
+            // sh -c / cwd / piped stdio / own process group), strip the
+            // environment down to the configured allowlist, attach the
             // Landlock pre_exec via confine_cmd, then hand it to tokio.
             let std_cmd = {
                 use std::os::unix::process::CommandExt;
@@ -101,6 +127,7 @@ impl PtyManager {
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .process_group(0);
+                apply_env_allow(&mut c, &env_allow);
                 sandbox::confine_cmd(c, &policy)
             };
             tokio::process::Command::from(std_cmd)
