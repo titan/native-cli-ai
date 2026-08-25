@@ -153,19 +153,7 @@ pub async fn spawn_child_session(
             .await;
     }
 
-    let mut context_prompt = format!(
-        "You are a sub-agent spawned by a parent session to handle a specific task.\n\n\
-         ## Parent Context\n{}\n\n\
-         ## Your Task\n{}",
-        cfg.parent_summary, cfg.task
-    );
-
-    if !cfg.focus_files.is_empty() {
-        context_prompt.push_str("\n\n## Focus Files\n");
-        for f in &cfg.focus_files {
-            context_prompt.push_str(&format!("- {f}\n"));
-        }
-    }
+    let context_prompt = build_context_prompt(&cfg.parent_summary, &cfg.task, &cfg.focus_files);
 
     let mut handle = sup.take_handle();
     let event_rx = handle.take_event_rx();
@@ -213,6 +201,24 @@ pub async fn spawn_child_session(
         branch,
         worktree_path: wt_path,
     })
+}
+
+/// Build the child's first user message: parent context, task, focus files.
+/// Deliberately carries NO specialist persona — the persona lives only in
+/// the system prompt via `SupervisorConfig::agent_name`.
+fn build_context_prompt(parent_summary: &str, task: &str, focus_files: &[String]) -> String {
+    let mut prompt = format!(
+        "You are a sub-agent spawned by a parent session to handle a specific task.\n\n\
+         ## Parent Context\n{parent_summary}\n\n\
+         ## Your Task\n{task}"
+    );
+    if !focus_files.is_empty() {
+        prompt.push_str("\n\n## Focus Files\n");
+        for f in focus_files {
+            prompt.push_str(&format!("- {f}\n"));
+        }
+    }
+    prompt
 }
 
 /// Apply provider/model routing to a child session config.
@@ -401,38 +407,30 @@ mod tests {
     use super::*;
     use nca_common::config::AgentProfileConfig;
 
-    /// Specialist spawn: `spawn_child_session` must NOT inline the persona
-    /// into the child's first user message — it lives only in the system
-    /// prompt via `SupervisorConfig::agent_name`. The construction is inline
-    /// in `spawn_child_session` (no extractable seam), so this test pins the
-    /// contract by building the prompt exactly as the production code does.
+    /// The child's first user message must NOT inline the specialist
+    /// persona — it lives only in the system prompt via
+    /// `SupervisorConfig::agent_name` (see the companion test below).
     #[test]
     fn child_context_prompt_carries_no_specialist_persona() {
-        let parent_summary = "[User]: fix the bug";
-        let task = "Do the thing";
-        let focus_files = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
-        let specialist = Some("librarian".to_string());
-
-        // Mirrors the `context_prompt` construction in `spawn_child_session`.
-        let mut context_prompt = format!(
-            "You are a sub-agent spawned by a parent session to handle a specific task.\n\n\
-             ## Parent Context\n{parent_summary}\n\n\
-             ## Your Task\n{task}"
+        let prompt = build_context_prompt(
+            "[User]: fix the bug",
+            "Do the thing",
+            &["src/a.rs".to_string(), "src/b.rs".to_string()],
         );
-        if !focus_files.is_empty() {
-            context_prompt.push_str("\n\n## Focus Files\n");
-            for f in &focus_files {
-                context_prompt.push_str(&format!("- {f}\n"));
-            }
-        }
-        let _ = specialist; // persona flows via SupervisorConfig::agent_name only
-
         assert!(
-            !context_prompt.contains("Specialist Persona"),
+            !prompt.contains("Specialist Persona"),
             "persona must live only in the system prompt, never in the context prompt"
         );
-        assert!(context_prompt.contains("## Parent Context"));
-        assert!(context_prompt.contains("## Focus Files"));
+        assert!(prompt.contains("## Parent Context"));
+        assert!(prompt.contains("## Your Task"));
+        assert!(prompt.contains("## Focus Files"));
+        assert!(prompt.contains("- src/a.rs"));
+    }
+
+    #[test]
+    fn context_prompt_without_focus_files_omits_section() {
+        let prompt = build_context_prompt("summary", "task", &[]);
+        assert!(!prompt.contains("## Focus Files"));
     }
 
     #[test]

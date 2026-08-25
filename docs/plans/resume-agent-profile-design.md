@@ -243,7 +243,14 @@ Verdict: **APPROVE WITH REQUIRED CORRECTIONS.** No P0. Core mechanism
 - **P3-1:** `SessionSnapshot` mirrors the field (was silently omitted in the
   original proposal).
 - **P3-2:** child persona duplication (context_prompt + system prompt) —
-  pre-existing; follow-up, not fixed here.
+  pre-existing; follow-up, not fixed here. **FIXED 2026-08-25**: the
+  `## Specialist Persona:` context-prompt injection was removed
+  (`fix(runtime): stop duplicating specialist persona in subagent context prompt`);
+  the persona now lives only in the system prompt via `agent_name`.
 - **P3-3:** unresolvable-name warn added symmetrically to
   `apply_agent_profile`; REPL "Switched to @bogus" false-success message
-  stays out of scope.
+  stays out of scope. **FIXED 2026-08-25**: `apply_agent_profile` now returns
+  `Result<Option<String>, ProviderError>` (`Ok(None)` = default persona,
+  including unresolvable names — non-fatal for resume symmetry); all four REPL
+  call sites report honestly (`fix(cli,runtime): report honest result on agent
+  profile switch`).
