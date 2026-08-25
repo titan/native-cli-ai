@@ -94,15 +94,12 @@ pub async fn spawn_child_session(
     // exists. This prevents the orchestrator LLM from bypassing the declarative
     // per-specialist routing configured by the user (e.g. echoing a misleading
     // "gpt-4o" example from the spawn_subagent description).
-    let specialist_profile = apply_child_routing(
+    apply_child_routing(
         &mut child_config,
         cfg.specialist.as_deref(),
         cfg.provider_override,
         cfg.model_override.as_deref(),
     );
-
-    // Save specialist system_prompt for context injection (before config is moved).
-    let specialist_persona = specialist_profile.and_then(|p| p.system_prompt.clone());
 
     let mut sup = Supervisor::create(SupervisorConfig {
         config: child_config,
@@ -162,18 +159,6 @@ pub async fn spawn_child_session(
          ## Your Task\n{}",
         cfg.parent_summary, cfg.task
     );
-
-    // If a specialist was requested, inject its persona at the beginning.
-    if let Some(ref specialist) = cfg.specialist
-        && let Some(ref persona) = specialist_persona
-        && !persona.trim().is_empty()
-    {
-        context_prompt = format!(
-            "## Specialist Persona: {specialist}\n\n\
-             {}\n\n---\n\n{context_prompt}",
-            persona.trim()
-        );
-    }
 
     if !cfg.focus_files.is_empty() {
         context_prompt.push_str("\n\n## Focus Files\n");
@@ -242,8 +227,10 @@ pub async fn spawn_child_session(
 /// Explicit overrides are honored only as an escape hatch when no specialist
 /// profile exists (or no specialist was requested).
 ///
-/// Returns the matched profile (for system-prompt injection) when a specialist
-/// profile was used; `None` otherwise.
+/// Returns the matched profile when a specialist profile was used; `None`
+/// otherwise. (The profile's `system_prompt` persona is applied to the child's
+/// system prompt via `SupervisorConfig::agent_name` — not via this return
+/// value.)
 fn apply_child_routing(
     config: &mut NcaConfig,
     specialist: Option<&str>,
