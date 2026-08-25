@@ -306,50 +306,8 @@ pub enum PtyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::EnvGuard;
     use std::time::Duration;
-
-    /// Serialize env mutation across the env-mutating tests in this crate
-    /// (mirrors the EnvGuard pattern in `nca_common::config` tests; private
-    /// helpers are not shared across crates).
-    static ENV_TEST_MUTEX: Mutex<()> = Mutex::new(());
-
-    struct EnvGuard {
-        previous: Vec<(String, Option<std::ffi::OsString>)>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl EnvGuard {
-        fn set(vars: &[(&str, Option<&str>)]) -> Self {
-            // Block until we exclusively own the process environment.
-            let lock = ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-            let mut previous = Vec::new();
-            for (key, value) in vars {
-                previous.push((key.to_string(), std::env::var_os(key)));
-                match value {
-                    // SAFETY: the mutex above serializes env mutation within
-                    // the env-mutating tests of this crate.
-                    Some(value) => unsafe { std::env::set_var(key, value) },
-                    None => unsafe { std::env::remove_var(key) },
-                }
-            }
-            Self {
-                previous,
-                _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, value) in self.previous.drain(..) {
-                match value {
-                    // SAFETY: still holding the env mutex.
-                    Some(value) => unsafe { std::env::set_var(&key, value) },
-                    None => unsafe { std::env::remove_var(&key) },
-                }
-            }
-        }
-    }
 
     fn env_names(cmd: &std::process::Command) -> Vec<String> {
         cmd.get_envs()

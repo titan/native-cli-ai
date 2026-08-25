@@ -2207,11 +2207,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let empty_xdg = tempfile::tempdir().expect("tempdir for xdg isolation");
 
-        // Isolate from real XDG config (which may have explorer/oracle/etc. installed).
-        // SAFETY: this test does not depend on other tests that read XDG in parallel.
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", empty_xdg.path());
-        }
+        // Isolate from real XDG config (which may have explorer/oracle/etc.
+        // installed). EnvGuard takes the crate env lock so parallel tests
+        // reading XDG_CONFIG_HOME (e.g. sandbox policy derivation) cannot see
+        // a half-swapped environment, and restores the ORIGINAL value on
+        // drop (the old raw remove_var leaked an unset XDG_CONFIG_HOME into
+        // every later test when the runner had one set).
+        let _env =
+            crate::test_util::EnvGuard::set(&[("XDG_CONFIG_HOME", empty_xdg.path().to_str())]);
 
         let skill_dir = dir.path().join(".nca/skills/explorer");
         std::fs::create_dir_all(&skill_dir).expect("mkdir");
@@ -2235,11 +2238,6 @@ mod tests {
                 .contains("You are an explorer")
         );
         assert_eq!(profile.description.as_deref(), Some("Explores code"));
-
-        // Restore env.
-        unsafe {
-            std::env::remove_var("XDG_CONFIG_HOME");
-        }
     }
 
     #[test]

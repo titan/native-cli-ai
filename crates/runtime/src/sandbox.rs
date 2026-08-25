@@ -345,6 +345,7 @@ pub use fallback_backend::{backend_supported, exec_confined};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::env_read_lock;
 
     fn policy() -> SandboxPolicy {
         SandboxPolicy {
@@ -356,6 +357,9 @@ mod tests {
 
     #[test]
     fn from_config_includes_workspace_and_temp_rw() {
+        // from_config derives git/cargo/cache paths from HOME/XDG_*: serialize
+        // against env-mutating tests (see test_util::ENV_TEST_MUTEX).
+        let _env = env_read_lock();
         let config = SandboxConfig {
             mode: SandboxMode::Required,
             ro_paths: vec![PathBuf::from("/opt/tools")],
@@ -375,6 +379,7 @@ mod tests {
     fn from_config_grants_essential_device_nodes() {
         // Ordinary shell redirections (`2>/dev/null`, `</dev/zero`) and
         // entropy reads must not fail EACCES under confinement.
+        let _env = env_read_lock();
         let p = SandboxPolicy::from_config(&SandboxConfig::default(), std::path::Path::new("/w"));
         for dev in ESSENTIAL_DEVICES {
             if std::path::Path::new(dev).exists() {
@@ -388,6 +393,12 @@ mod tests {
         // Regression for the sandboxed-git breakage: every `git` invocation
         // reads its global config chain at startup, so `~/.gitconfig` and the
         // XDG git config must be readable under confinement when they exist.
+        //
+        // The whole test (from_config AND the candidate recomputation below)
+        // must see one consistent environment: hold the env lock so a
+        // parallel env-mutating test (pty's EnvGuard HOME swap) cannot change
+        // HOME between the two reads.
+        let _env = env_read_lock();
         let p = SandboxPolicy::from_config(&SandboxConfig::default(), std::path::Path::new("/w"));
 
         let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME")
@@ -432,6 +443,7 @@ mod tests {
         }
         // The regression: a confined command redirecting to /dev/null must
         // not fail with "Permission denied".
+        let _env = env_read_lock();
         let config = SandboxConfig::default();
         let p = SandboxPolicy::from_config(&config, std::path::Path::new("."));
         let out = exec_confined("echo noisy >/dev/null 2>&1; echo pass", &p)
@@ -463,6 +475,7 @@ mod tests {
         // chain ($HOME/.gitconfig, XDG git config). Without the policy ro
         // entries, git dies at startup with rc=128 (config-read EACCES) and
         // every sandboxed shell call through git fails.
+        let _env = env_read_lock();
         let config = SandboxConfig::default();
         let p = SandboxPolicy::from_config(&config, std::path::Path::new("."));
         // Run from the temp dir (a rw root in every policy): `git config`

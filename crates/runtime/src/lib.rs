@@ -15,5 +15,7 @@ pub mod session_store;
 pub mod session_utils;
 pub mod subagent;
 pub mod supervisor;
+#[cfg(test)]
+pub(crate) mod test_util;
 pub mod tmux;
 pub mod worktree;
