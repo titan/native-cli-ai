@@ -384,6 +384,47 @@ mod tests {
     }
 
     #[test]
+    fn from_config_grants_git_global_config_paths_but_not_home_or_ssh() {
+        // Regression for the sandboxed-git breakage: every `git` invocation
+        // reads its global config chain at startup, so `~/.gitconfig` and the
+        // XDG git config must be readable under confinement when they exist.
+        let p = SandboxPolicy::from_config(&SandboxConfig::default(), std::path::Path::new("/w"));
+
+        let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
+        let candidates = [
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".gitconfig")),
+            xdg_config_home.map(|d| d.join("git").join("config")),
+        ];
+        let mut asserted = 0;
+        for path in candidates.into_iter().flatten() {
+            if path.exists() {
+                assert!(
+                    p.ro.contains(&path),
+                    "existing git config path must be a read-only root: {}",
+                    path.display()
+                );
+                asserted += 1;
+            }
+        }
+        if asserted == 0 {
+            eprintln!(
+                "NOTE: no git global config files exist on this machine; ro assertions skipped"
+            );
+        }
+
+        // Secrets stay out: neither bare $HOME nor ~/.ssh may be granted.
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            assert!(!p.ro.contains(&home), "bare $HOME must not be an ro root");
+            assert!(
+                !p.ro.contains(&home.join(".ssh")),
+                "~/.ssh must not be an ro root"
+            );
+        }
+    }
+
+    #[test]
     fn exec_confined_dev_null_redirect_works_on_supported_kernel() {
         if !backend_supported() {
             eprintln!("SKIP: Landlock unavailable on this kernel");
@@ -397,6 +438,57 @@ mod tests {
             .expect("confined exec with /dev/null redirect");
         assert_eq!(out.exit_code, Some(0), "{:?}", out.combined);
         assert!(out.combined.contains("pass"), "{:?}", out.combined);
+        assert!(
+            !out.combined.to_lowercase().contains("permission denied"),
+            "{:?}",
+            out.combined
+        );
+    }
+
+    #[test]
+    fn exec_confined_git_config_read_works_on_supported_kernel() {
+        if !backend_supported() {
+            eprintln!("SKIP: Landlock unavailable on this kernel");
+            return;
+        }
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP: git binary not installed");
+            return;
+        }
+        // Regression: a confined `git` must be able to read its global config
+        // chain ($HOME/.gitconfig, XDG git config). Without the policy ro
+        // entries, git dies at startup with rc=128 (config-read EACCES) and
+        // every sandboxed shell call through git fails.
+        let config = SandboxConfig::default();
+        let p = SandboxPolicy::from_config(&config, std::path::Path::new("."));
+        // Run from the temp dir (a rw root in every policy): `git config`
+        // still walks the parent directory chain looking for a repo, and
+        // outside one it needs only the global/system config chain — exactly
+        // the paths this regression covers. Running from the workspace root
+        // would make git try to open the workspace's own `.git`, which is
+        // confined-rw only when cwd == workspace root (repo-discovery walks
+        // above it and fails EACCES on the way up).
+        let tmp = std::env::temp_dir();
+        let out = exec_confined(
+            &format!(
+                "cd {} && git config user.name >/dev/null; echo rc=$?",
+                tmp.display()
+            ),
+            &p,
+        )
+        .expect("confined git exec");
+        // `git config user.name` exits 1 when the key is unset and 0 when set;
+        // the fatal case is 128 (cannot read config). Either 0 or 1 proves the
+        // global config chain was readable under confinement.
+        assert!(
+            out.combined.contains("rc=0") || out.combined.contains("rc=1"),
+            "git must not die with a config-read error (rc=128) under confinement: {:?}",
+            out.combined
+        );
         assert!(
             !out.combined.to_lowercase().contains("permission denied"),
             "{:?}",

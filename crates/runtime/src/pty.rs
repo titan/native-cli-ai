@@ -308,6 +308,135 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// Serialize env mutation across the env-mutating tests in this crate
+    /// (mirrors the EnvGuard pattern in `nca_common::config` tests; private
+    /// helpers are not shared across crates).
+    static ENV_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        previous: Vec<(String, Option<std::ffi::OsString>)>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn set(vars: &[(&str, Option<&str>)]) -> Self {
+            // Block until we exclusively own the process environment.
+            let lock = ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let mut previous = Vec::new();
+            for (key, value) in vars {
+                previous.push((key.to_string(), std::env::var_os(key)));
+                match value {
+                    // SAFETY: the mutex above serializes env mutation within
+                    // the env-mutating tests of this crate.
+                    Some(value) => unsafe { std::env::set_var(key, value) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
+            }
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.previous.drain(..) {
+                match value {
+                    // SAFETY: still holding the env mutex.
+                    Some(value) => unsafe { std::env::set_var(&key, value) },
+                    None => unsafe { std::env::remove_var(&key) },
+                }
+            }
+        }
+    }
+
+    fn env_names(cmd: &std::process::Command) -> Vec<String> {
+        cmd.get_envs()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn apply_env_allow_strips_secrets_keeps_allowlist() {
+        let _guard = EnvGuard::set(&[
+            ("NCA_TEST_ALLOW_ME", Some("visible")),
+            ("NCA_TEST_SECRET", Some("s3cr3t")),
+            ("LC_NCA_TEST_LOCALE", Some("xx_YY")),
+        ]);
+
+        let mut cmd = std::process::Command::new("sh");
+        apply_env_allow(&mut cmd, &["NCA_TEST_ALLOW_ME".to_string()]);
+        let names = env_names(&cmd);
+
+        assert!(
+            names.iter().any(|n| n == "PATH"),
+            "PATH passes unconditionally: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "NCA_TEST_ALLOW_ME"),
+            "allowlisted name passes: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "NCA_TEST_SECRET"),
+            "non-allowlisted name must be stripped: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "LC_NCA_TEST_LOCALE"),
+            "LC_* prefix always passes: {names:?}"
+        );
+    }
+
+    #[test]
+    fn apply_env_allow_default_list_keeps_toolchain_vars() {
+        let _guard = EnvGuard::set(&[
+            ("HOME", Some("/home/test")),
+            ("CARGO_HOME", Some("/home/test/.cargo")),
+            ("RUSTUP_HOME", Some("/home/test/.rustup")),
+            ("NCA_TEST_SECRET", Some("s3cr3t")),
+        ]);
+
+        let mut cmd = std::process::Command::new("sh");
+        apply_env_allow(&mut cmd, &default_sandbox_env_allow());
+        let names = env_names(&cmd);
+
+        for name in ["PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME"] {
+            assert!(
+                names.iter().any(|n| n == name),
+                "default allowlist must pass {name}: {names:?}"
+            );
+        }
+        assert!(
+            !names.iter().any(|n| n == "NCA_TEST_SECRET"),
+            "default allowlist must strip non-allowlisted vars: {names:?}"
+        );
+    }
+
+    #[test]
+    fn apply_env_allow_empty_list_passes_path_only() {
+        let _guard = EnvGuard::set(&[
+            ("HOME", Some("/home/test")),
+            ("LC_NCA_TEST_LOCALE", Some("xx_YY")),
+        ]);
+
+        let mut cmd = std::process::Command::new("sh");
+        apply_env_allow(&mut cmd, &[]);
+        let names = env_names(&cmd);
+
+        assert!(
+            names.iter().any(|n| n == "PATH"),
+            "PATH survives even an empty allowlist: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "HOME"),
+            "empty allowlist strips HOME: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "LC_NCA_TEST_LOCALE"),
+            "LC_* passes even with an empty allowlist: {names:?}"
+        );
+    }
+
     fn mgr() -> PtyManager {
         PtyManager::new(".")
     }

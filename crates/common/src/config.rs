@@ -3374,6 +3374,91 @@ rw_paths = ["/home/user/project", "/tmp"]
     }
 
     #[test]
+    fn sandbox_env_allow_defaults_to_curated_list() {
+        let config = NcaConfig::default();
+        let allow = &config.permissions.sandbox.env_allow;
+        for name in ["PATH", "HOME", "CARGO_HOME"] {
+            assert!(
+                allow.iter().any(|a| a == name),
+                "default env_allow should contain {name}: {allow:?}"
+            );
+        }
+        // The function the serde default points at must agree with the struct default.
+        assert_eq!(
+            *allow,
+            default_sandbox_env_allow(),
+            "SandboxConfig::default must use default_sandbox_env_allow()"
+        );
+    }
+
+    #[test]
+    fn sandbox_env_allow_parses_and_replaces_default() {
+        let toml_str = r#"
+[permissions.sandbox]
+env_allow = ["FOO"]
+"#;
+        let partial: PartialNcaConfig = toml::from_str(toml_str).expect("parse");
+        let mut config = NcaConfig::default();
+        config.merge(partial);
+
+        let allow = &config.permissions.sandbox.env_allow;
+        assert_eq!(
+            *allow,
+            vec!["FOO".to_string()],
+            "explicit list REPLACES the curated default"
+        );
+        assert!(
+            !allow.iter().any(|a| a == "HOME"),
+            "default entries must not linger after an explicit env_allow"
+        );
+    }
+
+    #[test]
+    fn sandbox_env_allow_empty_list_means_path_only() {
+        let toml_str = r#"
+[permissions.sandbox]
+env_allow = []
+"#;
+        let partial: PartialNcaConfig = toml::from_str(toml_str).expect("parse");
+        let mut config = NcaConfig::default();
+        config.merge(partial);
+        assert!(
+            config.permissions.sandbox.env_allow.is_empty(),
+            "explicit empty list must survive merge (runtime passes PATH only)"
+        );
+    }
+
+    #[test]
+    fn sandbox_env_allow_roundtrip_via_workspace_file() {
+        let tmp_home = tempfile::tempdir().expect("tempdir");
+        let _guard = EnvGuard::set(&[
+            ("HOME", Some(tmp_home.path().to_str().unwrap())),
+            ("MINIMAX_API_KEY", None),
+            ("OPENAI_API_KEY", None),
+            ("NCA_EDITOR", None),
+            ("EDITOR", None),
+        ]);
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let mut config = NcaConfig::default();
+        config.permissions.sandbox.env_allow = vec!["FOO".to_string(), "BAR".to_string()];
+        config.save_workspace_file(dir.path()).expect("save");
+
+        let raw =
+            std::fs::read_to_string(workspace_config_path(dir.path())).expect("read local config");
+        assert!(
+            raw.contains("env_allow"),
+            "persisted config should contain env_allow: {raw}"
+        );
+
+        let reloaded = NcaConfig::load_for_workspace(dir.path()).expect("reload");
+        assert_eq!(
+            reloaded.permissions.sandbox.env_allow,
+            vec!["FOO".to_string(), "BAR".to_string()]
+        );
+    }
+
+    #[test]
     fn sandbox_roundtrip_via_workspace_file() {
         let tmp_home = tempfile::tempdir().expect("tempdir");
         let _guard = EnvGuard::set(&[
