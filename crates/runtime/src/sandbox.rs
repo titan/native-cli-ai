@@ -61,6 +61,25 @@ impl SandboxPolicy {
         .collect();
         ro.extend(config.ro_paths.iter().cloned());
 
+        // Git global config chain (read-only): without these, every `git`
+        // invocation inside the sandbox fails with rc=128 because git cannot
+        // read its global/system config. Follows the cargo/cache derivation
+        // pattern: env var → HOME fallback → existence filter.
+        // NOTE: `~/.ssh` and the whole `$HOME` are deliberately NOT defaults
+        // (they contain secrets and far more than tooling needs) — opt in
+        // via `ro_paths` in config.
+        let git_xdg_config = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+            .map(|d| d.join("git").join("config"));
+        let git_global = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".gitconfig"));
+        ro.extend(
+            [git_global, git_xdg_config]
+                .into_iter()
+                .flatten()
+                .filter(|p| p.exists()),
+        );
+
         let mut rw = vec![workspace_root.to_path_buf(), std::env::temp_dir()];
         // Plan §P5 default rw roots: also cargo home and XDG cache so that
         // default-Auto confinement does not break `cargo build`.
