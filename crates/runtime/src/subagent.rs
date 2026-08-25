@@ -233,16 +233,14 @@ fn build_context_prompt(parent_summary: &str, task: &str, focus_files: &[String]
 /// Explicit overrides are honored only as an escape hatch when no specialist
 /// profile exists (or no specialist was requested).
 ///
-/// Returns the matched profile when a specialist profile was used; `None`
-/// otherwise. (The profile's `system_prompt` persona is applied to the child's
-/// system prompt via `SupervisorConfig::agent_name` — not via this return
-/// value.)
+/// The matched profile's `system_prompt` persona is applied to the child's
+/// system prompt via `SupervisorConfig::agent_name` — not here.
 fn apply_child_routing(
     config: &mut NcaConfig,
     specialist: Option<&str>,
     provider_override: Option<ProviderKind>,
     model_override: Option<&str>,
-) -> Option<nca_common::config::AgentProfileConfig> {
+) {
     let profile = specialist.and_then(|s| config.agent_profile(s).cloned());
     if let Some(ref profile) = profile {
         if let Some(provider) = profile.resolve_provider() {
@@ -264,7 +262,6 @@ fn apply_child_routing(
             config.sync_default_model_from_provider();
         }
     }
-    profile
 }
 
 /// Spawns a background task that consumes spawn requests from the sub-agent tool
@@ -484,13 +481,12 @@ mod tests {
         // from the spawn_subagent tool description. Otherwise the declarative
         // per-specialist routing configured by the user is silently bypassed.
         let mut config = config_with_librarian_profile();
-        let profile = apply_child_routing(
+        apply_child_routing(
             &mut config,
             Some("librarian"),
             Some(ProviderKind::OpenAi),
             Some("gpt-4o"),
         );
-        assert!(profile.is_some(), "librarian profile should match");
         assert_eq!(config.provider.default, ProviderKind::ZhipuAI);
         assert_eq!(config.provider.active_model(), "glm-4.7-flash");
         assert_eq!(config.model.default_model, "glm-4.7-flash");
@@ -499,8 +495,7 @@ mod tests {
     #[test]
     fn specialist_profile_applied_without_overrides() {
         let mut config = config_with_librarian_profile();
-        let profile = apply_child_routing(&mut config, Some("librarian"), None, None);
-        assert!(profile.is_some());
+        apply_child_routing(&mut config, Some("librarian"), None, None);
         assert_eq!(config.provider.default, ProviderKind::ZhipuAI);
         assert_eq!(config.model.default_model, "glm-4.7-flash");
     }
@@ -508,13 +503,12 @@ mod tests {
     #[test]
     fn no_specialist_honors_overrides() {
         let mut config = NcaConfig::default();
-        let profile = apply_child_routing(
+        apply_child_routing(
             &mut config,
             None,
             Some(ProviderKind::ZhipuAI),
             Some("glm-4.7-flash"),
         );
-        assert!(profile.is_none(), "no specialist means no profile");
         assert_eq!(config.provider.default, ProviderKind::ZhipuAI);
         assert_eq!(config.provider.active_model(), "glm-4.7-flash");
         assert_eq!(config.model.default_model, "glm-4.7-flash");
@@ -523,13 +517,12 @@ mod tests {
     #[test]
     fn unknown_specialist_falls_back_to_overrides() {
         let mut config = NcaConfig::default();
-        let profile = apply_child_routing(
+        apply_child_routing(
             &mut config,
             Some("does-not-exist"),
             Some(ProviderKind::DeepSeek),
             None,
         );
-        assert!(profile.is_none(), "unknown specialist matches no profile");
         assert_eq!(config.provider.default, ProviderKind::DeepSeek);
     }
 }
