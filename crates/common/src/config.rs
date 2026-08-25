@@ -3511,11 +3511,13 @@ env_allow = []
         let dir = tempfile::tempdir().expect("tempdir");
 
         // Save config with extra_paths set.
-        let mut config = NcaConfig::default();
-        config.extra_paths = vec![
-            PathBuf::from("/home/user/projects"),
-            PathBuf::from("/opt/data"),
-        ];
+        let config = NcaConfig {
+            extra_paths: vec![
+                PathBuf::from("/home/user/projects"),
+                PathBuf::from("/opt/data"),
+            ],
+            ..Default::default()
+        };
         config.save_workspace_file(dir.path()).expect("save");
 
         // The local file should contain extra_paths (diff against empty default).
@@ -3571,11 +3573,13 @@ env_allow = []
         let dir = tempfile::tempdir().expect("tempdir");
 
         // Step 1: simulate /mount of two paths.
-        let mut config = NcaConfig::default();
-        config.extra_paths = vec![
-            PathBuf::from("/home/user/projects"),
-            PathBuf::from("/opt/data"),
-        ];
+        let config = NcaConfig {
+            extra_paths: vec![
+                PathBuf::from("/home/user/projects"),
+                PathBuf::from("/opt/data"),
+            ],
+            ..Default::default()
+        };
         config.save_workspace_file(dir.path()).expect("save");
 
         // Step 2: simulate /unmount of one path — load fresh, overwrite the
