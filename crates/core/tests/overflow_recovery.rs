@@ -144,7 +144,7 @@ fn prunable_history() -> Vec<Message> {
             "",
             vec![read_call(&format!("c{i}"))],
         ));
-        messages.push(Message::tool(&format!("c{i}"), &format!("read output {i}")));
+        messages.push(Message::tool(format!("c{i}"), format!("read output {i}")));
     }
     for i in 0..9 {
         messages.push(Message::user(format!("u{i}")));

@@ -458,9 +458,12 @@ mod tests {
         messages: Vec<String>,
     }
 
+    /// Recorded provider call: (message texts, tool names, model, workspace root).
+    type RecordedCall = (Vec<String>, Vec<String>, String, PathBuf);
+
     /// Recording provider: counts calls, captures the full argument set.
     struct RecordingProvider {
-        calls: Mutex<Vec<(Vec<String>, Vec<String>, String, PathBuf)>>,
+        calls: Mutex<Vec<RecordedCall>>,
         fail_first: bool,
     }
 
@@ -865,7 +868,7 @@ mod tests {
                 "",
                 vec![read_call(&format!("c{i}"))],
             ));
-            messages.push(Message::tool(&format!("c{i}"), &format!("read output {i}")));
+            messages.push(Message::tool(format!("c{i}"), format!("read output {i}")));
         }
         for i in 0..9 {
             messages.push(Message::user(format!("u{i}")));

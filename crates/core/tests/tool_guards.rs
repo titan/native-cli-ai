@@ -75,7 +75,7 @@ async fn run_batch(
     let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
     let cancel_flag = AtomicBool::new(false);
     let pipeline = run_tool_pipeline(
-        &tools,
+        tools,
         &mut approval,
         &hooks,
         &tx,
