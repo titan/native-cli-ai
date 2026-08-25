@@ -82,7 +82,7 @@ impl ToolExecutor for RunValidationTool {
         };
 
         let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-lc")
+        cmd.arg("-c")
             .arg(&p.command)
             .current_dir(&cwd_abs)
             .stdout(std::process::Stdio::piped())

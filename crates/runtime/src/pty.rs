@@ -90,12 +90,12 @@ impl PtyManager {
         let sandbox_policy = self.sandbox.lock().expect("sandbox lock poisoned").clone();
         let mut cmd = if let Some(policy) = sandbox_policy {
             // Confined path: build the command as std::process::Command (same
-            // sh -lc / cwd / piped stdio / own process group), attach the
+            // sh -c / cwd / piped stdio / own process group), attach the
             // Landlock pre_exec via confine_cmd, then hand it to tokio.
             let std_cmd = {
                 use std::os::unix::process::CommandExt;
                 let mut c = std::process::Command::new("sh");
-                c.arg("-lc")
+                c.arg("-c")
                     .arg(command)
                     .current_dir(&root)
                     .stdout(Stdio::piped())
@@ -106,7 +106,7 @@ impl PtyManager {
             tokio::process::Command::from(std_cmd)
         } else {
             let mut c = tokio::process::Command::new("sh");
-            c.arg("-lc")
+            c.arg("-c")
                 .arg(command)
                 .current_dir(&root)
                 .stdout(Stdio::piped())

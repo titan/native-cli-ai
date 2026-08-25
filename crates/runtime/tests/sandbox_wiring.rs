@@ -3,7 +3,7 @@
 //! These tests pin the WIRING layer on top of the (already-landed) sandbox
 //! backend: a `confine_cmd` helper that attaches a Landlock `pre_exec` to a
 //! caller-built `std::process::Command`, and a `PtyManager::set_sandbox_config`
-//! setter that makes `exec_streaming` confine its `sh -lc` child.
+//! setter that makes `exec_streaming` confine its `sh -c` child.
 //!
 //! Neither API exists yet — this crate intentionally FAILS TO COMPILE
 //! (compile-red) until:

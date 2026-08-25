@@ -32,11 +32,10 @@ pub struct SandboxPolicy {
 }
 
 /// Essential character-device nodes granted read-write access in every
-/// policy. Confined shells run as login shells (`sh -lc`, see `pty.rs`) and
-/// therefore source `/etc/profile.d/*.sh` — on modern systemd (≥ v256) that
-/// includes `80-systemd-osc-context.sh`, and virtually every profile script
-/// redirects through `/dev/null`. `/dev` is not covered by any built-in root,
-/// so without these nodes every sourced script spews
+/// policy. Ordinary shell commands and build tooling routinely redirect
+/// through `/dev/null` (`2>/dev/null`, `</dev/zero`, ...), and many tools
+/// draw entropy from `/dev/urandom`. `/dev` is not covered by any built-in
+/// root, so without these nodes common redirections fail with
 /// `/dev/null: Permission denied` (Landlock EACCES) into tool output.
 const ESSENTIAL_DEVICES: [&str; 6] = [
     "/dev/null",
@@ -373,8 +372,8 @@ mod tests {
 
     #[test]
     fn from_config_grants_essential_device_nodes() {
-        // Login-shell profile scripts (e.g. systemd's 80-systemd-osc-context.sh)
-        // redirect through /dev/null; without the node in rw they fail EACCES.
+        // Ordinary shell redirections (`2>/dev/null`, `</dev/zero`) and
+        // entropy reads must not fail EACCES under confinement.
         let p = SandboxPolicy::from_config(&SandboxConfig::default(), std::path::Path::new("/w"));
         for dev in ESSENTIAL_DEVICES {
             if std::path::Path::new(dev).exists() {
@@ -389,9 +388,8 @@ mod tests {
             eprintln!("SKIP: Landlock unavailable on this kernel");
             return;
         }
-        // The regression: a confined command (and the login-shell profile
-        // scripts it sources) redirecting to /dev/null must not fail with
-        // "Permission denied".
+        // The regression: a confined command redirecting to /dev/null must
+        // not fail with "Permission denied".
         let config = SandboxConfig::default();
         let p = SandboxPolicy::from_config(&config, std::path::Path::new("."));
         let out = exec_confined("echo noisy >/dev/null 2>&1; echo pass", &p)
