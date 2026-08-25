@@ -31,9 +31,26 @@ pub struct SandboxPolicy {
     pub net: bool,
 }
 
+/// Essential character-device nodes granted read-write access in every
+/// policy. Confined shells run as login shells (`sh -lc`, see `pty.rs`) and
+/// therefore source `/etc/profile.d/*.sh` — on modern systemd (≥ v256) that
+/// includes `80-systemd-osc-context.sh`, and virtually every profile script
+/// redirects through `/dev/null`. `/dev` is not covered by any built-in root,
+/// so without these nodes every sourced script spews
+/// `/dev/null: Permission denied` (Landlock EACCES) into tool output.
+const ESSENTIAL_DEVICES: [&str; 6] = [
+    "/dev/null",
+    "/dev/zero",
+    "/dev/full",
+    "/dev/random",
+    "/dev/urandom",
+    "/dev/tty",
+];
+
 impl SandboxPolicy {
     /// Build a policy from config: built-in read-only system roots plus
-    /// `config.ro_paths`, workspace + temp plus `config.rw_paths`.
+    /// `config.ro_paths`, workspace + temp plus `config.rw_paths`, and the
+    /// essential device nodes ([`ESSENTIAL_DEVICES`]).
     pub fn from_config(config: &SandboxConfig, workspace_root: &std::path::Path) -> Self {
         let mut ro: Vec<PathBuf> = [
             "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/nix", "/opt",
@@ -60,6 +77,15 @@ impl SandboxPolicy {
                 .filter(|p| p.exists()),
         );
         rw.extend(config.rw_paths.iter().cloned());
+        // POSIX shell substrate: must come last so config `rw_paths` cannot
+        // accidentally shadow them, and filtered by existence so non-Linux
+        // targets (and stripped containers) skip silently.
+        rw.extend(
+            ESSENTIAL_DEVICES
+                .iter()
+                .map(PathBuf::from)
+                .filter(|p| p.exists()),
+        );
 
         Self {
             ro,
@@ -324,6 +350,40 @@ mod tests {
         assert!(p.rw.contains(&PathBuf::from("/data")));
         assert!(p.ro.contains(&PathBuf::from("/opt/tools")));
         assert!(!p.net);
+    }
+
+    #[test]
+    fn from_config_grants_essential_device_nodes() {
+        // Login-shell profile scripts (e.g. systemd's 80-systemd-osc-context.sh)
+        // redirect through /dev/null; without the node in rw they fail EACCES.
+        let p = SandboxPolicy::from_config(&SandboxConfig::default(), std::path::Path::new("/w"));
+        for dev in ESSENTIAL_DEVICES {
+            if std::path::Path::new(dev).exists() {
+                assert!(p.rw.contains(&PathBuf::from(dev)), "missing {dev}");
+            }
+        }
+    }
+
+    #[test]
+    fn exec_confined_dev_null_redirect_works_on_supported_kernel() {
+        if !backend_supported() {
+            eprintln!("SKIP: Landlock unavailable on this kernel");
+            return;
+        }
+        // The regression: a confined command (and the login-shell profile
+        // scripts it sources) redirecting to /dev/null must not fail with
+        // "Permission denied".
+        let config = SandboxConfig::default();
+        let p = SandboxPolicy::from_config(&config, std::path::Path::new("."));
+        let out = exec_confined("echo noisy >/dev/null 2>&1; echo pass", &p)
+            .expect("confined exec with /dev/null redirect");
+        assert_eq!(out.exit_code, Some(0), "{:?}", out.combined);
+        assert!(out.combined.contains("pass"), "{:?}", out.combined);
+        assert!(
+            !out.combined.to_lowercase().contains("permission denied"),
+            "{:?}",
+            out.combined
+        );
     }
 
     #[test]
