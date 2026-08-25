@@ -273,11 +273,20 @@ impl Repl {
         } else {
             Some(name.as_str())
         };
-        if let Err(e) = self.runtime.apply_agent_profile(profile_name) {
-            eprintln!("\n[agent] failed to switch: {e}");
+        match self.runtime.apply_agent_profile(profile_name) {
+            Ok(Some(_)) => eprintln!("\n[agent] Switched to @{name}"),
+            Ok(None) if profile_name.is_none() => {
+                eprintln!("\n[agent] Switched to @orchestrator")
+            }
+            Ok(None) => {
+                // Unresolvable name: the runtime fell back to the default
+                // persona — reflect that in the label instead of a bogus one.
+                self.current_agent_label = "@orchestrator".to_string();
+                self.prompt.set_agent(&self.current_agent_label);
+                eprintln!("\n[agent] unknown profile @{name} — now on @orchestrator");
+            }
+            Err(e) => eprintln!("\n[agent] failed to switch: {e}"),
         }
-
-        eprintln!("\n[agent] Switched to @{name}");
     }
 
     /// Run a shell command directly (bash mode) - Claude Code style
@@ -574,8 +583,20 @@ impl Repl {
                         self.current_agent_label = format!("@{name}");
                         self.prompt.set_agent(&self.current_agent_label);
                         let profile_name = if idx == 0 { None } else { Some(name.as_str()) };
-                        if let Err(e) = self.runtime.apply_agent_profile(profile_name) {
-                            out.eprintln(&format!("Failed to switch agent: {e}"));
+                        let mut unknown_profile = false;
+                        match self.runtime.apply_agent_profile(profile_name) {
+                            Ok(Some(_)) => {}
+                            Ok(None) if profile_name.is_none() => {}
+                            Ok(None) => {
+                                // Unresolvable name: the runtime is on the
+                                // default persona — keep the label truthful.
+                                unknown_profile = true;
+                                self.current_agent_label = "@orchestrator".to_string();
+                                self.prompt.set_agent(&self.current_agent_label);
+                            }
+                            Err(e) => {
+                                out.eprintln(&format!("Failed to switch agent: {e}"));
+                            }
                         }
                         if let ReplOutput::Tui(st) = &out {
                             st.set_agent_profile(self.current_agent_label.clone());
@@ -585,7 +606,13 @@ impl Repl {
                             ));
                             st.set_model(self.runtime.model().to_string());
                         }
-                        out.println(&format!("Switched to @{name}"));
+                        if unknown_profile {
+                            out.eprintln(&format!(
+                                "unknown profile @{name} — now on @orchestrator"
+                            ));
+                        } else {
+                            out.println(&format!("Switched to @{name}"));
+                        }
                     } else {
                         out.println(&format!("Unknown agent: {target}"));
                         out.println(&format!(
@@ -1711,8 +1738,18 @@ impl Repl {
                             } else {
                                 Some(name.as_str())
                             };
-                            if let Err(e) = self.runtime.apply_agent_profile(profile_name) {
-                                tui_feedback.push_error(format!("Failed to switch agent: {e}"));
+                            match self.runtime.apply_agent_profile(profile_name) {
+                                Ok(Some(_)) => {}
+                                Ok(None) if profile_name.is_none() => {}
+                                Ok(None) => {
+                                    self.current_agent_label = "@orchestrator".to_string();
+                                    tui_feedback.push_error(format!(
+                                        "unknown profile @{name} — now on @orchestrator"
+                                    ));
+                                }
+                                Err(e) => {
+                                    tui_feedback.push_error(format!("Failed to switch agent: {e}"));
+                                }
                             }
                             tui_feedback.set_agent_profile(self.current_agent_label.clone());
                             tui_feedback.set_permission_mode(format!(
@@ -1813,8 +1850,20 @@ impl Repl {
                             let name = name.clone();
                             self.current_agent_label = format!("@{name}");
                             let profile_name = if idx == 0 { None } else { Some(name.as_str()) };
-                            if let Err(e) = self.runtime.apply_agent_profile(profile_name) {
-                                tui_feedback.push_error(format!("Failed to switch agent: {e}"));
+                            let mut unknown_profile = false;
+                            match self.runtime.apply_agent_profile(profile_name) {
+                                Ok(Some(_)) => {}
+                                Ok(None) if profile_name.is_none() => {}
+                                Ok(None) => {
+                                    unknown_profile = true;
+                                    self.current_agent_label = "@orchestrator".to_string();
+                                    tui_feedback.push_error(format!(
+                                        "unknown profile @{name} — now on @orchestrator"
+                                    ));
+                                }
+                                Err(e) => {
+                                    tui_feedback.push_error(format!("Failed to switch agent: {e}"));
+                                }
                             }
                             tui_feedback.set_agent_profile(self.current_agent_label.clone());
                             tui_feedback.set_permission_mode(format!(
@@ -1822,7 +1871,9 @@ impl Repl {
                                 self.runtime.permission_mode()
                             ));
                             tui_feedback.set_model(self.runtime.model().to_string());
-                            tui_feedback.push_system(format!("switched to @{name}"));
+                            if !unknown_profile {
+                                tui_feedback.push_system(format!("switched to @{name}"));
+                            }
                         }
                     }
                     TuiCmd::OpenEditor => {

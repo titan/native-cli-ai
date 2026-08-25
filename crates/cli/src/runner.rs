@@ -182,11 +182,16 @@ impl SessionRuntime {
     ///
     /// Pass `None` to restore the default (no-profile) agent.
     /// Pass `Some("explorer")` to activate the explorer specialist, etc.
-    pub fn apply_agent_profile(&mut self, name: Option<&str>) -> Result<(), ProviderError> {
-        self.supervisor.apply_agent_profile(name)?;
+    /// Returns the applied profile name, or `None` when the session is on
+    /// the default (@orchestrator) persona (unresolvable names included).
+    pub fn apply_agent_profile(
+        &mut self,
+        name: Option<&str>,
+    ) -> Result<Option<String>, ProviderError> {
+        let applied = self.supervisor.apply_agent_profile(name)?;
         // Keep SessionRuntime's config snapshot in sync.
         self.config = self.supervisor.config().clone();
-        Ok(())
+        Ok(applied)
     }
 
     /// List all registered agent profile names (from the supervisor's config,

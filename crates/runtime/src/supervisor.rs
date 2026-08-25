@@ -1439,13 +1439,24 @@ impl Supervisor {
 
     /// Switch the active agent profile at runtime.
     ///
-    /// When `name` is `None`, the default (no-profile) harness prompt is restored.
-    /// When `name` matches a registered `[agents.<name>]` entry, its system prompt,
-    /// provider, model, and permission overrides are applied.
+    /// Returns the name of the persona actually in effect after the switch:
+    ///
+    /// - `Ok(Some(applied_name))` — a named profile was found and applied.
+    /// - `Ok(None)` — no named profile is active; the session is on the
+    ///   default (@orchestrator) harness persona. Reached via `name: None`,
+    ///   `name == Some("orchestrator")` (when unregistered), or an
+    ///   unresolvable name. Unresolvable names are deliberately non-fatal
+    ///   (a resume with a dead recorded name must not hard-fail), but the
+    ///   honest `None` lets callers report the fallback instead of a
+    ///   false "switched" success.
+    /// - `Err` — the provider rebuild failed.
     ///
     /// This rebuilds the LLM provider if the profile changes provider/model.
     /// An injected test provider (via `SupervisorConfig::provider`) is discarded here.
-    pub fn apply_agent_profile(&mut self, name: Option<&str>) -> Result<(), ProviderError> {
+    pub fn apply_agent_profile(
+        &mut self,
+        name: Option<&str>,
+    ) -> Result<Option<String>, ProviderError> {
         // Start from the clean base config (before any agent overrides).
         let mut config = self.base_config.clone();
         let profile = name.and_then(|n| config.agent_profile(n).cloned());
@@ -1490,11 +1501,17 @@ impl Supervisor {
         // (e.g. `build_provider` error) must not persist the new name — the
         // next resume would re-resolve it into an unbuildable provider and
         // fail loudly on a session whose switch merely failed.
+        // Truthful applied-name: Some only when a named profile actually
+        // resolved and was applied.
+        let applied = match (&profile, name) {
+            (Some(_), Some(n)) => Some(n.to_string()),
+            _ => None,
+        };
         self.agent_profile = profile;
         self.active_agent_name = name.map(str::to_string);
         self.rebuild_system_prompt();
         self.rebuild_context_manager_sync();
-        Ok(())
+        Ok(applied)
     }
 
     /// Reset for a fresh session: new ID, rebuild system prompt, clear lineage and cost.
