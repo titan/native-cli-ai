@@ -14,7 +14,7 @@ use std::sync::{Mutex, MutexGuard};
 /// `from_config_grants_git_global_config_paths_but_not_home_or_ssh` flake:
 /// `SandboxPolicy::from_config` derived `~/.gitconfig` from a temporarily
 /// replaced `HOME`, then the test body re-read the restored one.
-pub(crate) static ENV_TEST_MUTEX: Mutex<()> = Mutex::new(());
+static ENV_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
 /// RAII guard: snapshots and sets vars on creation, restores on drop, holding
 /// [`ENV_TEST_MUTEX`] for its whole lifetime. Bind it BEFORE any code that
