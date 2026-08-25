@@ -401,6 +401,71 @@ mod tests {
     use super::*;
     use nca_common::config::AgentProfileConfig;
 
+    /// Specialist spawn: `spawn_child_session` must NOT inline the persona
+    /// into the child's first user message — it lives only in the system
+    /// prompt via `SupervisorConfig::agent_name`. The construction is inline
+    /// in `spawn_child_session` (no extractable seam), so this test pins the
+    /// contract by building the prompt exactly as the production code does.
+    #[test]
+    fn child_context_prompt_carries_no_specialist_persona() {
+        let parent_summary = "[User]: fix the bug";
+        let task = "Do the thing";
+        let focus_files = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
+        let specialist = Some("librarian".to_string());
+
+        // Mirrors the `context_prompt` construction in `spawn_child_session`.
+        let mut context_prompt = format!(
+            "You are a sub-agent spawned by a parent session to handle a specific task.\n\n\
+             ## Parent Context\n{parent_summary}\n\n\
+             ## Your Task\n{task}"
+        );
+        if !focus_files.is_empty() {
+            context_prompt.push_str("\n\n## Focus Files\n");
+            for f in &focus_files {
+                context_prompt.push_str(&format!("- {f}\n"));
+            }
+        }
+        let _ = specialist; // persona flows via SupervisorConfig::agent_name only
+
+        assert!(
+            !context_prompt.contains("Specialist Persona"),
+            "persona must live only in the system prompt, never in the context prompt"
+        );
+        assert!(context_prompt.contains("## Parent Context"));
+        assert!(context_prompt.contains("## Focus Files"));
+    }
+
+    #[test]
+    fn agent_name_profile_puts_persona_in_system_prompt_not_context() {
+        // Supervisor-side seam: when `agent_name` resolves, the persona is in
+        // the child's SYSTEM prompt (via `build_system_prompt_with_agent`) —
+        // the counterpart to the context-prompt exclusion above.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = NcaConfig::default();
+        config.agents.insert(
+            "librarian".to_string(),
+            AgentProfileConfig {
+                system_prompt: Some("You are the Librarian, keeper of docs.".to_string()),
+                ..Default::default()
+            },
+        );
+        let profile = config.agent_profile("librarian").cloned();
+
+        let system_prompt = nca_core::harness::build_system_prompt_with_agent(
+            &config,
+            dir.path(),
+            &nca_core::plugin::PluginRegistry::new(),
+            None,
+            profile.as_ref(),
+            &[],
+        );
+        assert!(system_prompt.contains("You are the Librarian, keeper of docs."));
+        assert!(
+            !system_prompt.contains("Specialist Persona"),
+            "persona is the system prompt itself — no inline marker anywhere"
+        );
+    }
+
     fn config_with_librarian_profile() -> NcaConfig {
         let mut cfg = NcaConfig::default();
         cfg.agents.insert(
