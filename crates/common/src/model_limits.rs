@@ -118,7 +118,8 @@ pub const MODEL_CONTEXT_LIMITS: &[ModelContextLimits] = &[
         context_window: 32_000,
         max_output_tokens: 8192,
     },
-    // ZhipuAI GLM-5.3 (text-only, 1M context, 128K output; thinking always enabled)
+    // ZhipuAI GLM-5.3 and GLM-5.3-Flash (1M context, 128K output; thinking
+    // always enabled). glm-5.3-flash is native multimodal; same limits.
     ModelContextLimits {
         pattern: "glm-5.3",
         context_window: 1_000_000,
@@ -361,6 +362,9 @@ mod tests {
     fn test_detect_glm() {
         assert_eq!(detect_context_window("glm-5.3"), 1_000_000);
         assert_eq!(detect_max_output_tokens("glm-5.3"), 131_072);
+        // glm-5.3-flash shares the glm-5.3 limits (1M context, 128K output).
+        assert_eq!(detect_context_window("glm-5.3-flash"), 1_000_000);
+        assert_eq!(detect_max_output_tokens("glm-5.3-flash"), 131_072);
         assert_eq!(detect_context_window("glm-5.2"), 1_000_000);
         assert_eq!(detect_context_window("glm-5-turbo"), 200_000);
         assert_eq!(detect_max_output_tokens("glm-5-turbo"), 128_000);

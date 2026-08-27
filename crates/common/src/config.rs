@@ -351,7 +351,9 @@ impl NcaConfig {
             "openai" | "gpt" | "gpt4o" | "gpt4omini" => Some(ProviderKind::OpenAi),
             "claude" | "claude-sonnet" => Some(ProviderKind::Anthropic),
             "openrouter" => Some(ProviderKind::OpenRouter),
-            "zhipuai" | "glm" | "glm5" | "glm-5.2" | "glm-5.3" => Some(ProviderKind::ZhipuAI),
+            "zhipuai" | "glm" | "glm5" | "glm-5.2" | "glm-5.3" | "glm-5.3-flash" => {
+                Some(ProviderKind::ZhipuAI)
+            }
             "default" | "deepseek" | "ds" | "deepseek-v4" | "dsv4" | "dsv4p" | "deepseek-v3"
             | "dsv3" | "deepseek-r1" | "dsr1" => Some(ProviderKind::DeepSeek),
             _ => None,
@@ -995,7 +997,9 @@ impl ProviderKind {
             "openai" | "open-ai" | "gpt" => Some(Self::OpenAi),
             "anthropic" | "claude" => Some(Self::Anthropic),
             "openrouter" | "open-router" => Some(Self::OpenRouter),
-            "zhipuai" | "zhipu" | "glm" | "glm-5" | "glm-5.2" | "glm-5.3" => Some(Self::ZhipuAI),
+            "zhipuai" | "zhipu" | "glm" | "glm-5" | "glm-5.2" | "glm-5.3" | "glm-5.3-flash" => {
+                Some(Self::ZhipuAI)
+            }
             "deepseek" => Some(Self::DeepSeek),
             "kimi" | "k3" | "kimi-k3" => Some(Self::Kimi),
             "custom" => Some(Self::Custom),
@@ -2449,6 +2453,7 @@ fn default_model_aliases() -> BTreeMap<String, String> {
         ("glm".into(), "glm-5.3".into()),
         ("glm5".into(), "glm-5.3".into()),
         ("glm-5.3".into(), "glm-5.3".into()),
+        ("glm-5.3-flash".into(), "glm-5.3-flash".into()),
         ("glm-5.2".into(), "glm-5.2".into()),
         // Kimi (via Anthropic-compatible Kimi for Coding endpoint)
         ("kimi".into(), "k3".into()),
@@ -2539,6 +2544,21 @@ mod tests {
         assert_eq!(config.model.default_model, "glm-5.3");
         // DeepSeek model must NOT have been polluted
         assert_eq!(config.provider.deepseek.model, "deepseek-v4-flash");
+    }
+
+    #[test]
+    fn glm_5_3_flash_switches_provider_and_resolves_verbatim() {
+        // "glm-5.3-flash" is a full model id, not an alias to rewrite: it must
+        // switch the provider to ZhipuAI and pass through unchanged.
+        let mut config = NcaConfig::default();
+        config.provider.default = ProviderKind::DeepSeek;
+        config.sync_default_model_from_provider();
+
+        config.apply_model_override("glm-5.3-flash");
+
+        assert_eq!(config.provider.default, ProviderKind::ZhipuAI);
+        assert_eq!(config.provider.zhipuai.model, "glm-5.3-flash");
+        assert_eq!(config.model.default_model, "glm-5.3-flash");
     }
 
     #[test]

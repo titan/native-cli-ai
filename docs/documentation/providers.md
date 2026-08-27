@@ -160,7 +160,7 @@ return an empty `content` with `finish_reason: "length"`.
 
 nca handles this in two ways:
 
-- For thinking-locked models (`glm-5.3`), `max_tokens` is floored to 65536
+- For thinking-locked models (`glm-5.3`, `glm-5.3-flash`), `max_tokens` is floored to 65536
   (matching ZhipuAI's own coding examples) unless you set a larger value.
 - A truncation (`finish_reason: "length"`) with no content fails fast with a
 diagnostic pointing at the cap, instead of being misread as a retryable

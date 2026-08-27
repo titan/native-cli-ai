@@ -460,7 +460,12 @@ pub async fn fetch_provider_model_ids(config: &NcaConfig) -> Vec<String> {
         ProviderKind::Anthropic => fetch_anthropic_model_ids(&client, config).await,
         ProviderKind::OpenAi => fetch_openai_model_ids(&client, config).await,
         ProviderKind::MiniMax => vec!["MiniMax-M2.5".into(), "MiniMax-M2.7".into()],
-        ProviderKind::ZhipuAI => vec!["glm-5.3".into(), "glm-5.2".into(), "glm-5-turbo".into()],
+        ProviderKind::ZhipuAI => vec![
+            "glm-5.3".into(),
+            "glm-5.3-flash".into(),
+            "glm-5.2".into(),
+            "glm-5-turbo".into(),
+        ],
         ProviderKind::DeepSeek => vec![
             "deepseek-v4-flash".into(),
             "deepseek-v4-pro".into(),

@@ -35,11 +35,11 @@ pub fn model_accepts_native_images(kind: ProviderKind, model: &str) -> bool {
                 || m.contains("vision")
                 || m.contains("qwen-vl")
         }
-        // GLM-5.3 is text-only; glm-5.2 and glm-4v/glm-4 models accept native images.
+        // glm-5.3 is text-only; glm-5.3-flash is the GLM-5 series' first
+        // native multimodal model; glm-5.2 and glm-4v/glm-4 accept native images.
         ProviderKind::ZhipuAI => {
-            (m.contains("glm-5") && !m.contains("glm-5.3"))
-                || m.contains("glm-4v")
-                || m.contains("glm-4")
+            let text_only = m.contains("glm-5.3") && !m.contains("glm-5.3-flash");
+            (m.contains("glm-5") && !text_only) || m.contains("glm-4v") || m.contains("glm-4")
         }
         ProviderKind::DeepSeek => false, // DeepSeek does not support native image inputs
         ProviderKind::Kimi => false,     // Kimi for Coding: k3 specs don't list native image input
@@ -69,10 +69,16 @@ mod tests {
     }
 
     #[test]
-    fn glm_5_3_is_text_only() {
+    fn glm_5_3_is_text_only_but_flash_is_multimodal() {
         assert!(!model_accepts_native_images(
             ProviderKind::ZhipuAI,
             "glm-5.3"
+        ));
+        // glm-5.3-flash: GLM-5 series' first native multimodal model
+        // (image / video / file input).
+        assert!(model_accepts_native_images(
+            ProviderKind::ZhipuAI,
+            "glm-5.3-flash"
         ));
         assert!(model_accepts_native_images(
             ProviderKind::ZhipuAI,
