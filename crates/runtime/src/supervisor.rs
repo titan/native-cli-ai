@@ -370,24 +370,34 @@ fn persist_allow_pattern(workspace_root: &Path, pattern: String) {
 /// Mirrors [`persist_allow_pattern`]: loads the freshest config from disk,
 /// updates `extra_paths` to match the live `RealFs` state, and writes back
 /// via the diff algorithm so only the workspace-local file is touched.
-fn persist_mounted_paths(workspace_root: &Path, paths: Vec<PathBuf>) {
+///
+/// Awaited by [`Supervisor::mount_path`] / [`Supervisor::unmount_path`] rather
+/// than spawned-and-dropped: dropping the join handle meant a fast process exit
+/// right after `/mount` could discard the queued task and silently lose the
+/// write, and callers had no way to know when the file was durably updated.
+async fn persist_mounted_paths(workspace_root: &Path, paths: Vec<PathBuf>) {
     let root = workspace_root.to_path_buf();
-    std::mem::drop(tokio::runtime::Handle::current().spawn_blocking(move || {
-        match nca_common::config::NcaConfig::load_for_workspace(&root) {
-            Ok(mut config) => {
-                if config.extra_paths != paths {
-                    config.extra_paths = paths;
-                    tracing::debug!("persisted mounted paths to workspace config");
-                    if let Err(e) = config.save_workspace_file(&root) {
-                        tracing::warn!("failed to persist mounted paths: {e}");
+    let joined =
+        tokio::task::spawn_blocking(
+            move || match nca_common::config::NcaConfig::load_for_workspace(&root) {
+                Ok(mut config) => {
+                    if config.extra_paths != paths {
+                        config.extra_paths = paths;
+                        tracing::debug!("persisted mounted paths to workspace config");
+                        if let Err(e) = config.save_workspace_file(&root) {
+                            tracing::warn!("failed to persist mounted paths: {e}");
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                tracing::warn!("failed to load config for mount persistence: {e}");
-            }
-        }
-    }));
+                Err(e) => {
+                    tracing::warn!("failed to load config for mount persistence: {e}");
+                }
+            },
+        )
+        .await;
+    if let Err(join_err) = joined {
+        tracing::warn!("mounted-path persistence task did not complete: {join_err}");
+    }
 }
 
 /// Resolve the session's provider: an injected provider wins verbatim, else
@@ -1621,18 +1631,34 @@ impl Supervisor {
     }
 
     /// Mount an additional directory so tools can access files outside the workspace root.
-    pub fn mount_path(&mut self, path: &Path) -> Result<(), String> {
+    ///
+    /// Keeps the in-memory `config` / `base_config` `extra_paths` in lockstep
+    /// with the live `RealFs` mount list. Without this, any later whole-config
+    /// save (`/model`, `/thinking`, `/set-editor`, … — they all serialize
+    /// `Supervisor::config`) rewrote `.nca/config.local.toml` from the stale
+    /// pre-mount snapshot and silently erased the freshly persisted entry.
+    pub async fn mount_path(&mut self, path: &Path) -> Result<(), String> {
         self.fs.mount_path(path).map_err(|e| e.to_string())?;
-        persist_mounted_paths(&self.workspace_root, self.fs.mounted_paths());
+        let paths = self.fs.mounted_paths();
+        self.config.extra_paths = paths.clone();
+        self.base_config.extra_paths = paths.clone();
+        persist_mounted_paths(&self.workspace_root, paths).await;
         self.rebuild_system_prompt();
         self.refresh_sandbox_policy();
         Ok(())
     }
 
     /// Unmount a previously mounted directory.
-    pub fn unmount_path(&mut self, path: &Path) -> Result<(), String> {
+    ///
+    /// Mirrors [`Self::mount_path`]: syncs the in-memory `extra_paths` and
+    /// awaits persistence, so the removal reaches disk before the caller learns
+    /// of success and later config saves cannot resurrect the entry.
+    pub async fn unmount_path(&mut self, path: &Path) -> Result<(), String> {
         self.fs.unmount_path(path).map_err(|e| e.to_string())?;
-        persist_mounted_paths(&self.workspace_root, self.fs.mounted_paths());
+        let paths = self.fs.mounted_paths();
+        self.config.extra_paths = paths.clone();
+        self.base_config.extra_paths = paths.clone();
+        persist_mounted_paths(&self.workspace_root, paths).await;
         self.rebuild_system_prompt();
         self.refresh_sandbox_policy();
         Ok(())

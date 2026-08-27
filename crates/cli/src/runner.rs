@@ -348,13 +348,13 @@ impl SessionRuntime {
     // ── Mount management ─────────────────────────────────────────────
 
     /// Mount an additional directory so tools can access files outside the workspace root.
-    pub fn mount_path(&mut self, path: &std::path::Path) -> Result<(), String> {
-        self.supervisor.mount_path(path)
+    pub async fn mount_path(&mut self, path: &std::path::Path) -> Result<(), String> {
+        self.supervisor.mount_path(path).await
     }
 
     /// Unmount a previously mounted directory.
-    pub fn unmount_path(&mut self, path: &std::path::Path) -> Result<(), String> {
-        self.supervisor.unmount_path(path)
+    pub async fn unmount_path(&mut self, path: &std::path::Path) -> Result<(), String> {
+        self.supervisor.unmount_path(path).await
     }
 
     /// List currently mounted extra paths.

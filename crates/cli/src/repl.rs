@@ -1032,7 +1032,7 @@ impl Repl {
                     }
                 } else {
                     let path = std::path::Path::new(rest_trim);
-                    match self.runtime.mount_path(path) {
+                    match self.runtime.mount_path(path).await {
                         Ok(()) => {
                             let mounted = self.runtime.mounted_paths();
                             out.println(&format!(
@@ -1053,7 +1053,7 @@ impl Repl {
                     out.println("Usage: /unmount <path>   (alias: /umount)");
                 } else {
                     let path = std::path::Path::new(rest_trim);
-                    match self.runtime.unmount_path(path) {
+                    match self.runtime.unmount_path(path).await {
                         Ok(()) => {
                             out.println(&format!("[unmount] {}", path.display()));
                         }
