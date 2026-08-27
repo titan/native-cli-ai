@@ -50,7 +50,18 @@ impl SandboxPolicy {
     /// Build a policy from config: built-in read-only system roots plus
     /// `config.ro_paths`, workspace + temp plus `config.rw_paths`, and the
     /// essential device nodes ([`ESSENTIAL_DEVICES`]).
-    pub fn from_config(config: &SandboxConfig, workspace_root: &std::path::Path) -> Self {
+    ///
+    /// `mounts` are the live `/mount` paths (session `extra_paths`). When
+    /// `config.inherit_mounts` (default) they are granted read-write so
+    /// sandboxed shell commands can reach what file tools already can —
+    /// `/mount` is an explicit user authorization, and file tools get rw on
+    /// mounts, so propagating rw adds no authority the user has not granted.
+    /// Non-existent paths are dropped (same existence filter as `ro_paths`).
+    pub fn from_config(
+        config: &SandboxConfig,
+        workspace_root: &std::path::Path,
+        mounts: &[PathBuf],
+    ) -> Self {
         let mut ro: Vec<PathBuf> = [
             "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/nix", "/opt",
         ]
@@ -95,6 +106,11 @@ impl SandboxPolicy {
                 .filter(|p| p.exists()),
         );
         rw.extend(config.rw_paths.iter().cloned());
+        // Mounted paths (rw) — see the method doc for the authorization
+        // argument. Skipped entirely when `inherit_mounts = false`.
+        if config.inherit_mounts {
+            rw.extend(mounts.iter().filter(|p| p.exists()).cloned());
+        }
         // POSIX shell substrate: must come last so config `rw_paths` cannot
         // accidentally shadow them, and filtered by existence so non-Linux
         // targets (and stripped containers) skip silently.
@@ -366,8 +382,9 @@ mod tests {
             rw_paths: vec![PathBuf::from("/data")],
             net: false,
             env_allow: nca_common::config::default_sandbox_env_allow(),
+            inherit_mounts: true,
         };
-        let p = SandboxPolicy::from_config(&config, std::path::Path::new("/work/root"));
+        let p = SandboxPolicy::from_config(&config, std::path::Path::new("/work/root"), &[]);
 
         assert!(p.rw.contains(&PathBuf::from("/work/root")));
         assert!(p.rw.contains(&PathBuf::from("/data")));
@@ -380,7 +397,8 @@ mod tests {
         // Ordinary shell redirections (`2>/dev/null`, `</dev/zero`) and
         // entropy reads must not fail EACCES under confinement.
         let _env = env_read_lock();
-        let p = SandboxPolicy::from_config(&SandboxConfig::default(), std::path::Path::new("/w"));
+        let p =
+            SandboxPolicy::from_config(&SandboxConfig::default(), std::path::Path::new("/w"), &[]);
         for dev in ESSENTIAL_DEVICES {
             if std::path::Path::new(dev).exists() {
                 assert!(p.rw.contains(&PathBuf::from(dev)), "missing {dev}");
@@ -399,7 +417,8 @@ mod tests {
         // parallel env-mutating test (pty's EnvGuard HOME swap) cannot change
         // HOME between the two reads.
         let _env = env_read_lock();
-        let p = SandboxPolicy::from_config(&SandboxConfig::default(), std::path::Path::new("/w"));
+        let p =
+            SandboxPolicy::from_config(&SandboxConfig::default(), std::path::Path::new("/w"), &[]);
 
         let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
@@ -445,7 +464,7 @@ mod tests {
         // not fail with "Permission denied".
         let _env = env_read_lock();
         let config = SandboxConfig::default();
-        let p = SandboxPolicy::from_config(&config, std::path::Path::new("."));
+        let p = SandboxPolicy::from_config(&config, std::path::Path::new("."), &[]);
         let out = exec_confined("echo noisy >/dev/null 2>&1; echo pass", &p)
             .expect("confined exec with /dev/null redirect");
         assert_eq!(out.exit_code, Some(0), "{:?}", out.combined);
@@ -477,7 +496,7 @@ mod tests {
         // every sandboxed shell call through git fails.
         let _env = env_read_lock();
         let config = SandboxConfig::default();
-        let p = SandboxPolicy::from_config(&config, std::path::Path::new("."));
+        let p = SandboxPolicy::from_config(&config, std::path::Path::new("."), &[]);
         // Run from the temp dir (a rw root in every policy): `git config`
         // still walks the parent directory chain looking for a repo, and
         // outside one it needs only the global/system config chain — exactly
@@ -583,5 +602,97 @@ mod tests {
         let out = exec_confined("echo hello-sandbox", &p).expect("confined exec");
         assert_eq!(out.exit_code, Some(0));
         assert!(out.combined.contains("hello-sandbox"), "{:?}", out.combined);
+    }
+
+    #[test]
+    fn from_config_inherits_mounts_as_rw_by_default() {
+        let _env = env_read_lock();
+        let mounted = tempfile::tempdir().expect("tempdir");
+        let config = SandboxConfig::default();
+        assert!(config.inherit_mounts, "default must propagate mounts");
+
+        let p = SandboxPolicy::from_config(
+            &config,
+            std::path::Path::new("/work/root"),
+            &[mounted.path().to_path_buf()],
+        );
+        assert!(
+            p.rw.contains(&mounted.path().to_path_buf()),
+            "mounted dir must be a rw root"
+        );
+    }
+
+    #[test]
+    fn from_config_inherit_mounts_false_excludes_mounts() {
+        let _env = env_read_lock();
+        let mounted = tempfile::tempdir().expect("tempdir");
+        let config = SandboxConfig {
+            inherit_mounts: false,
+            ..SandboxConfig::default()
+        };
+
+        let p = SandboxPolicy::from_config(
+            &config,
+            std::path::Path::new("/work/root"),
+            &[mounted.path().to_path_buf()],
+        );
+        assert!(
+            !p.rw.contains(&mounted.path().to_path_buf()),
+            "inherit_mounts = false must keep mounts out of the policy"
+        );
+    }
+
+    #[test]
+    fn from_config_drops_nonexistent_mounts() {
+        let _env = env_read_lock();
+        let ghost = PathBuf::from("/definitely/not/a/real/mount/point");
+        let config = SandboxConfig::default();
+
+        let p = SandboxPolicy::from_config(
+            &config,
+            std::path::Path::new("/work/root"),
+            std::slice::from_ref(&ghost),
+        );
+        assert!(!p.rw.contains(&ghost), "non-existent mount must be dropped");
+    }
+
+    #[test]
+    fn exec_confined_mounted_dir_writable_on_supported_kernel() {
+        if !backend_supported() {
+            eprintln!("SKIP: Landlock unavailable on this kernel");
+            return;
+        }
+        // End-to-end regression for the mount/sandbox split: a path granted
+        // via mounts must be writable by a confined shell command, matching
+        // what file tools could already do through RealFs. Fixture lives
+        // under bare $HOME — deliberately NOT a default rw root (unlike /tmp)
+        // — so success proves the mount grant, not a default root.
+        let Some(home) = std::env::var_os("HOME") else {
+            eprintln!("SKIP: HOME unset");
+            return;
+        };
+        // Skip honestly when the hosting process is itself sandboxed and
+        // cannot create the fixture (nca dogfooding).
+        let mounted = std::path::Path::new(&home)
+            .join(format!(".nca-sbox-unit-mount-{}", std::process::id()));
+        if let Err(e) = std::fs::create_dir_all(&mounted) {
+            eprintln!("SKIP: cannot create mount fixture under HOME ({e})");
+            return;
+        }
+        let config = SandboxConfig::default();
+        let p = SandboxPolicy::from_config(
+            &config,
+            std::path::Path::new("."),
+            std::slice::from_ref(&mounted),
+        );
+        let marker = mounted.join("marker.txt");
+        let out = exec_confined(
+            &format!("echo ok > {} && cat {}", marker.display(), marker.display()),
+            &p,
+        )
+        .expect("confined exec writing to mounted dir");
+        let _ = std::fs::remove_dir_all(&mounted);
+        assert_eq!(out.exit_code, Some(0), "{:?}", out.combined);
+        assert!(out.combined.contains("ok"), "{:?}", out.combined);
     }
 }

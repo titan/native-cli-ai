@@ -50,6 +50,7 @@ fn required_config() -> SandboxConfig {
         rw_paths: Vec::new(),
         net: true,
         env_allow: nca_common::config::default_sandbox_env_allow(),
+        inherit_mounts: true,
     }
 }
 
@@ -144,8 +145,8 @@ async fn pty_required_mode_confines_writes_to_workspace_root() {
     }
 
     let ws = tempfile::tempdir().expect("tempdir");
-    let mut m = PtyManager::new(ws.path());
-    m.set_sandbox_config(required_config());
+    let m = PtyManager::new(ws.path());
+    m.set_sandbox_config(required_config(), &[]);
 
     // (1) Write outside all rw roots (/etc is ro under the wired policy) →
     //     must fail. Clean any stale file from earlier runs so the assertion
@@ -197,4 +198,91 @@ async fn pty_required_mode_confines_writes_to_workspace_root() {
         "write inside default tmp rw root failed: {:?}",
         tmp_ok.stdout
     );
+}
+
+/// `/mount` → sandbox propagation: a path passed to `set_sandbox_config` as
+/// a mount becomes rw for subsequent `exec_streaming` commands (default
+/// `inherit_mounts`). Also covers the mid-session refresh seam: re-calling
+/// `set_sandbox_config` with the new mount list widens the policy without
+/// rebuilding the manager. Kernel-gated.
+///
+/// The mount fixture must live OUTSIDE the default rw roots (workspace,
+/// `std::env::temp_dir()`, cargo/cache homes) — a `tempfile::tempdir()` is
+/// under /tmp and would be writable regardless of the mount. Bare `$HOME`
+/// is deliberately not a default root (secrets), so a scratch dir there is
+/// confined until mounted.
+#[tokio::test(flavor = "multi_thread")]
+async fn pty_mounted_paths_become_rw_after_refresh() {
+    if !backend_supported() {
+        eprintln!("SKIP: Landlock unavailable on this kernel");
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        eprintln!("SKIP: HOME unset; cannot build a mount fixture outside rw roots");
+        return;
+    };
+
+    let ws = tempfile::tempdir().expect("tempdir workspace");
+    let mounted = std::path::Path::new(&home).join(format!(
+        ".nca-sbox-mount-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    // Hosting process itself sandboxed (e.g. nca dogfooding: bare $HOME is
+    // not an rw root) — cannot build a fixture outside the default rw roots,
+    // so the pre/post contrast is unobservable. Skip honestly instead of
+    // failing; unconfined environments (CI) run the full assertion.
+    if let Err(e) = std::fs::create_dir_all(&mounted) {
+        eprintln!("SKIP: cannot create mount fixture under HOME ({e})");
+        return;
+    }
+    let m = PtyManager::new(ws.path());
+
+    // Before the mount: writing inside the (not yet mounted) dir fails.
+    m.set_sandbox_config(required_config(), &[]);
+    let denied = m
+        .exec_streaming(
+            &format!("touch {}/pre-mount", mounted.display()),
+            10,
+            &progress("pre-mount-write"),
+        )
+        .await
+        .expect("command should spawn");
+    assert_ne!(denied.exit_code, 0, "pre-mount write must be confined");
+
+    // Simulate `/mount`: refresh the policy with the live mount list.
+    m.set_sandbox_config(required_config(), std::slice::from_ref(&mounted));
+    let allowed = m
+        .exec_streaming(
+            &format!(
+                "echo ok > {}/post-mount && cat {}/post-mount",
+                mounted.display(),
+                mounted.display()
+            ),
+            10,
+            &progress("post-mount-write"),
+        )
+        .await
+        .expect("command should spawn");
+    assert_eq!(
+        allowed.exit_code, 0,
+        "post-mount write must succeed: {:?}",
+        allowed.stdout
+    );
+
+    // Confinement elsewhere is untouched: /etc is still ro.
+    let still = m
+        .exec_streaming(
+            "touch /etc/should-not-exist-p5m",
+            10,
+            &progress("etc-write"),
+        )
+        .await
+        .expect("command should spawn");
+    assert_ne!(still.exit_code, 0, "/etc must stay read-only");
+
+    let _ = std::fs::remove_dir_all(&mounted);
 }

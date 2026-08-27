@@ -682,6 +682,7 @@ async fn try_main() -> anyhow::Result<()> {
             let policy = nca_runtime::sandbox::SandboxPolicy::from_config(
                 &config.permissions.sandbox,
                 &workspace_root,
+                &config.extra_paths,
             );
             let out = tokio::task::spawn_blocking(move || {
                 nca_runtime::sandbox::exec_confined(&cmd, &policy)

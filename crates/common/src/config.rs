@@ -1622,9 +1622,20 @@ pub struct SandboxConfig {
     /// (structurally required to locate executables).
     #[serde(default = "default_sandbox_env_allow")]
     pub env_allow: Vec<String>,
+    /// `true` (default) = paths mounted via `/mount` (persisted as
+    /// `extra_paths`) are automatically granted read-write access in the
+    /// Landlock policy, so shell commands can reach what file tools already
+    /// can. `false` keeps mounts file-tool-only; shell access then requires
+    /// an explicit `rw_paths` entry.
+    #[serde(default = "default_sandbox_inherit_mounts")]
+    pub inherit_mounts: bool,
 }
 
 fn default_sandbox_net() -> bool {
+    true
+}
+
+fn default_sandbox_inherit_mounts() -> bool {
     true
 }
 
@@ -1659,6 +1670,7 @@ impl Default for SandboxConfig {
             rw_paths: Vec::new(),
             net: true,
             env_allow: default_sandbox_env_allow(),
+            inherit_mounts: true,
         }
     }
 }
@@ -2308,6 +2320,9 @@ impl SandboxConfig {
         if let Some(env_allow) = partial.env_allow {
             self.env_allow = env_allow;
         }
+        if let Some(inherit_mounts) = partial.inherit_mounts {
+            self.inherit_mounts = inherit_mounts;
+        }
     }
 }
 
@@ -2327,6 +2342,7 @@ struct PartialSandboxConfig {
     rw_paths: Option<Vec<PathBuf>>,
     net: Option<bool>,
     env_allow: Option<Vec<String>>,
+    inherit_mounts: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -3345,6 +3361,23 @@ extra_paths = ["/home/user/projects", "/opt/data"]
                 "mode = {raw} should parse"
             );
         }
+    }
+
+    #[test]
+    fn sandbox_inherit_mounts_defaults_true_and_parses_false() {
+        // Absent key → default true (mounts propagate to the sandbox).
+        let partial: PartialNcaConfig =
+            toml::from_str("[permissions.sandbox]\nmode = \"off\"\n").expect("parse");
+        let mut config = NcaConfig::default();
+        config.merge(partial);
+        assert!(config.permissions.sandbox.inherit_mounts);
+
+        // Explicit false → honored.
+        let partial: PartialNcaConfig =
+            toml::from_str("[permissions.sandbox]\ninherit_mounts = false\n").expect("parse");
+        let mut config = NcaConfig::default();
+        config.merge(partial);
+        assert!(!config.permissions.sandbox.inherit_mounts);
     }
 
     #[test]

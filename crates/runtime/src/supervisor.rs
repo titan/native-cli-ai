@@ -485,8 +485,10 @@ impl Supervisor {
 
         // Wire the P5 Landlock sandbox into every PTY shell execution
         // (resolved once here; per-exec confinement applies only to children).
-        let mut pty = PtyManager::new(&workspace_root);
-        pty.set_sandbox_config(config.permissions.sandbox.clone());
+        // Live mounts (restored above + any runtime `/mount`) are passed so
+        // the policy matches file-tool visibility.
+        let pty = PtyManager::new(&workspace_root);
+        pty.set_sandbox_config(config.permissions.sandbox.clone(), &fs.mounted_paths());
         let pty = Arc::new(pty);
         let pty_for_supervisor = pty.clone();
         tools.register(Box::new(crate::bash_tool::RuntimeBashTool::new(pty)));
@@ -1606,11 +1608,24 @@ impl Supervisor {
 
     // ── Mount management ─────────────────────────────────────────────
 
+    /// Rebuild the PTY sandbox policy from the current config and live
+    /// mounts. Called at `create` (after restoring persisted mounts) and after
+    /// every `/mount` + `/unmount`, so shell-command visibility tracks
+    /// file-tool visibility without a session restart. Honors
+    /// `[permissions.sandbox] inherit_mounts` (default on).
+    fn refresh_sandbox_policy(&self) {
+        self.pty.set_sandbox_config(
+            self.config.permissions.sandbox.clone(),
+            &self.fs.mounted_paths(),
+        );
+    }
+
     /// Mount an additional directory so tools can access files outside the workspace root.
     pub fn mount_path(&mut self, path: &Path) -> Result<(), String> {
         self.fs.mount_path(path).map_err(|e| e.to_string())?;
         persist_mounted_paths(&self.workspace_root, self.fs.mounted_paths());
         self.rebuild_system_prompt();
+        self.refresh_sandbox_policy();
         Ok(())
     }
 
@@ -1619,6 +1634,7 @@ impl Supervisor {
         self.fs.unmount_path(path).map_err(|e| e.to_string())?;
         persist_mounted_paths(&self.workspace_root, self.fs.mounted_paths());
         self.rebuild_system_prompt();
+        self.refresh_sandbox_policy();
         Ok(())
     }
 

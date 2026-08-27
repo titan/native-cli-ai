@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
@@ -59,7 +59,13 @@ impl PtyManager {
     /// (warn-once on auto degradation); `required` + unavailable is logged as
     /// an error and degrades to unconfined rather than breaking every shell
     /// tool call.
-    pub fn set_sandbox_config(&mut self, cfg: SandboxConfig) {
+    ///
+    /// `mounts` are the live `/mount` paths; they become rw roots when
+    /// `cfg.inherit_mounts` (default). Takes `&self` so the supervisor can
+    /// refresh the policy after a runtime `/mount` without rebuilding the
+    /// `Arc`-shared manager — each confined child snapshots the policy at
+    /// spawn time, so later mounts apply to the next command.
+    pub fn set_sandbox_config(&self, cfg: SandboxConfig, mounts: &[PathBuf]) {
         let decision = sandbox::resolve(
             cfg.mode,
             &sandbox::backend_supported,
@@ -67,9 +73,11 @@ impl PtyManager {
             &|| tracing::warn!("Landlock sandbox unavailable; PTY commands run unconfined"),
         );
         let policy = match decision {
-            Ok(sandbox::SandboxDecision::Confined) => {
-                Some(SandboxPolicy::from_config(&cfg, &self.workspace_root()))
-            }
+            Ok(sandbox::SandboxDecision::Confined) => Some(SandboxPolicy::from_config(
+                &cfg,
+                &self.workspace_root(),
+                mounts,
+            )),
             Ok(sandbox::SandboxDecision::Unconfined) => None,
             Err(e) => {
                 tracing::error!("sandbox required but unavailable: {e}; running unconfined");
