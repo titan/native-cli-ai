@@ -26,10 +26,21 @@ pub fn openai_request_body(
     temperature: f32,
     workspace_root: &Path,
 ) -> Result<Value, ProviderError> {
-    let tools = if tools.is_empty() {
-        None
-    } else {
-        Some(
+    let mut body = json!({
+        "model": model,
+        "messages": to_openai_messages(messages, workspace_root)?,
+        "stream": true,
+        "stream_options": {
+            "include_usage": true
+        },
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    });
+    // Omit the key entirely when there are no tools: `"tools": null` is
+    // rejected by strict OpenAI-compatible gateways (e.g. ZhipuAI 400s the
+    // request instead of ignoring the field).
+    if !tools.is_empty() {
+        body["tools"] = json!(
             tools
                 .iter()
                 .map(|tool| {
@@ -42,21 +53,10 @@ pub fn openai_request_body(
                         }
                     })
                 })
-                .collect::<Vec<_>>(),
-        )
-    };
-
-    Ok(json!({
-        "model": model,
-        "messages": to_openai_messages(messages, workspace_root)?,
-        "tools": tools,
-        "stream": true,
-        "stream_options": {
-            "include_usage": true
-        },
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }))
+                .collect::<Vec<_>>()
+        );
+    }
+    Ok(body)
 }
 
 pub fn spawn_openai_stream(
@@ -384,6 +384,24 @@ fn tool_content_string(content: &MessageContent) -> String {
     }
 }
 
+/// Compact per-message shape summary for error-path diagnostics, e.g.
+/// `System(text:4821),User(text:12)` or `User(parts:2)` for array content.
+/// Lets a provider-side 400 (ZhipuAI 1213/1214 class) be diagnosed from the
+/// log alone without reproducing the turn.
+fn messages_shape(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .map(|m| {
+            let content = match &m.content {
+                MessageContent::Text(t) => format!("text:{}", t.len()),
+                MessageContent::Parts(p) => format!("parts:{}", p.len()),
+            };
+            format!("{:?}({content})", m.role)
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn openai_user_content_value(
     content: &MessageContent,
     workspace_root: &Path,
@@ -417,6 +435,20 @@ fn openai_user_content_value(
                     }
                 }
             }
+            // Text-only parts collapse to a plain string: text-model chat
+            // endpoints on strict OpenAI-compatible gateways (ZhipuAI among
+            // them) reject array-form content for their text models with a
+            // generic "prompt not received" 400. Arrays are only emitted when
+            // an image block is actually present.
+            let has_image = parts.iter().any(|p| matches!(p, ContentPart::Image { .. }));
+            if !has_image {
+                let text = blocks
+                    .iter()
+                    .filter_map(|b| b["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return Ok(json!(text));
+            }
             Ok(Value::Array(blocks))
         }
     }
@@ -426,25 +458,61 @@ fn to_openai_messages(
     messages: &[Message],
     workspace_root: &Path,
 ) -> Result<Vec<Value>, ProviderError> {
+    // Preflight: strict gateways (ZhipuAI error 1213 "未正常接收到prompt参数")
+    // return an opaque 400 for empty prompt payloads. Fail loudly here with a
+    // precise, local error instead of a provider-side riddle.
+    if messages.is_empty() {
+        return Err(ProviderError::RequestFailed(
+            "refusing to send a request with an empty messages list".into(),
+        ));
+    }
+
     let mut out = Vec::new();
 
-    for message in messages {
+    for (index, message) in messages.iter().enumerate() {
         match message.role {
-            Role::System => out.push(json!({
-                "role": "system",
-                "content": tool_content_string(&message.content),
-            })),
+            Role::System => {
+                let content = tool_content_string(&message.content);
+                if content.trim().is_empty() {
+                    return Err(ProviderError::RequestFailed(format!(
+                        "refusing to send an empty system message (index {index})"
+                    )));
+                }
+                out.push(json!({
+                    "role": "system",
+                    "content": content,
+                }));
+            }
             Role::User => {
                 let c = openai_user_content_value(&message.content, workspace_root)?;
+                // Empty-payload guard on the WIRE value (not the in-memory
+                // representation): whitespace-only text and empty Parts both
+                // collapse to an unparsable prompt server-side (ZhipuAI 1213).
+                let empty = match &c {
+                    Value::String(s) => s.trim().is_empty(),
+                    Value::Array(a) => a.is_empty(),
+                    _ => false,
+                };
+                if empty {
+                    return Err(ProviderError::RequestFailed(format!(
+                        "refusing to send an empty user message (index {index})"
+                    )));
+                }
                 out.push(json!({
                     "role": "user",
                     "content": c,
                 }));
             }
             Role::Assistant => {
+                let has_tool_calls = message.tool_calls.is_some();
+                if message.content.is_empty() && !has_tool_calls {
+                    return Err(ProviderError::RequestFailed(format!(
+                        "refusing to send an empty assistant message with no tool calls (index {index})"
+                    )));
+                }
                 let mut value = json!({
                     "role": "assistant",
-                    "content": if message.content.is_empty() && message.tool_calls.is_some() {
+                    "content": if message.content.is_empty() && has_tool_calls {
                         Value::Null
                     } else {
                         openai_user_content_value(&message.content, workspace_root)?
@@ -659,6 +727,8 @@ impl Provider for OpenAiCompatProvider {
                 model = %model,
                 http_status = %status,
                 response_preview = %truncate_bytes_safe(&body_text, 500),
+                request_messages_shape = %messages_shape(messages),
+                request_tools = tools.len(),
                 "provider_http_error"
             );
             return Err(map_provider_error(status, body_text));
@@ -772,5 +842,123 @@ mod tests {
     fn truncate_bytes_safe_returns_input_under_limit() {
         assert_eq!(truncate_bytes_safe("hello", 200), "hello");
         assert_eq!(truncate_bytes_safe("", 500), "");
+    }
+
+    // ---- ZhipuAI 1213-class guardrails: prompt payload must deserialize ----
+
+    #[test]
+    fn text_only_parts_collapse_to_plain_string_content() {
+        let messages = vec![Message::user_with_parts(vec![
+            ContentPart::Text {
+                text: "hello ".into(),
+            },
+            ContentPart::Text {
+                text: "world".into(),
+            },
+        ])];
+        let out = to_openai_messages(&messages, std::path::Path::new(".")).expect("messages");
+        assert!(
+            out[0]["content"].is_string(),
+            "text-only parts must not serialize as an array: {}",
+            out[0]
+        );
+        assert_eq!(out[0]["content"], "hello \nworld");
+    }
+
+    #[test]
+    fn image_parts_still_serialize_as_content_blocks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("img.png"), b"png-bytes").expect("write image");
+        let messages = vec![Message::user_with_parts(vec![
+            ContentPart::Text {
+                text: "look".into(),
+            },
+            ContentPart::Image {
+                media_type: "image/png".into(),
+                path: "img.png".into(),
+            },
+        ])];
+        let out = to_openai_messages(&messages, dir.path()).expect("messages");
+        let arr = out[0]["content"]
+            .as_array()
+            .expect("image-bearing parts stay array-form");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["type"], "text");
+        assert_eq!(arr[1]["type"], "image_url");
+    }
+
+    #[test]
+    fn empty_messages_list_rejected_loudly() {
+        let err = to_openai_messages(&[], std::path::Path::new(".")).unwrap_err();
+        assert!(err.to_string().contains("empty messages list"), "{err}");
+    }
+
+    #[test]
+    fn blank_user_text_rejected_loudly() {
+        // Whitespace-only text and image-less empty parts both collapse to an
+        // unparsable prompt server-side (ZhipuAI 1213) — refuse locally.
+        let cases = vec![Message::user("   "), Message::user_with_parts(vec![])];
+        for message in cases {
+            let messages = vec![message];
+            let err = to_openai_messages(&messages, std::path::Path::new(".")).unwrap_err();
+            assert!(err.to_string().contains("empty user message"), "{err}");
+        }
+    }
+
+    #[test]
+    fn empty_assistant_needs_tool_calls_to_survive() {
+        // No tool calls + empty content → loud local error…
+        let bad = vec![Message::assistant("")];
+        let err = to_openai_messages(&bad, std::path::Path::new(".")).unwrap_err();
+        assert!(err.to_string().contains("empty assistant"), "{err}");
+
+        // …but empty content WITH tool calls stays `content: null` (legal).
+        let mut with_calls = Message::assistant("");
+        with_calls.tool_calls = Some(vec![nca_common::message::MessageToolCall {
+            id: "call_1".into(),
+            name: "read".into(),
+            arguments: json!({}),
+        }]);
+        let out = to_openai_messages(&[with_calls], std::path::Path::new(".")).expect("messages");
+        assert!(out[0]["content"].is_null());
+        assert_eq!(out[0]["tool_calls"][0]["function"]["name"], "read");
+    }
+
+    #[test]
+    fn tools_key_omitted_when_no_tools_not_null() {
+        let body = openai_request_body(
+            &[Message::user("hello")],
+            &[],
+            "glm-5.3",
+            1_000,
+            0.7,
+            std::path::Path::new("."),
+        )
+        .expect("body");
+        assert!(
+            body.get("tools").is_none(),
+            "empty tools must omit the key, not send null: {body}"
+        );
+    }
+
+    #[test]
+    fn tools_array_present_when_tools_exist() {
+        let body = openai_request_body(
+            &[Message::user("hello")],
+            &[ToolDefinition {
+                timeout_ms: None,
+                name: "lookup".into(),
+                description: "Lookup a path".into(),
+                parameters: json!({"type": "object", "properties": {}}),
+            }],
+            "glm-5.3",
+            1_000,
+            0.7,
+            std::path::Path::new("."),
+        )
+        .expect("body");
+        let tools = body["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "lookup");
     }
 }
