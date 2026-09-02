@@ -56,7 +56,6 @@ pub struct SessionRuntime {
     supervisor: Supervisor,
     handle: Option<SupervisorHandle>,
     question_pending: Option<QuestionPendingMap>,
-    config: NcaConfig,
     safe_mode: bool,
     interactive_approvals: bool,
 }
@@ -160,8 +159,9 @@ impl SessionRuntime {
         self.handle.as_mut()?.take_turn_commit_tx()
     }
 
-    pub fn messages(&self) -> &[nca_common::message::Message] {
-        &self.supervisor.agent().messages
+    /// Live conversation mirror for the sub-agent spawn consumer.
+    pub fn spawn_history(&self) -> Arc<std::sync::Mutex<Vec<nca_common::message::Message>>> {
+        self.supervisor.spawn_history()
     }
 
     pub fn set_model(&mut self, model: impl Into<String>) {
@@ -189,8 +189,6 @@ impl SessionRuntime {
         name: Option<&str>,
     ) -> Result<Option<String>, ProviderError> {
         let applied = self.supervisor.apply_agent_profile(name)?;
-        // Keep SessionRuntime's config snapshot in sync.
-        self.config = self.supervisor.config().clone();
         Ok(applied)
     }
 
@@ -221,7 +219,7 @@ impl SessionRuntime {
         provider: ProviderKind,
         model_override: Option<&str>,
     ) -> Result<String, ProviderError> {
-        let mut cfg = self.config.clone();
+        let mut cfg = self.supervisor.config().clone();
         cfg.set_default_provider(provider);
         if let Some(model) = model_override {
             cfg.provider
@@ -229,8 +227,7 @@ impl SessionRuntime {
         }
         cfg.sync_default_model_from_provider();
         let effective_model = cfg.model.default_model.clone();
-        self.supervisor.apply_nca_config(cfg.clone())?;
-        self.config = cfg;
+        self.supervisor.apply_nca_config(cfg)?;
         Ok(effective_model)
     }
 
@@ -250,7 +247,8 @@ impl SessionRuntime {
         &self,
     ) -> Result<Vec<nca_common::session::SessionSnapshot>, String> {
         let store = nca_runtime::session_store::SessionStore::new(
-            self.workspace_root().join(&self.config.session.history_dir),
+            self.workspace_root()
+                .join(&self.supervisor.config().session.history_dir),
         );
         let ids = store.list().await.map_err(|err| err.to_string())?;
         let mut snapshots = Vec::with_capacity(ids.len());
@@ -265,19 +263,20 @@ impl SessionRuntime {
         Ok(snapshots)
     }
 
+    /// Live config. The supervisor owns the single authoritative copy;
+    /// mutations via `config_mut` and `apply_nca_config` stay visible here.
     pub fn config(&self) -> &NcaConfig {
-        &self.config
+        self.supervisor.config()
     }
 
+    /// Mutate the live config in place (e.g. `/set-editor`).
     pub fn config_mut(&mut self) -> &mut NcaConfig {
-        &mut self.config
+        self.supervisor.config_mut()
     }
 
     /// Replace merged config and rebuild the provider (fails if API key missing, etc.).
     pub fn apply_nca_config(&mut self, config: NcaConfig) -> Result<(), ProviderError> {
-        self.supervisor.apply_nca_config(config.clone())?;
-        self.config = config;
-        Ok(())
+        self.supervisor.apply_nca_config(config)
     }
 
     pub fn snapshot(&self) -> SessionSnapshot {
@@ -326,7 +325,7 @@ impl SessionRuntime {
         self.supervisor.finish(EndReason::Completed).await;
 
         let mut supervisor = Supervisor::resume(
-            self.config.clone(),
+            self.supervisor.config().clone(),
             &self.supervisor.workspace_root,
             self.safe_mode,
             self.interactive_approvals,
@@ -394,7 +393,7 @@ pub async fn build_session_runtime(
     let approval_handler = ipc_approval_handler;
 
     let mut supervisor = Supervisor::create(SupervisorConfig {
-        config: config.clone(),
+        config,
         workspace_root: workspace_root.to_path_buf(),
         safe_mode,
         interactive_approvals,
@@ -412,7 +411,6 @@ pub async fn build_session_runtime(
         supervisor,
         handle: Some(handle),
         question_pending,
-        config,
         safe_mode,
         interactive_approvals,
     })
@@ -427,7 +425,7 @@ pub async fn build_resumed_session_runtime(
     approval_handler: Option<Arc<dyn ApprovalHandler>>,
 ) -> Result<SessionRuntime, ProviderError> {
     let mut supervisor = Supervisor::resume(
-        config.clone(),
+        config,
         workspace_root,
         safe_mode,
         interactive_approvals,
@@ -442,8 +440,109 @@ pub async fn build_resumed_session_runtime(
         supervisor,
         handle: Some(handle),
         question_pending,
-        config,
         safe_mode,
         interactive_approvals,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Regression: `/mount` must survive a later `/model`-style whole-config
+    /// save. SessionRuntime used to keep its own stale `NcaConfig` copy that
+    /// `mount_path` never updated, so the next clone→apply→save cycle erased
+    /// the persisted `extra_paths` from `.nca/config.local.toml`.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    struct TestEnvGuard {
+        previous: Vec<(String, Option<std::ffi::OsString>)>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl TestEnvGuard {
+        fn set(vars: &[(&str, &str)]) -> Self {
+            let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let mut previous = Vec::new();
+            for (key, value) in vars {
+                previous.push((key.to_string(), std::env::var_os(key)));
+                // SAFETY: the mutex serializes env mutation within this binary.
+                unsafe { std::env::set_var(key, value) };
+            }
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for TestEnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.previous.drain(..) {
+                // SAFETY: still holding the env mutex.
+                match value {
+                    Some(value) => unsafe { std::env::set_var(&key, value) },
+                    None => unsafe { std::env::remove_var(&key) },
+                }
+            }
+        }
+    }
+
+    fn offline_config() -> NcaConfig {
+        let mut config = NcaConfig::default();
+        config.permissions.mode = PermissionMode::BypassPermissions;
+        config.memory.context.auto_detect_context_window = false;
+        config.memory.context.query_provider_models_api = false;
+        config.memory.context.enable_auto_summarize = false;
+        config
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mount_survives_model_switch_config_save() {
+        let home = tempfile::tempdir().expect("home tempdir");
+        let xdg = tempfile::tempdir().expect("xdg tempdir");
+        let _env = TestEnvGuard::set(&[
+            ("HOME", home.path().to_str().unwrap()),
+            ("XDG_CONFIG_HOME", xdg.path().to_str().unwrap()),
+        ]);
+
+        let ws = tempfile::tempdir().expect("workspace tempdir");
+        let ext = tempfile::tempdir().expect("external dir tempdir");
+        let mut rt = build_session_runtime(
+            offline_config(),
+            ws.path(),
+            true,
+            false,
+            Some("mnt-runner-regression".into()),
+            None,
+            None,
+        )
+        .await
+        .expect("session runtime builds (keyless deepseek validates lazily)");
+
+        rt.mount_path(ext.path()).await.expect("mount");
+
+        let expected = vec![ext.path().canonicalize().expect("canonicalize")];
+        assert_eq!(
+            rt.config().extra_paths,
+            expected,
+            "runtime-visible config must reflect the mount immediately"
+        );
+
+        // `/model` flow: clone the runtime snapshot, tweak, re-apply, save.
+        let mut cfg = rt.config().clone();
+        cfg.apply_model_override("deepseek-chat");
+        rt.apply_nca_config(cfg)
+            .expect("apply (keyless deepseek validates lazily)");
+        rt.config()
+            .save_workspace_file(ws.path())
+            .expect("workspace save");
+
+        let disk = NcaConfig::load_for_workspace(ws.path()).expect("reload");
+        assert_eq!(
+            disk.extra_paths, expected,
+            "REGRESSION: model switch erased the persisted mount from the stale runner snapshot"
+        );
+    }
 }

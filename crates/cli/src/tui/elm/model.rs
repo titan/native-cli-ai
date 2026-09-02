@@ -39,7 +39,23 @@ use tokio::sync::mpsc::UnboundedSender;
 /// downgrades the leftover bytes to plain `Char` keys, which the focused
 /// composer inserts as garbage like `[<35;72;23M`. 48 messages per tick is a
 /// ~1200 msg/s ceiling at the 40ms tick cadence — far above real UI needs.
+///
+/// A backlog *larger* than this slice is not a live burst but a resume-replay
+/// load (startup resume, `/session` switch): the whole event log is queued in
+/// the channel up front, and pacing it at 48/40ms would "play back" the
+/// transcript frame by frame for potentially tens of seconds. Those backlogs
+/// switch to [`BRIDGE_BULK_DRAIN_BUDGET`] instead.
 const BRIDGE_DRAIN_BUDGET: usize = 48;
+
+/// Bulk-mode cap for draining a resume-replay backlog in a single tick.
+///
+/// `redraw` is a per-tick boolean, so a bulk drain renders exactly once per
+/// tick — at the accumulated state — instead of frame-by-frame playback; a
+/// resumed session therefore opens directly at the end of the transcript.
+/// The cap still bounds per-tick work, and the crossterm input poll runs
+/// between ticks, so input stays responsive. 4096/tick ≈ 100k msg/s: even a
+/// very long session replay completes within a handful of ticks.
+const BRIDGE_BULK_DRAIN_BUDGET: usize = 4096;
 
 // ── Side-effect channels ─────────────────────────────────────────
 
@@ -435,11 +451,20 @@ impl NcaModel {
 
     // ── Feedback processing ───────────────────────────────────────
 
-    /// Drain at most `BRIDGE_DRAIN_BUDGET` feedback messages per tick so the
-    /// crossterm input poll (step 1) can never starve. Leftover messages are
-    /// drained on subsequent ticks (~40ms later each).
+    /// Drain bridge messages into the model, budgeted per tick.
+    ///
+    /// A backlog within one live slice ([`BRIDGE_DRAIN_BUDGET`]) is consumed
+    /// slice-sized so the crossterm input poll (step 1) can never starve; the
+    /// rest is drained on subsequent ticks (~40ms later each). A larger
+    /// backlog is a resume-replay load and drains up to
+    /// [`BRIDGE_BULK_DRAIN_BUDGET`] per tick instead — see the const docs.
     fn drain_bridge(&mut self) {
-        for _ in 0..BRIDGE_DRAIN_BUDGET {
+        let budget = if self.bridge_rx.len() > BRIDGE_DRAIN_BUDGET {
+            BRIDGE_BULK_DRAIN_BUDGET
+        } else {
+            BRIDGE_DRAIN_BUDGET
+        };
+        for _ in 0..budget {
             match self.bridge_rx.try_recv() {
                 Ok(msg) => self.update_feedback(msg),
                 Err(_) => break,
@@ -1114,41 +1139,53 @@ mod tests {
         })
     }
 
-    // The bridge drain must be bounded: during parallel subagent runs the
-    // bridge bursts hundreds of events at once, and an unbounded drain starves
-    // the 40ms crossterm input poll, letting SGR-1006 mouse bytes desync and
-    // leak into the composer as garbage chars. `BRIDGE_DRAIN_BUDGET` caps how
-    // many feedback messages one `drain_bridge()` may process per tick.
+    // The bridge drain is two-tier: live bursts are consumed at most
+    // `BRIDGE_DRAIN_BUDGET` per tick so the 40ms crossterm input poll can
+    // never starve (SGR-1006 mouse bytes desyncing into the composer was a
+    // real bug), while a backlog larger than one slice is a resume-replay
+    // load that drains at `BRIDGE_BULK_DRAIN_BUDGET` per tick — rendering
+    // once per tick at the accumulated state, never frame-by-frame.
     #[test]
-    fn drain_bridge_respects_budget() {
+    fn drain_bridge_bulk_drains_replay_backlog() {
         let (mut model, bridge_tx) = test_model();
         for _ in 0..200 {
+            bridge_tx.send(assistant_msg("m")).expect("bridge send");
+        }
+
+        // 200 > 48: bulk mode. One drain must consume the entire replay
+        // backlog (the old slice-by-slice behavior needed five drains).
+        model.drain_bridge();
+        assert_eq!(
+            model.components.transcript.blocks.len(),
+            200,
+            "a replay backlog must drain in a single call"
+        );
+
+        // …and a further drain on an empty channel is a no-op.
+        model.drain_bridge();
+        assert_eq!(model.components.transcript.blocks.len(), 200);
+    }
+
+    #[test]
+    fn drain_bridge_respects_bulk_cap() {
+        let (mut model, bridge_tx) = test_model();
+        for _ in 0..BRIDGE_BULK_DRAIN_BUDGET + 100 {
             bridge_tx.send(assistant_msg("m")).expect("bridge send");
         }
 
         model.drain_bridge();
         assert_eq!(
             model.components.transcript.blocks.len(),
-            BRIDGE_DRAIN_BUDGET,
-            "one drain must consume exactly the budget"
+            BRIDGE_BULK_DRAIN_BUDGET,
+            "bulk mode must stay bounded per tick"
         );
 
         model.drain_bridge();
         assert_eq!(
             model.components.transcript.blocks.len(),
-            BRIDGE_DRAIN_BUDGET * 2,
-            "a second drain must consume the next budget slice"
+            BRIDGE_BULK_DRAIN_BUDGET + 100,
+            "the remainder drains on the next tick"
         );
-
-        // Repeated drains eventually consume everything…
-        while model.components.transcript.blocks.len() < 200 {
-            model.drain_bridge();
-        }
-        assert_eq!(model.components.transcript.blocks.len(), 200);
-
-        // …and a further drain on an empty channel is a no-op.
-        model.drain_bridge();
-        assert_eq!(model.components.transcript.blocks.len(), 200);
     }
 
     #[test]

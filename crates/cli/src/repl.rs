@@ -150,7 +150,7 @@ impl Repl {
                     self.runtime.session_id().to_string(),
                     self.runtime.workspace_root().to_path_buf(),
                     self.runtime.config().clone(),
-                    self.runtime.messages().to_vec(),
+                    self.runtime.spawn_history(),
                     event_tx,
                     self.runtime.fs(),
                 ))
@@ -1632,7 +1632,7 @@ impl Repl {
                     self.runtime.session_id().to_string(),
                     self.runtime.workspace_root().to_path_buf(),
                     self.runtime.config().clone(),
-                    self.runtime.messages().to_vec(),
+                    self.runtime.spawn_history(),
                     event_tx,
                     self.runtime.fs(),
                 ))

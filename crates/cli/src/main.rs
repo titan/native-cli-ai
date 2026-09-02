@@ -683,6 +683,7 @@ async fn try_main() -> anyhow::Result<()> {
                 &config.permissions.sandbox,
                 &workspace_root,
                 &config.extra_paths,
+                &SkillCatalog::discovery_roots(&workspace_root, &config.harness.skill_directories),
             );
             let out = tokio::task::spawn_blocking(move || {
                 nca_runtime::sandbox::exec_confined(&cmd, &policy)
@@ -952,7 +953,7 @@ async fn run_one_shot(
                 runtime.session_id().to_string(),
                 runtime.workspace_root().to_path_buf(),
                 config.clone(),
-                runtime.messages().to_vec(),
+                runtime.spawn_history(),
                 event_tx,
                 runtime.fs(),
             )
