@@ -145,6 +145,13 @@ pub trait WorkspaceFs: Send + Sync {
 pub struct RealFs {
     root: RwLock<PathBuf>,
     canonical_cache: RwLock<Option<PathBuf>>,
+    /// Roots this fs was previously rooted at, oldest first. Absolute paths
+    /// under a legacy root are **rebased** onto the current root at resolution
+    /// time, so a session switched into a git worktree keeps accepting
+    /// parent-workspace absolute paths (task text, focus files, parent-summary
+    /// echoes) without punching through the sandbox: every rebased access
+    /// lands inside the current root.
+    legacy_roots: RwLock<Vec<PathBuf>>,
     /// Additional directories mounted as allowed roots (canonicalized).
     extra_allowed: RwLock<Vec<PathBuf>>,
 }
@@ -160,8 +167,41 @@ impl RealFs {
         Self {
             root: RwLock::new(root),
             canonical_cache: RwLock::new(Some(canonical)),
+            legacy_roots: RwLock::new(Vec::new()),
             extra_allowed: RwLock::new(Vec::new()),
         }
+    }
+
+    /// Rebase an absolute path that lives under a legacy root onto the
+    /// current root.
+    ///
+    /// Non-absolute paths and paths already inside the current root are
+    /// returned unchanged; paths under no known root are returned unchanged
+    /// so the caller's boundary check rejects them.
+    fn rebase_legacy(&self, full: &Path) -> PathBuf {
+        if !full.is_absolute() {
+            return full.to_path_buf();
+        }
+        let current = self.cached_canonical_root();
+        if full.starts_with(&current) {
+            return full.to_path_buf();
+        }
+        let mut legacy = self
+            .legacy_roots
+            .read()
+            .expect("legacy_roots lock poisoned")
+            .clone();
+        // Longest legacy root first: nested worktree switches stack roots, and
+        // the deepest (most recent) root is the tightest match.
+        legacy.sort_by_key(|r| std::cmp::Reverse(r.components().count()));
+        for old in &legacy {
+            if let Ok(stripped) = full.strip_prefix(old)
+                && !stripped.as_os_str().is_empty()
+            {
+                return current.join(stripped);
+            }
+        }
+        full.to_path_buf()
     }
 
     /// Return the cached canonical workspace root.
@@ -209,7 +249,20 @@ impl WorkspaceFs for RealFs {
 
     fn set_root(&self, path: PathBuf) -> Result<(), SandboxError> {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
-        *self.root.write().expect("root lock poisoned") = path;
+        {
+            let mut root = self.root.write().expect("root lock poisoned");
+            let old_canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+            if old_canonical != canonical {
+                let mut legacy = self
+                    .legacy_roots
+                    .write()
+                    .expect("legacy_roots lock poisoned");
+                if !legacy.contains(&old_canonical) {
+                    legacy.push(old_canonical);
+                }
+            }
+            *root = path;
+        }
         *self
             .canonical_cache
             .write()
@@ -218,8 +271,11 @@ impl WorkspaceFs for RealFs {
     }
 
     fn resolve(&self, path: &str) -> Result<PathBuf, SandboxError> {
-        let root = self.root.read().expect("root lock poisoned");
-        let full = root.join(path);
+        let root = self.root.read().expect("root lock poisoned").clone();
+        // Absolute parent-root paths (legacy roots) rebasing onto the current
+        // root keeps worktree-switched sessions working with the absolute
+        // paths that task text and parent summaries carry.
+        let full = self.rebase_legacy(&root.join(path));
         let canonical = full.canonicalize().map_err(|e| SandboxError::NotFound {
             path: full.display().to_string(),
             source: e,
@@ -238,8 +294,8 @@ impl WorkspaceFs for RealFs {
     }
 
     fn validate_prefix(&self, path: &str) -> Result<PathBuf, SandboxError> {
-        let root = self.root.read().expect("root lock poisoned");
-        let full = root.join(path);
+        let root = self.root.read().expect("root lock poisoned").clone();
+        let full = self.rebase_legacy(&root.join(path));
         let normalized = logical_normalize(&full);
         if self.is_allowed_normalized(&normalized) {
             Ok(normalized)
@@ -310,7 +366,7 @@ impl WorkspaceFs for RealFs {
 
     async fn write_file(&self, path: &str, content: &str) -> Result<(), SandboxError> {
         let root = self.root.read().expect("root lock poisoned").clone();
-        let full = root.join(path);
+        let full = self.rebase_legacy(&root.join(path));
         let parent = full
             .parent()
             .ok_or_else(|| SandboxError::InvalidPath(path.to_string()))?;
@@ -416,7 +472,7 @@ impl WorkspaceFs for RealFs {
         let canonical_from = self.resolve(from)?;
         // Destination parent must be in workspace (create if needed).
         let root = self.root.read().expect("root lock poisoned").clone();
-        let full_to = root.join(to);
+        let full_to = self.rebase_legacy(&root.join(to));
         if let Some(parent) = full_to.parent().filter(|p| !p.as_os_str().is_empty()) {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -450,7 +506,7 @@ impl WorkspaceFs for RealFs {
         let canonical_from = self.resolve(from)?;
         // Destination parent must be in workspace (create if needed).
         let root = self.root.read().expect("root lock poisoned").clone();
-        let full_to = root.join(to);
+        let full_to = self.rebase_legacy(&root.join(to));
         if let Some(parent) = full_to.parent().filter(|p| !p.as_os_str().is_empty()) {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -766,5 +822,102 @@ mod tests {
         fs.mount_path(external.path()).unwrap();
         fs.mount_path(external.path()).unwrap();
         assert_eq!(fs.mounted_paths().len(), 1);
+    }
+
+    // ── Legacy-root rebasing (worktree switches) ─────────────────────
+
+    #[test]
+    fn resolve_rebases_legacy_root_abs_paths_onto_current_root() {
+        // A session switched into a worktree must keep accepting absolute
+        // paths rooted at the parent workspace — task text and parent
+        // summaries are full of them.
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("a.txt"), "parent").unwrap();
+        let wt = ws.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join("a.txt"), "worktree").unwrap();
+
+        let fs = RealFs::new(ws.path().to_path_buf());
+        fs.set_root(wt.clone()).unwrap();
+
+        // Absolute parent-root path rebases onto the worktree copy.
+        let abs_parent = ws.path().join("a.txt");
+        let resolved = fs.resolve(&abs_parent.display().to_string()).unwrap();
+        let expected = wt.canonicalize().unwrap().join("a.txt");
+        assert_eq!(resolved, expected, "must resolve inside the worktree");
+    }
+
+    #[tokio::test]
+    async fn read_file_via_legacy_abs_path_reads_current_root_copy() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("a.txt"), "parent").unwrap();
+        let wt = ws.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join("a.txt"), "worktree").unwrap();
+
+        let fs = RealFs::new(ws.path().to_path_buf());
+        fs.set_root(wt).unwrap();
+
+        let abs_parent = ws.path().join("a.txt");
+        let content = fs
+            .read_file(&abs_parent.display().to_string())
+            .await
+            .unwrap();
+        assert_eq!(content, "worktree", "rebased read hits the worktree copy");
+    }
+
+    #[test]
+    fn resolve_abs_path_outside_all_roots_still_rejected() {
+        let ws = tempfile::tempdir().unwrap();
+        let wt = ws.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+
+        let fs = RealFs::new(ws.path().to_path_buf());
+        fs.set_root(wt).unwrap();
+
+        let err = fs.resolve("/etc/passwd").unwrap_err();
+        assert!(
+            matches!(err, SandboxError::OutsideWorkspace { .. }),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn nested_switch_rebases_through_every_legacy_root() {
+        // ws → wt1 → wt2: absolute ws-paths must land inside wt2.
+        let ws = tempfile::tempdir().unwrap();
+        let wt1 = ws.path().join("wt1");
+        let wt2 = ws.path().join("wt2");
+        std::fs::create_dir_all(wt1.join("src")).unwrap();
+        std::fs::create_dir_all(wt2.join("src")).unwrap();
+        std::fs::write(wt2.join("src/main.rs"), "v2").unwrap();
+
+        let fs = RealFs::new(ws.path().to_path_buf());
+        fs.set_root(wt1).unwrap();
+        fs.set_root(wt2.clone()).unwrap();
+
+        let abs = ws.path().join("src/main.rs");
+        let resolved = fs.resolve(&abs.display().to_string()).unwrap();
+        assert_eq!(resolved, wt2.canonicalize().unwrap().join("src/main.rs"));
+    }
+
+    #[tokio::test]
+    async fn write_file_via_legacy_abs_path_lands_in_current_root() {
+        // Writes through legacy absolute paths must land in the worktree
+        // (isolation preserved), never in the parent tree.
+        let ws = tempfile::tempdir().unwrap();
+        let wt = ws.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+
+        let fs = RealFs::new(ws.path().to_path_buf());
+        fs.set_root(wt.clone()).unwrap();
+
+        let abs_new = ws.path().join("out/created.txt");
+        fs.write_file(&abs_new.display().to_string(), "payload")
+            .await
+            .unwrap();
+
+        assert!(!ws.path().join("out/created.txt").exists());
+        assert!(wt.join("out/created.txt").exists());
     }
 }
