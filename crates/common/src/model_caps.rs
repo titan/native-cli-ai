@@ -41,11 +41,43 @@ pub fn model_accepts_native_images(kind: ProviderKind, model: &str) -> bool {
             let text_only = m.contains("glm-5.3") && !m.contains("glm-5.3-flash");
             (m.contains("glm-5") && !text_only) || m.contains("glm-4v") || m.contains("glm-4")
         }
-        ProviderKind::DeepSeek => false, // DeepSeek does not support native image inputs
-        ProviderKind::Kimi => false,     // Kimi for Coding: k3 specs don't list native image input
+        // DeepSeek V4 and later accept native image inputs (OpenAI-style
+        // `image_url` blocks on /chat/completions); v3.x and r1 generations
+        // are text-only. The rolling aliases `deepseek-chat` and
+        // `deepseek-reasoner` track the current generation, so they count as
+        // multimodal; unknown explicit names stay conservative (the
+        // run_turn_with_images gate names the model when it rejects).
+        ProviderKind::DeepSeek => {
+            m.contains("chat")
+                || m.contains("reasoner")
+                || m.contains("vl")
+                || deepseek_generation(&m).is_some_and(|v| v >= 4)
+        }
+        // Kimi for Coding serves k3 on the Anthropic-compatible endpoint, which
+        // accepts native image blocks (anthropic_compat serializes them directly;
+        // no coding_plan/vlm sidecar needed).
+        ProviderKind::Kimi => !m.is_empty(),
         // ponytail: custom endpoints vary; assume no native image input until configured otherwise
         ProviderKind::Custom => false,
     }
+}
+
+/// Major version number of a `deepseek-v<N>...` style model name, if present.
+fn deepseek_generation(model: &str) -> Option<u32> {
+    let m = model.as_bytes();
+    let mut i = 0;
+    while i + 1 < m.len() {
+        if m[i] == b'v' && m[i + 1].is_ascii_digit() {
+            let start = i + 1;
+            let end = m[start..]
+                .iter()
+                .position(|b| !b.is_ascii_digit())
+                .map_or(m.len(), |p| start + p);
+            return std::str::from_utf8(&m[start..end]).ok()?.parse().ok();
+        }
+        i += 1;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -69,6 +101,12 @@ mod tests {
     }
 
     #[test]
+    fn kimi_k3_accepts_native_images() {
+        assert!(model_accepts_native_images(ProviderKind::Kimi, "k3"));
+        assert!(model_accepts_native_images(ProviderKind::Kimi, "kimi-k3"));
+    }
+
+    #[test]
     fn glm_5_3_is_text_only_but_flash_is_multimodal() {
         assert!(!model_accepts_native_images(
             ProviderKind::ZhipuAI,
@@ -88,5 +126,48 @@ mod tests {
             ProviderKind::ZhipuAI,
             "glm-4v-flash"
         ));
+    }
+
+    #[test]
+    fn deepseek_v4_onwards_is_multimodal() {
+        assert!(model_accepts_native_images(
+            ProviderKind::DeepSeek,
+            "deepseek-v4"
+        ));
+        assert!(model_accepts_native_images(
+            ProviderKind::DeepSeek,
+            "deepseek-v4-flash"
+        ));
+        // Rolling aliases track the current (multimodal) generation.
+        assert!(model_accepts_native_images(
+            ProviderKind::DeepSeek,
+            "deepseek-chat"
+        ));
+        assert!(model_accepts_native_images(
+            ProviderKind::DeepSeek,
+            "deepseek-reasoner"
+        ));
+    }
+
+    #[test]
+    fn deepseek_pre_v4_is_text_only() {
+        assert!(!model_accepts_native_images(
+            ProviderKind::DeepSeek,
+            "deepseek-v3"
+        ));
+        assert!(!model_accepts_native_images(
+            ProviderKind::DeepSeek,
+            "deepseek-v3.2"
+        ));
+        assert!(!model_accepts_native_images(
+            ProviderKind::DeepSeek,
+            "deepseek-r1"
+        ));
+        // Unknown explicit names stay conservative.
+        assert!(!model_accepts_native_images(
+            ProviderKind::DeepSeek,
+            "deepseek"
+        ));
+        assert!(!model_accepts_native_images(ProviderKind::DeepSeek, ""));
     }
 }

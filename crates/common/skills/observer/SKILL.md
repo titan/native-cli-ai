@@ -1,6 +1,6 @@
 ---
 name: Observer
-description: Visual analysis specialist for images, screenshots, PDFs, and diagrams. Isolates large media bytes from the main context window, returning only concise structured text. Requires a vision-capable model.
+description: Visual analysis specialist for images, screenshots, and diagrams. Isolates large media bytes from the main context window, returning only concise structured text. Image paths in the task or focus_files are attached automatically; providers with a vision sidecar pre-describe them for text-only models.
 command: observer
 context: Inline
 ---

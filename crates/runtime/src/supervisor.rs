@@ -67,6 +67,10 @@ pub struct Supervisor {
     approval_pending: Option<ApprovalPendingMap>,
     question_pending: Option<QuestionPendingMap>,
     spawn_rx: Option<mpsc::Receiver<SpawnRequest>>,
+    /// Live mirror of this session's conversation, refreshed at each turn
+    /// start and read by [`SpawnSubagentTool`] when collecting images for a
+    /// child session. `Arc`-shared so the tool sees fresh history.
+    spawn_history: Arc<Mutex<Vec<Message>>>,
     pub(crate) worktree_path: Option<PathBuf>,
     pub(crate) branch: Option<String>,
     pub(crate) base_branch: Option<String>,
@@ -510,8 +514,12 @@ impl Supervisor {
         tools.register(Box::new(crate::bash_tool::RuntimeBashTool::new(pty)));
 
         let (spawn_tx, spawn_rx) = mpsc::channel::<SpawnRequest>(16);
+        let spawn_history = Arc::new(Mutex::new(Vec::<Message>::new()));
         if !cfg.safe_mode {
-            tools.register(Box::new(SpawnSubagentTool::new(spawn_tx)));
+            tools.register(Box::new(SpawnSubagentTool::new(
+                spawn_tx,
+                Arc::clone(&spawn_history),
+            )));
         }
 
         let approval_pending: Option<ApprovalPendingMap>;
@@ -672,6 +680,7 @@ impl Supervisor {
             approval_pending,
             question_pending: Some(question_pending),
             spawn_rx: Some(spawn_rx),
+            spawn_history,
             worktree_path: None,
             branch: None,
             base_branch: None,
@@ -900,6 +909,14 @@ impl Supervisor {
             .join(format!("{}.events.jsonl", self.session_id))
     }
 
+    /// Shared live mirror of this session's conversation, refreshed at each
+    /// turn start by [`Self::run_turn_with_images`]. Wired into the sub-agent
+    /// spawn consumer so child summaries and forwarded images reflect the
+    /// conversation as of spawn time, not session-create time.
+    pub fn spawn_history(&self) -> Arc<Mutex<Vec<Message>>> {
+        Arc::clone(&self.spawn_history)
+    }
+
     pub async fn run_turn(&mut self, prompt: &str) -> Result<String, ProviderError> {
         self.run_turn_with_images(prompt, &[]).await
     }
@@ -925,6 +942,16 @@ impl Supervisor {
 
         // Check context before running turn
         self.maybe_compact_context().await;
+
+        // Refresh the spawn-history mirror so `spawn_subagent` calls made
+        // during this turn collect images and context from exactly the
+        // history the model sees (post-compaction), plus this turn's opening
+        // message — a screenshot pasted together with the delegation request
+        // must reach the child.
+        if let Ok(mut mirror) = self.spawn_history.lock() {
+            *mirror = self.agent.messages.clone();
+            mirror.push(nca_core::agent::turn_user_message(prompt, attachments));
+        }
 
         // Durability barrier (P2 Phase B): capture the last committed turn
         // before the turn runs, then wait for this turn's TurnCompleted to be

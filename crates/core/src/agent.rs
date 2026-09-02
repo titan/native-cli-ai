@@ -51,6 +51,34 @@ pub struct AgentLoop {
     turn_seq: u64,
 }
 
+/// Build the user message that opens a turn: prompt text plus any image
+/// attachments (an empty prompt with images gets a placeholder text part).
+/// Shared by [`AgentLoop::run_turn`] and the runtime supervisor's
+/// spawn-history projection so both see the identical turn-opening message.
+pub fn turn_user_message(user_input: &str, attachments: &[ImageAttachment]) -> Message {
+    if attachments.is_empty() {
+        Message::user(user_input)
+    } else {
+        let mut parts: Vec<ContentPart> = Vec::new();
+        if user_input.trim().is_empty() {
+            parts.push(ContentPart::Text {
+                text: "(See attached image(s).)".into(),
+            });
+        } else {
+            parts.push(ContentPart::Text {
+                text: user_input.to_string(),
+            });
+        }
+        for a in attachments {
+            parts.push(ContentPart::Image {
+                media_type: a.media_type.clone(),
+                path: a.path.clone(),
+            });
+        }
+        Message::user_with_parts(parts)
+    }
+}
+
 impl AgentLoop {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -168,28 +196,7 @@ impl AgentLoop {
         // BEFORE the new user message.
         self.claim_inbox().await;
 
-        let user_msg = if attachments.is_empty() {
-            Message::user(user_input)
-        } else {
-            let mut parts: Vec<ContentPart> = Vec::new();
-            let trimmed = user_input.trim();
-            if !trimmed.is_empty() {
-                parts.push(ContentPart::Text {
-                    text: user_input.to_string(),
-                });
-            } else {
-                parts.push(ContentPart::Text {
-                    text: "(See attached image(s).)".into(),
-                });
-            }
-            for a in attachments {
-                parts.push(ContentPart::Image {
-                    media_type: a.media_type.clone(),
-                    path: a.path.clone(),
-                });
-            }
-            Message::user_with_parts(parts)
-        };
+        let user_msg = turn_user_message(user_input, attachments);
         let preview = user_msg.event_preview();
         self.record(&user_msg).await;
         self.messages.push(user_msg);
@@ -427,6 +434,37 @@ pub(crate) fn format_tool_result(result: &nca_common::tool::ToolResult) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turn_user_message_shapes() {
+        use nca_common::message::MessageContent;
+
+        // Plain text, no attachments → simple text message.
+        let plain = turn_user_message("hello", &[]);
+        assert!(matches!(&plain.content, MessageContent::Text(t) if t == "hello"));
+
+        let images = [ImageAttachment {
+            media_type: "image/png".into(),
+            path: "shot.png".into(),
+        }];
+
+        // Prompt + images → parts, text first.
+        let with_prompt = turn_user_message("look", &images);
+        let MessageContent::Parts(parts) = with_prompt.content else {
+            panic!("expected parts content")
+        };
+        assert_eq!(parts.len(), 2);
+        assert!(matches!(&parts[0], ContentPart::Text { text } if text == "look"));
+        assert!(matches!(&parts[1], ContentPart::Image { .. }));
+
+        // Blank prompt + images → placeholder text part.
+        let image_only = turn_user_message("  ", &images);
+        let MessageContent::Parts(parts) = image_only.content else {
+            panic!("expected parts content")
+        };
+        assert_eq!(parts.len(), 2);
+        assert!(matches!(&parts[0], ContentPart::Text { text } if text.contains("attached image")));
+    }
     use crate::approval::ApprovalPolicy;
     use crate::provider::{Provider, ProviderError, StreamChunk};
     use crate::tools::ToolRegistry;

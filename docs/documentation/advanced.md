@@ -44,7 +44,12 @@ When `use_worktree` is true (default), the child session runs in an isolated git
 
 - **Permissions:** `bypass-permissions` (no interactive approval needed)
 - **Approvals:** Auto-deny handler (no blocking waits)
-- **Context:** Inherits a summary of the parent's last ~10 messages
+- **Context:** Inherits a summary of the parent's last ~10 messages, captured live at spawn time (not session start)
+- **Images:** The parent's recent image attachments (up to 8, deduplicated) are
+  attached to the child's first message when the child's routed provider+model
+  accepts native image input; paths are resolved against the parent workspace
+  so worktree-rooted children still see them. Non-vision children get an
+  explanatory note instead of the images.
 - **Timeout:** 600 seconds (10 minutes)
 - **Lineage:** Parent and child session IDs are cross-referenced in metadata
 

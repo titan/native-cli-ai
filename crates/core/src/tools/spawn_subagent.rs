@@ -1,14 +1,26 @@
 use nca_common::config::ProviderKind;
+use nca_common::message::{ContentPart, ImageAttachment, Message, MessageContent};
 use nca_common::tool::{ToolCall, ToolDefinition, ToolResult};
+use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
 use super::ToolExecutor;
+
+/// Upper bound on distinct images auto-forwarded with a spawn request; the
+/// most recent are kept when the parent conversation exceeds this.
+pub const MAX_FORWARD_IMAGES: usize = 8;
 
 /// Request sent from the tool to the runtime to spawn a child session.
 #[derive(Debug)]
 pub struct SpawnRequest {
     pub task: String,
     pub focus_files: Vec<String>,
+    /// Images collected from the parent's live history at spawn time, plus
+    /// any image files the task text or `focus_files` reference (see
+    /// `collect_task_image_references`). The runtime forwards them to the
+    /// child's first message when the child's routed provider+model accepts
+    /// native image input; paths are relative to the parent workspace root.
+    pub images: Vec<ImageAttachment>,
     pub use_worktree: bool,
     pub provider_override: Option<ProviderKind>,
     pub model_override: Option<String>,
@@ -31,12 +43,44 @@ pub struct SpawnResponse {
 
 pub struct SpawnSubagentTool {
     spawn_tx: mpsc::Sender<SpawnRequest>,
+    /// Live mirror of the parent conversation, refreshed by the supervisor at
+    /// each turn start, so image collection sees messages pasted after the
+    /// consumer was wired (a wiring-time snapshot would miss them).
+    history: Arc<Mutex<Vec<Message>>>,
 }
 
 impl SpawnSubagentTool {
-    pub fn new(spawn_tx: mpsc::Sender<SpawnRequest>) -> Self {
-        Self { spawn_tx }
+    pub fn new(spawn_tx: mpsc::Sender<SpawnRequest>, history: Arc<Mutex<Vec<Message>>>) -> Self {
+        Self { spawn_tx, history }
     }
+}
+
+/// Collect image attachments from a conversation snapshot, deduplicated by
+/// path in chronological order. When more than `cap` distinct images exist,
+/// the oldest are dropped and the dropped count is returned.
+pub fn collect_recent_images(messages: &[Message], cap: usize) -> (Vec<ImageAttachment>, usize) {
+    let mut seen = std::collections::HashSet::new();
+    let mut images: Vec<ImageAttachment> = Vec::new();
+    for message in messages {
+        let MessageContent::Parts(parts) = &message.content else {
+            continue;
+        };
+        for part in parts {
+            if let ContentPart::Image { media_type, path } = part
+                && seen.insert(path.clone())
+            {
+                images.push(ImageAttachment {
+                    media_type: media_type.clone(),
+                    path: path.clone(),
+                });
+            }
+        }
+    }
+    if images.len() <= cap {
+        return (images, 0);
+    }
+    let dropped = images.len() - cap;
+    (images.split_off(dropped), dropped)
 }
 
 #[async_trait::async_trait]
@@ -60,7 +104,7 @@ impl ToolExecutor for SpawnSubagentTool {
                     "focus_files": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional list of file paths the sub-agent should focus on."
+                        "description": "Optional list of file paths the sub-agent should focus on. Image files (png/jpg/gif/webp/bmp) listed here or mentioned in the task text are attached to the sub-agent's first message, so visual-analysis tasks work by path."
                     },
                     "use_worktree": {
                         "type": "boolean",
@@ -120,9 +164,15 @@ impl ToolExecutor for SpawnSubagentTool {
 
         let (reply_tx, reply_rx) = oneshot::channel();
 
+        let images = match self.history.lock() {
+            Ok(messages) => collect_recent_images(&messages, MAX_FORWARD_IMAGES).0,
+            Err(_) => Vec::new(),
+        };
+
         let req = SpawnRequest {
             task,
             focus_files,
+            images,
             use_worktree,
             provider_override,
             model_override,
@@ -233,7 +283,7 @@ mod tests {
                 "API request failed: {\"error\":{\"message\":\"Insufficient Balance\"}}",
             ),
         );
-        let tool = SpawnSubagentTool::new(spawn_tx);
+        let tool = SpawnSubagentTool::new(spawn_tx, empty_history());
         let result = tool.execute(&tool_call()).await;
         assert!(!result.success);
         let error = result.error.expect("error must be set on failure");
@@ -249,7 +299,7 @@ mod tests {
         // Empty output: status-only message.
         let (spawn_tx, spawn_rx) = mpsc::channel(1);
         spawn_responder(spawn_rx, response("error", "   "));
-        let tool = SpawnSubagentTool::new(spawn_tx);
+        let tool = SpawnSubagentTool::new(spawn_tx, empty_history());
         let result = tool.execute(&tool_call()).await;
         assert_eq!(
             result.error.as_deref(),
@@ -260,7 +310,7 @@ mod tests {
         // (plus the fixed prefix).
         let (spawn_tx, spawn_rx) = mpsc::channel(1);
         spawn_responder(spawn_rx, response("error", &"x".repeat(5000)));
-        let tool = SpawnSubagentTool::new(spawn_tx);
+        let tool = SpawnSubagentTool::new(spawn_tx, empty_history());
         let result = tool.execute(&tool_call()).await;
         let error = result.error.expect("error must be set on failure");
         assert!(
@@ -269,5 +319,62 @@ mod tests {
             error.chars().count()
         );
         assert!(error.ends_with('…'));
+    }
+
+    fn empty_history() -> Arc<Mutex<Vec<Message>>> {
+        Arc::new(Mutex::new(Vec::new()))
+    }
+
+    fn image_part(path: &str) -> ContentPart {
+        ContentPart::Image {
+            media_type: "image/png".into(),
+            path: path.into(),
+        }
+    }
+
+    #[test]
+    fn collect_recent_images_dedups_and_caps_oldest() {
+        let messages = vec![
+            Message::user_with_parts(vec![
+                ContentPart::Text { text: "a".into() },
+                image_part("one.png"),
+            ]),
+            Message::user("no images here"),
+            Message::user_with_parts(vec![image_part("two.png"), image_part("one.png")]),
+            Message::user_with_parts(vec![image_part("three.png")]),
+        ];
+
+        let (images, dropped) = collect_recent_images(&messages, 2);
+        assert_eq!(dropped, 1);
+        let paths: Vec<_> = images.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(paths, ["two.png", "three.png"]);
+
+        let (images, dropped) = collect_recent_images(&messages, 8);
+        assert_eq!((images.len(), dropped), (3, 0));
+    }
+
+    #[tokio::test]
+    async fn execute_collects_images_from_history_mirror() {
+        let (spawn_tx, mut spawn_rx) = mpsc::channel::<SpawnRequest>(1);
+        let history = Arc::new(Mutex::new(vec![Message::user_with_parts(vec![
+            image_part("shot.png"),
+        ])]));
+
+        let responder = tokio::spawn(async move {
+            if let Some(req) = spawn_rx.recv().await {
+                let _ = req.reply.send(response("completed", "ok"));
+                req.images
+            } else {
+                Vec::new()
+            }
+        });
+
+        let tool = SpawnSubagentTool::new(spawn_tx, history);
+        let result = tool.execute(&tool_call()).await;
+        assert!(result.success);
+
+        let images = responder.await.expect("responder");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].path, "shot.png");
     }
 }

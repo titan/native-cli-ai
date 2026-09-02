@@ -529,7 +529,7 @@ async fn t27_consumer_wiring_routes_child_spawn_into_parent_log() {
         "t27-parent".into(),
         ws.path().to_path_buf(),
         config,
-        vec![Message::user("parent context")],
+        Arc::new(std::sync::Mutex::new(vec![Message::user("parent context")])),
         Some(parent_tx),
         parent_fs,
     );
@@ -538,6 +538,7 @@ async fn t27_consumer_wiring_routes_child_spawn_into_parent_log() {
         .send(SpawnRequest {
             task: "t27 child task".into(),
             focus_files: Vec::new(),
+            images: Vec::new(),
             use_worktree: false,
             provider_override: None,
             model_override: None,
