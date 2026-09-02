@@ -1504,7 +1504,7 @@ impl Supervisor {
         name: Option<&str>,
     ) -> Result<Option<String>, ProviderError> {
         // Start from the clean base config (before any agent overrides).
-        let mut config = self.base_config.clone();
+        let config = self.base_config.clone();
         let profile = name.and_then(|n| config.agent_profile(n).cloned());
         if let Some(name) = name
             && profile.is_none()
@@ -1515,32 +1515,37 @@ impl Supervisor {
             );
         }
 
+        // Profile provider/model/permission overrides apply to a transient
+        // effective snapshot used only to build the provider and drive the
+        // session. They must never leak into `self.config` / `base_config`:
+        // those are user-level state that whole-config saves persist, and a
+        // baked-in profile model used to resurface in `.nca/config.local.toml`
+        // after any later `/model` / `/provider` save.
+        let mut effective = config.clone();
         if let Some(ref p) = profile {
             if let Some(provider) = p.resolve_provider() {
-                config.set_default_provider(provider);
+                effective.set_default_provider(provider);
             }
             if let Some(ref model) = p.model {
-                let resolved = config.model.resolve_alias(model);
-                config.provider.set_model_for_default(resolved);
-                config.sync_default_model_from_provider();
+                let resolved = effective.model.resolve_alias(model);
+                effective.provider.set_model_for_default(resolved);
+                effective.sync_default_model_from_provider();
             }
             if let Some(mode) = p.permission_mode {
-                config.permissions.mode = mode;
+                effective.permissions.mode = mode;
             }
         }
 
         // Rebuild provider if config changed.
-        let provider = build_provider(&config)?;
+        let provider = build_provider(&effective)?;
         self.config = config;
-        self.model = self.config.model.default_model.clone();
+        self.model = effective.model.default_model.clone();
         let m = self.model.clone();
         self.agent.model = m;
         self.agent.replace_provider(provider);
         self.agent
-            .set_keepalive_profile(cache_keepalive::resolve_profile(
-                self.config.provider.default,
-            ));
-        self.agent.approval.set_mode(self.config.permissions.mode);
+            .set_keepalive_profile(cache_keepalive::resolve_profile(effective.provider.default));
+        self.agent.approval.set_mode(effective.permissions.mode);
 
         // Store profile and rebuild system prompt. `active_agent_name` is
         // assigned HERE, on the success path only: a failed switch above
@@ -1600,10 +1605,23 @@ impl Supervisor {
         &self.config
     }
 
+    /// Mutable access to the live config, so CLI edits (e.g. `/set-editor`)
+    /// land on the same snapshot later whole-config saves serialize.
+    pub fn config_mut(&mut self) -> &mut NcaConfig {
+        &mut self.config
+    }
+
     /// Apply a new [`NcaConfig`] and rebuild the active LLM provider (in-session provider switch).
     /// An injected test provider (via `SupervisorConfig::provider`) is discarded here.
-    pub fn apply_nca_config(&mut self, config: NcaConfig) -> Result<(), ProviderError> {
+    pub fn apply_nca_config(&mut self, mut config: NcaConfig) -> Result<(), ProviderError> {
         let provider = build_provider(&config)?;
+        // Live mounts win: callers may pass a snapshot taken before a `/mount`,
+        // and adopting it verbatim lets the next whole-config save erase the
+        // persisted `extra_paths` (see mount_config_persistence regression).
+        let live_mounts = self.fs.mounted_paths();
+        if config.extra_paths != live_mounts {
+            config.extra_paths = live_mounts;
+        }
         self.base_config = config.clone();
         self.config = config;
         self.model = self.config.provider.active_model().to_string();
