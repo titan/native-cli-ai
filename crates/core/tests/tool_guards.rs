@@ -82,6 +82,7 @@ async fn run_batch(
         &cancel_flag,
         calls,
         guard,
+        "/tmp/test-workspace",
     )
     .await
     .expect("pipeline must not be cancelled");

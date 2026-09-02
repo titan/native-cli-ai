@@ -36,6 +36,10 @@ pub struct PipelineResult {
 ///
 /// `repeat_guard` is caller-owned and must live for the whole session so
 /// repeat detection persists across tool batches, steps, and turns.
+///
+/// `workspace_root` is included in every hook payload as a top-level
+/// `workspace` string so hook scripts can identify the source directory.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_tool_pipeline(
     tools: &ToolRegistry,
     approval: &mut ApprovalPolicy,
@@ -44,6 +48,7 @@ pub async fn run_tool_pipeline(
     cancel_flag: &AtomicBool,
     tool_calls: Vec<ToolCall>,
     repeat_guard: &mut RepeatCallGuard,
+    workspace_root: &str,
 ) -> Result<PipelineResult, String> {
     let mut events = Vec::new();
     let mut emit = |e: AgentEvent| {
@@ -113,6 +118,7 @@ pub async fn run_tool_pipeline(
                                 "tool": call.name.clone(),
                                 "input": call.input.clone(),
                                 "description": description,
+                                "workspace": workspace_root,
                             }),
                         )
                         .await;
@@ -142,6 +148,7 @@ pub async fn run_tool_pipeline(
                                     "call_id": call.id.clone(),
                                     "tool": call.name.clone(),
                                     "input": call.input.clone(),
+                                    "workspace": workspace_root,
                                 }),
                             )
                             .await
@@ -193,6 +200,7 @@ pub async fn run_tool_pipeline(
                                 "call_id": call.id.clone(),
                                 "tool": call.name.clone(),
                                 "input": call.input.clone(),
+                                "workspace": workspace_root,
                             }),
                         )
                         .await
@@ -327,6 +335,7 @@ pub async fn run_tool_pipeline(
                         "success": result.success,
                         "output": result.output,
                         "error": result.error,
+                        "workspace": workspace_root,
                     }),
                 )
                 .await;

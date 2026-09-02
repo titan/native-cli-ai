@@ -348,6 +348,7 @@ pub fn spawn_subagent_consumer(
                                         "parent_session_id": parent_session_id.clone(),
                                         "child_session_id": res.child_session_id.clone(),
                                         "status": res.status.clone(),
+                                        "workspace": res.workspace.clone(),
                                     }),
                                 )
                                 .await;
@@ -372,6 +373,7 @@ pub fn spawn_subagent_consumer(
                                         "parent_session_id": parent_session_id.clone(),
                                         "status": "error",
                                         "error": e.clone(),
+                                        "workspace": workspace_root.display().to_string(),
                                     }),
                                 )
                                 .await;

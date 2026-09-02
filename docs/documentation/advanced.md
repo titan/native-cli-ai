@@ -184,6 +184,11 @@ blocking = false
 | `matcher` | string | `""` | Regex pattern to filter when the hook fires |
 | `blocking` | bool | `false` | Whether to wait for the hook to complete |
 
+All hook payloads are JSON objects delivered on the hook script's stdin and
+include a top-level `workspace` string — the session's workspace root path.
+This lets one shared script identify which directory an event came from, e.g.
+`jq -r '.workspace | split("/") | last'` yields the directory name.
+
 ---
 
 ## Persistent Memory

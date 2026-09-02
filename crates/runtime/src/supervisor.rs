@@ -1306,6 +1306,7 @@ impl Supervisor {
             json!({
                 "reason": format!("{reason:?}"),
                 "session": self.snapshot(),
+                "workspace": self.workspace_root.display().to_string(),
             }),
         )
         .await;

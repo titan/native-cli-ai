@@ -243,6 +243,7 @@ impl<'a> TurnDriver<'a> {
                     None,
                     &json!({
                         "response_preview": response_preview,
+                        "workspace": self.workspace_root.display().to_string(),
                     }),
                 )
                 .await;
@@ -599,6 +600,7 @@ impl<'a> TurnDriver<'a> {
             &agent.cancel_flag,
             tool_calls.clone(),
             &mut agent.repeat_guard,
+            &self.workspace_root.display().to_string(),
         )
         .await
         .map_err(ProviderError::Other)?;
