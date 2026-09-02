@@ -35,16 +35,23 @@ pub enum SkillSource {
 pub struct SkillCatalog;
 
 impl SkillCatalog {
-    pub fn discover(
-        workspace_root: &Path,
-        skill_directories: &[PathBuf],
-    ) -> Result<Vec<Skill>, String> {
+    /// Return every directory root [`Self::discover`] scans, in priority
+    /// order: config-declared `skill_directories` (relative paths resolved
+    /// against `workspace_root`) followed by the global XDG fallbacks
+    /// (`~/.config/nca/skills`, `~/.config/claude/skills`).
+    ///
+    /// Exposed so consumers that need the same visibility as skill discovery
+    /// can derive the roots without duplicating the fallback logic — notably
+    /// the Landlock sandbox, which grants read-only access to skill roots so
+    /// bundled tools stay executable under confinement.
+    pub fn discovery_roots(workspace_root: &Path, skill_directories: &[PathBuf]) -> Vec<PathBuf> {
         let mut roots = Vec::new();
 
         // Workspace-local skill directories take precedence over the global
         // fallback so per-project skills override the shared defaults. The
-        // scan below keeps the first skill seen for a given command, so order
-        // here defines priority (AGENTS.md, parsed earlier, wins overall).
+        // `discover` scan below keeps the first skill seen for a given
+        // command, so order here defines priority (AGENTS.md, parsed earlier,
+        // wins overall).
         for dir in skill_directories {
             if dir.is_absolute() {
                 roots.push(dir.clone());
@@ -58,6 +65,15 @@ impl SkillCatalog {
             roots.push(config_dir.join("nca/skills"));
             roots.push(config_dir.join("claude/skills"));
         }
+
+        roots
+    }
+
+    pub fn discover(
+        workspace_root: &Path,
+        skill_directories: &[PathBuf],
+    ) -> Result<Vec<Skill>, String> {
+        let roots = Self::discovery_roots(workspace_root, skill_directories);
 
         let mut skills = Vec::new();
 
@@ -803,6 +819,30 @@ mod tests {
         assert_eq!(skill.context, SkillContextMode::Fork);
         assert_eq!(skill.permission_mode, Some(PermissionMode::Plan));
         assert!(skill.body.contains("Inspect diffs"));
+    }
+
+    #[test]
+    fn discovery_roots_resolve_relative_and_append_xdg_fallbacks() {
+        // Roots feed both skill discovery and the Landlock policy (read-only
+        // skill roots), so the ordering contract is load-bearing: config-
+        // declared directories first (relative resolved against the workspace
+        // root), global XDG fallbacks appended after.
+        let ws = tempfile::tempdir().unwrap();
+        let roots = SkillCatalog::discovery_roots(
+            ws.path(),
+            &[
+                PathBuf::from(".nca/skills"),
+                PathBuf::from("/abs/custom-skills"),
+            ],
+        );
+        assert_eq!(roots[0], ws.path().join(".nca/skills"));
+        assert_eq!(roots[1], PathBuf::from("/abs/custom-skills"));
+        if let Some(config_dir) = nca_common::config::xdg_config_dir() {
+            assert_eq!(roots[2], config_dir.join("nca/skills"));
+            assert_eq!(roots[3], config_dir.join("claude/skills"));
+        } else {
+            assert_eq!(roots.len(), 2, "no XDG dir → no fallback roots");
+        }
     }
 
     // === lenient frontmatter parser tests ===

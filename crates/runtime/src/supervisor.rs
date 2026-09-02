@@ -496,9 +496,15 @@ impl Supervisor {
         // Wire the P5 Landlock sandbox into every PTY shell execution
         // (resolved once here; per-exec confinement applies only to children).
         // Live mounts (restored above + any runtime `/mount`) are passed so
-        // the policy matches file-tool visibility.
+        // the policy matches file-tool visibility; skill catalog roots are
+        // passed read-only so skill-bundled tools stay executable under
+        // confinement.
         let pty = PtyManager::new(&workspace_root);
-        pty.set_sandbox_config(config.permissions.sandbox.clone(), &fs.mounted_paths());
+        pty.set_sandbox_config(
+            config.permissions.sandbox.clone(),
+            &fs.mounted_paths(),
+            &SkillCatalog::discovery_roots(&workspace_root, &config.harness.skill_directories),
+        );
         let pty = Arc::new(pty);
         let pty_for_supervisor = pty.clone();
         tools.register(Box::new(crate::bash_tool::RuntimeBashTool::new(pty)));
@@ -1628,6 +1634,10 @@ impl Supervisor {
         self.pty.set_sandbox_config(
             self.config.permissions.sandbox.clone(),
             &self.fs.mounted_paths(),
+            &SkillCatalog::discovery_roots(
+                &self.workspace_root,
+                &self.config.harness.skill_directories,
+            ),
         );
     }
 

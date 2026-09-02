@@ -61,11 +61,18 @@ impl PtyManager {
     /// tool call.
     ///
     /// `mounts` are the live `/mount` paths; they become rw roots when
-    /// `cfg.inherit_mounts` (default). Takes `&self` so the supervisor can
+    /// `cfg.inherit_mounts` (default). `skill_roots` are the skill catalog
+    /// directories; they become read-only roots so skill-bundled tools stay
+    /// executable under confinement. Takes `&self` so the supervisor can
     /// refresh the policy after a runtime `/mount` without rebuilding the
     /// `Arc`-shared manager — each confined child snapshots the policy at
     /// spawn time, so later mounts apply to the next command.
-    pub fn set_sandbox_config(&self, cfg: SandboxConfig, mounts: &[PathBuf]) {
+    pub fn set_sandbox_config(
+        &self,
+        cfg: SandboxConfig,
+        mounts: &[PathBuf],
+        skill_roots: &[PathBuf],
+    ) {
         let decision = sandbox::resolve(
             cfg.mode,
             &sandbox::backend_supported,
@@ -77,6 +84,7 @@ impl PtyManager {
                 &cfg,
                 &self.workspace_root(),
                 mounts,
+                skill_roots,
             )),
             Ok(sandbox::SandboxDecision::Unconfined) => None,
             Err(e) => {

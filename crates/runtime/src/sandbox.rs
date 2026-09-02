@@ -57,10 +57,21 @@ impl SandboxPolicy {
     /// `/mount` is an explicit user authorization, and file tools get rw on
     /// mounts, so propagating rw adds no authority the user has not granted.
     /// Non-existent paths are dropped (same existence filter as `ro_paths`).
+    ///
+    /// `skill_roots` are the skill catalog directories
+    /// ([`nca_core::skills::SkillCatalog::discovery_roots`]). They become
+    /// read-only roots: skills may ship bundled tools that agent-driven
+    /// shell commands execute, and Landlock's read access set includes
+    /// execute, so ro keeps them runnable while still denying writes — a
+    /// confined command must not be able to mutate the skill definitions
+    /// the agent itself follows (file-tool write access is denied there
+    /// too, so this matches file-tool visibility exactly). Roots already
+    /// under the workspace are redundant with its rw root but harmless.
     pub fn from_config(
         config: &SandboxConfig,
         workspace_root: &std::path::Path,
         mounts: &[PathBuf],
+        skill_roots: &[PathBuf],
     ) -> Self {
         let mut ro: Vec<PathBuf> = [
             "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/nix", "/opt",
@@ -70,6 +81,10 @@ impl SandboxPolicy {
         .filter(|p| p.exists())
         .collect();
         ro.extend(config.ro_paths.iter().cloned());
+        // Skill catalog roots (read-only) — see the method doc for the
+        // authorization argument. Existence-filtered like every other
+        // derived root.
+        ro.extend(skill_roots.iter().filter(|p| p.exists()).cloned());
 
         // Git global config chain (read-only): without these, every `git`
         // invocation inside the sandbox fails with rc=128 because git cannot
@@ -384,7 +399,7 @@ mod tests {
             env_allow: nca_common::config::default_sandbox_env_allow(),
             inherit_mounts: true,
         };
-        let p = SandboxPolicy::from_config(&config, std::path::Path::new("/work/root"), &[]);
+        let p = SandboxPolicy::from_config(&config, std::path::Path::new("/work/root"), &[], &[]);
 
         assert!(p.rw.contains(&PathBuf::from("/work/root")));
         assert!(p.rw.contains(&PathBuf::from("/data")));
@@ -397,8 +412,12 @@ mod tests {
         // Ordinary shell redirections (`2>/dev/null`, `</dev/zero`) and
         // entropy reads must not fail EACCES under confinement.
         let _env = env_read_lock();
-        let p =
-            SandboxPolicy::from_config(&SandboxConfig::default(), std::path::Path::new("/w"), &[]);
+        let p = SandboxPolicy::from_config(
+            &SandboxConfig::default(),
+            std::path::Path::new("/w"),
+            &[],
+            &[],
+        );
         for dev in ESSENTIAL_DEVICES {
             if std::path::Path::new(dev).exists() {
                 assert!(p.rw.contains(&PathBuf::from(dev)), "missing {dev}");
@@ -417,8 +436,12 @@ mod tests {
         // parallel env-mutating test (pty's EnvGuard HOME swap) cannot change
         // HOME between the two reads.
         let _env = env_read_lock();
-        let p =
-            SandboxPolicy::from_config(&SandboxConfig::default(), std::path::Path::new("/w"), &[]);
+        let p = SandboxPolicy::from_config(
+            &SandboxConfig::default(),
+            std::path::Path::new("/w"),
+            &[],
+            &[],
+        );
 
         let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
@@ -464,7 +487,7 @@ mod tests {
         // not fail with "Permission denied".
         let _env = env_read_lock();
         let config = SandboxConfig::default();
-        let p = SandboxPolicy::from_config(&config, std::path::Path::new("."), &[]);
+        let p = SandboxPolicy::from_config(&config, std::path::Path::new("."), &[], &[]);
         let out = exec_confined("echo noisy >/dev/null 2>&1; echo pass", &p)
             .expect("confined exec with /dev/null redirect");
         assert_eq!(out.exit_code, Some(0), "{:?}", out.combined);
@@ -496,7 +519,7 @@ mod tests {
         // every sandboxed shell call through git fails.
         let _env = env_read_lock();
         let config = SandboxConfig::default();
-        let p = SandboxPolicy::from_config(&config, std::path::Path::new("."), &[]);
+        let p = SandboxPolicy::from_config(&config, std::path::Path::new("."), &[], &[]);
         // Run from the temp dir (a rw root in every policy): `git config`
         // still walks the parent directory chain looking for a repo, and
         // outside one it needs only the global/system config chain — exactly
@@ -615,6 +638,7 @@ mod tests {
             &config,
             std::path::Path::new("/work/root"),
             &[mounted.path().to_path_buf()],
+            &[],
         );
         assert!(
             p.rw.contains(&mounted.path().to_path_buf()),
@@ -635,6 +659,7 @@ mod tests {
             &config,
             std::path::Path::new("/work/root"),
             &[mounted.path().to_path_buf()],
+            &[],
         );
         assert!(
             !p.rw.contains(&mounted.path().to_path_buf()),
@@ -652,8 +677,36 @@ mod tests {
             &config,
             std::path::Path::new("/work/root"),
             std::slice::from_ref(&ghost),
+            &[],
         );
         assert!(!p.rw.contains(&ghost), "non-existent mount must be dropped");
+    }
+
+    #[test]
+    fn from_config_grants_skill_roots_read_only_and_drops_missing() {
+        let _env = env_read_lock();
+        let skills = tempfile::tempdir().expect("tempdir");
+        let ghost = PathBuf::from("/definitely/not/a/skill/root");
+        let config = SandboxConfig::default();
+
+        let p = SandboxPolicy::from_config(
+            &config,
+            std::path::Path::new("/work/root"),
+            &[],
+            &[skills.path().to_path_buf(), ghost.clone()],
+        );
+        assert!(
+            p.ro.contains(&skills.path().to_path_buf()),
+            "existing skill root must be a read-only root"
+        );
+        assert!(
+            !p.rw.contains(&skills.path().to_path_buf()),
+            "skill roots must NOT be read-write (confined commands must not mutate skill definitions)"
+        );
+        assert!(
+            !p.ro.contains(&ghost),
+            "non-existent skill root must be dropped"
+        );
     }
 
     #[test]
@@ -684,6 +737,7 @@ mod tests {
             &config,
             std::path::Path::new("."),
             std::slice::from_ref(&mounted),
+            &[],
         );
         let marker = mounted.join("marker.txt");
         let out = exec_confined(

@@ -146,7 +146,7 @@ async fn pty_required_mode_confines_writes_to_workspace_root() {
 
     let ws = tempfile::tempdir().expect("tempdir");
     let m = PtyManager::new(ws.path());
-    m.set_sandbox_config(required_config(), &[]);
+    m.set_sandbox_config(required_config(), &[], &[]);
 
     // (1) Write outside all rw roots (/etc is ro under the wired policy) →
     //     must fail. Clean any stale file from earlier runs so the assertion
@@ -242,7 +242,7 @@ async fn pty_mounted_paths_become_rw_after_refresh() {
     let m = PtyManager::new(ws.path());
 
     // Before the mount: writing inside the (not yet mounted) dir fails.
-    m.set_sandbox_config(required_config(), &[]);
+    m.set_sandbox_config(required_config(), &[], &[]);
     let denied = m
         .exec_streaming(
             &format!("touch {}/pre-mount", mounted.display()),
@@ -254,7 +254,7 @@ async fn pty_mounted_paths_become_rw_after_refresh() {
     assert_ne!(denied.exit_code, 0, "pre-mount write must be confined");
 
     // Simulate `/mount`: refresh the policy with the live mount list.
-    m.set_sandbox_config(required_config(), std::slice::from_ref(&mounted));
+    m.set_sandbox_config(required_config(), std::slice::from_ref(&mounted), &[]);
     let allowed = m
         .exec_streaming(
             &format!(
@@ -285,4 +285,87 @@ async fn pty_mounted_paths_become_rw_after_refresh() {
     assert_ne!(still.exit_code, 0, "/etc must stay read-only");
 
     let _ = std::fs::remove_dir_all(&mounted);
+}
+
+/// Skill catalog roots → sandbox propagation: a directory passed to
+/// `set_sandbox_config` as a skill root is readable/executable — but NOT
+/// writable — by subsequent `exec_streaming` commands. Skills may ship
+/// bundled tools (scripts) that agent-driven shell commands must run; Landlock's
+/// read access set includes execute, so read-only keeps them runnable while
+/// the skill definitions stay immutable from inside the sandbox. Kernel-gated.
+///
+/// Like the mount test above, the fixture lives under bare `$HOME`
+/// (deliberately not a default root) so success/failure proves the grant.
+#[tokio::test(flavor = "multi_thread")]
+async fn pty_skill_roots_are_executable_but_not_writable() {
+    if !backend_supported() {
+        eprintln!("SKIP: Landlock unavailable on this kernel");
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        eprintln!("SKIP: HOME unset; cannot build a skill-root fixture outside rw roots");
+        return;
+    };
+
+    let ws = tempfile::tempdir().expect("tempdir workspace");
+    let skills = std::path::Path::new(&home).join(format!(
+        ".nca-sbox-skill-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let tool = skills.join("my-skill/tool.sh");
+    // Hosting process itself sandboxed (e.g. nca dogfooding) — cannot build
+    // the fixture; skip honestly instead of failing.
+    if let Err(e) = std::fs::create_dir_all(tool.parent().expect("parent")) {
+        eprintln!("SKIP: cannot create skill fixture under HOME ({e})");
+        return;
+    }
+    std::fs::write(&tool, "#!/bin/sh\necho skill-tool-ok\n").expect("write tool");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let m = PtyManager::new(ws.path());
+    let script = tool.display().to_string();
+
+    // (1) Without the skill root: executing the bundled tool is confined away.
+    m.set_sandbox_config(required_config(), &[], &[]);
+    let denied = m
+        .exec_streaming(&script, 10, &progress("pre-skill-exec"))
+        .await
+        .expect("command should spawn");
+    assert_ne!(denied.exit_code, 0, "pre-grant skill tool must be confined");
+
+    // (2) With the skill root: the bundled tool executes under its ro root.
+    m.set_sandbox_config(required_config(), &[], std::slice::from_ref(&skills));
+    let allowed = m
+        .exec_streaming(&script, 10, &progress("post-skill-exec"))
+        .await
+        .expect("command should spawn");
+    assert_eq!(
+        allowed.exit_code, 0,
+        "skill-bundled tool must execute under its ro root: {:?}",
+        allowed.stdout
+    );
+    assert!(
+        allowed.stdout.contains("skill-tool-ok"),
+        "unexpected tool output: {:?}",
+        allowed.stdout
+    );
+
+    // (3) But the root stays read-only: mutating skill definitions from
+    //     inside the sandbox must still fail.
+    let write = m
+        .exec_streaming(
+            &format!("touch {}/mutate", skills.display()),
+            10,
+            &progress("skill-write"),
+        )
+        .await
+        .expect("command should spawn");
+    assert_ne!(write.exit_code, 0, "skill roots must stay read-only");
+
+    let _ = std::fs::remove_dir_all(&skills);
 }
