@@ -145,6 +145,14 @@ pub async fn spawn_child_session(
     .await
     .map_err(|e| e.to_string())?;
 
+    // Child sessions are non-interactive: `QuestionRequested` is NOT
+    // forwarded to the parent UI (only activity lines are), so a child that
+    // called `ask_question` would block forever on an oneshot nobody can
+    // answer — freezing both the child and the parent turn awaiting it.
+    // Strip the tool; the model gets a normal "unknown tool" error it can
+    // recover from instead of an invisible hang.
+    sup.agent_mut().tools.unregister("ask_question");
+
     let child_id = sup.session_id.clone();
 
     sup.set_parent(

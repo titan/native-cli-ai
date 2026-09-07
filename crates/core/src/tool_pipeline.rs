@@ -1,9 +1,11 @@
 //! Tool execution pipeline extracted from AgentLoop.
 //!
 //! Takes a batch of [`ToolCall`]s, runs permission checks (sequential, because
-//! approvals may be interactive), executes approved calls concurrently, and
-//! returns ordered results. This isolates the "check → approve → execute" flow
-//! from the streaming/parser logic in AgentLoop.
+//! approvals may be interactive), executes approved calls concurrently —
+//! except interactive tools (see [`ToolRegistry::is_interactive`]), which run
+//! strictly one at a time — and returns ordered results. This isolates the
+//! "check → approve → execute" flow from the streaming/parser logic in
+//! AgentLoop.
 
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -242,17 +244,23 @@ pub async fn run_tool_pipeline(
         let mut cancel_poll = tokio::time::interval(Duration::from_millis(50));
         cancel_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-        // Run tool executions concurrently.  Poll cancel_flag every 50 ms so
-        // the user can interrupt long-running tools (e.g. cargo build).
-        // Each call with a declared `timeout_ms` is additionally wrapped in a
-        // cooperative `tokio::time::timeout` (external processes like bash are
-        // killed by their own PTY timeout, not by this wrapper).
+        // Run tool executions concurrently, EXCEPT interactive tools (tools
+        // that block awaiting a human answer, e.g. `ask_question`): those run
+        // strictly one at a time as barriers between concurrent spans. Every
+        // UI surface tracks a single active question — two simultaneous
+        // `QuestionRequested` events would overwrite the first in the UI,
+        // orphan its oneshot channel, and freeze the turn forever.
+        //
+        // Poll cancel_flag every 50 ms so the user can interrupt long-running
+        // tools (e.g. cargo build). Each call with a declared `timeout_ms` is
+        // additionally wrapped in a cooperative `tokio::time::timeout`
+        // (external processes like bash are killed by their own PTY timeout,
+        // not by this wrapper).
         let exec_fut = async {
-            let futs = to_execute.iter().map(|(i, call, guard_hint)| {
+            // Shared per-call future: timeout wrap + repeat-hint append.
+            let run_call = |(i, call, guard_hint): (usize, ToolCall, Option<String>)| {
                 let call_id = call.id.clone();
                 let tx = event_tx.clone();
-                let call = call.clone();
-                let guard_hint = guard_hint.clone();
                 let timeout_ms = tools.timeout_ms_for(&call.name);
                 async move {
                     let progress = crate::tools::ToolProgress::new(call_id, tx);
@@ -289,10 +297,25 @@ pub async fn run_tool_pipeline(
                         }
                         _ => res,
                     };
-                    (*i, res)
+                    (i, res)
                 }
-            });
-            futures_util::future::join_all(futs).await
+            };
+
+            let mut executed: Vec<(usize, ToolResult)> = Vec::with_capacity(to_execute.len());
+            let mut span: Vec<(usize, ToolCall, Option<String>)> = Vec::new();
+            for item in to_execute {
+                if !tools.is_interactive(&item.1.name) {
+                    span.push(item);
+                    continue;
+                }
+                // Barrier: drain the concurrent span, then run the interactive
+                // call alone so at most one human-blocking question is pending.
+                executed
+                    .extend(futures_util::future::join_all(span.drain(..).map(&run_call)).await);
+                executed.push(run_call(item).await);
+            }
+            executed.extend(futures_util::future::join_all(span.into_iter().map(run_call)).await);
+            executed
         };
 
         tokio::pin!(exec_fut);
@@ -346,4 +369,265 @@ pub async fn run_tool_pipeline(
         results: final_results,
         events,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::ToolExecutor;
+    use nca_common::tool::ToolDefinition;
+    use std::sync::{Arc, Mutex};
+
+    /// Tool that logs "start:<id>"/"end:<id>" into a shared log and blocks on
+    /// a zero-permit semaphore until the test releases it.
+    struct GatedTool {
+        name: String,
+        log: Arc<Mutex<Vec<String>>>,
+        gate: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for GatedTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                timeout_ms: None,
+                name: self.name.clone(),
+                description: "gated test tool".into(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+
+        async fn execute(&self, call: &ToolCall) -> ToolResult {
+            self.log.lock().unwrap().push(format!("start:{}", call.id));
+            // Block until released. `forget` keeps the permit from recycling
+            // back into the semaphore when this call returns (a recycled permit
+            // would release the NEXT gated call without test consent); a permit
+            // added before we reach here is not lost — no missed-wakeup deadlock.
+            self.gate.acquire().await.expect("gate closed").forget();
+            self.log.lock().unwrap().push(format!("end:{}", call.id));
+            ToolResult {
+                timed_out: false,
+                call_id: call.id.clone(),
+                success: true,
+                output: format!("done:{}", call.id),
+                error: None,
+            }
+        }
+    }
+
+    fn call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            input: serde_json::json!({}),
+        }
+    }
+
+    async fn run(tools: ToolRegistry, calls: Vec<ToolCall>) -> Result<PipelineResult, String> {
+        let mut config = nca_common::config::NcaConfig::default();
+        // Bypass so the fake tool names ("instant", "slow_read", …) never hit
+        // the approval Ask tier — only ask_question is on the read allowlist.
+        config.permissions.mode = nca_common::config::PermissionMode::BypassPermissions;
+        let mut approval = ApprovalPolicy::new(config.permissions);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+        let cancel = AtomicBool::new(false);
+        let mut guard = RepeatCallGuard::new();
+        run_tool_pipeline(
+            &tools,
+            &mut approval,
+            &None,
+            &event_tx,
+            &cancel,
+            calls,
+            &mut guard,
+            "/ws",
+        )
+        .await
+    }
+
+    /// Two `ask_question` calls in one batch must serialize: the second must
+    /// not start until the first completed. Pre-fix, `join_all` ran both at
+    /// once, the UI's single active-question slot was overwritten, and the
+    /// first question's oneshot was orphaned — freezing the turn forever.
+    #[tokio::test]
+    async fn interactive_calls_serialize_one_at_a_time() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(GatedTool {
+            name: "ask_question".into(),
+            log: log.clone(),
+            gate: gate.clone(),
+        }));
+
+        let pipeline = tokio::spawn(async move {
+            run(
+                tools,
+                vec![call("q1", "ask_question"), call("q2", "ask_question")],
+            )
+            .await
+        });
+
+        // First question starts; the second must NOT have started yet.
+        // Give the (wrong) concurrent path a moment to misbehave.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        {
+            let l = log.lock().unwrap();
+            assert_eq!(
+                &*l,
+                &*vec!["start:q1".to_string()],
+                "only q1 may run: {l:?}"
+            );
+        }
+
+        // Release q1 → q2 may start only after q1 ended.
+        gate.add_permits(1);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        {
+            let l = log.lock().unwrap();
+            assert_eq!(
+                &*l,
+                &*vec![
+                    "start:q1".to_string(),
+                    "end:q1".to_string(),
+                    "start:q2".to_string()
+                ],
+                "q2 must start strictly after q1 completed: {l:?}"
+            );
+        }
+
+        // Release q2 → pipeline finishes with ordered results.
+        gate.add_permits(1);
+        let result = tokio::time::timeout(Duration::from_secs(5), pipeline)
+            .await
+            .expect("pipeline must not hang")
+            .expect("join must succeed")
+            .expect("pipeline must succeed");
+        assert!(result.results.iter().all(|r| r.success));
+        assert_eq!(result.results[0].call_id, "q1");
+        assert_eq!(result.results[1].call_id, "q2");
+    }
+
+    /// Non-interactive tools must keep running concurrently (the original
+    /// `join_all` behavior): both enter execute before either can finish.
+    #[tokio::test]
+    async fn non_interactive_calls_still_run_concurrently() {
+        // Two tools that must be in flight simultaneously: each waits at a
+        // 2-party barrier, so concurrency is proven by completion at all.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        struct BarrierTool {
+            name: String,
+            barrier: Arc<tokio::sync::Barrier>,
+        }
+        #[async_trait::async_trait]
+        impl ToolExecutor for BarrierTool {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    timeout_ms: None,
+                    name: self.name.clone(),
+                    description: "barrier test tool".into(),
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                }
+            }
+            async fn execute(&self, call: &ToolCall) -> ToolResult {
+                self.barrier.wait().await;
+                ToolResult {
+                    timed_out: false,
+                    call_id: call.id.clone(),
+                    success: true,
+                    output: String::new(),
+                    error: None,
+                }
+            }
+        }
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(BarrierTool {
+            name: "slow_read".into(),
+            barrier: barrier.clone(),
+        }));
+        tools.register(Box::new(BarrierTool {
+            name: "slow_search".into(),
+            barrier,
+        }));
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run(
+                tools,
+                vec![call("a", "slow_read"), call("b", "slow_search")],
+            ),
+        )
+        .await
+        .expect("must not hang — tools must overlap")
+        .expect("pipeline must succeed");
+        assert!(result.results.iter().all(|r| r.success));
+        assert_eq!(result.results[0].call_id, "a");
+        assert_eq!(result.results[1].call_id, "b");
+    }
+
+    /// Mixed batch: interactive barriers must not lose or reorder results.
+    #[tokio::test]
+    async fn mixed_batch_preserves_result_order() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+
+        struct InstantTool;
+        #[async_trait::async_trait]
+        impl ToolExecutor for InstantTool {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    timeout_ms: None,
+                    name: "instant".into(),
+                    description: "instant test tool".into(),
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                }
+            }
+            async fn execute(&self, call: &ToolCall) -> ToolResult {
+                ToolResult {
+                    timed_out: false,
+                    call_id: call.id.clone(),
+                    success: true,
+                    output: String::new(),
+                    error: None,
+                }
+            }
+        }
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(InstantTool));
+        tools.register(Box::new(GatedTool {
+            name: "ask_question".into(),
+            log: log.clone(),
+            gate: gate.clone(),
+        }));
+
+        let pipeline = tokio::spawn(async move {
+            run(
+                tools,
+                vec![
+                    call("a", "instant"),
+                    call("q1", "ask_question"),
+                    call("b", "instant"),
+                    call("q2", "ask_question"),
+                ],
+            )
+            .await
+        });
+
+        // Both questions run one after the other; release as they arrive.
+        for _ in 0..2 {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            gate.add_permits(1);
+        }
+
+        let result = tokio::time::timeout(Duration::from_secs(5), pipeline)
+            .await
+            .expect("must not hang")
+            .expect("join must succeed")
+            .expect("pipeline must succeed");
+        let ids: Vec<&str> = result.results.iter().map(|r| r.call_id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "q1", "b", "q2"]);
+        assert!(result.results.iter().all(|r| r.success));
+    }
 }

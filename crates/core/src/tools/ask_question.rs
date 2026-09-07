@@ -179,6 +179,26 @@ impl ToolExecutor for AskQuestionTool {
         }
 
         let question_id = format!("q-{}", call.id);
+
+        // One question at a time. The tool pipeline serializes interactive
+        // calls, but guard anyway: a second live `QuestionRequested` would
+        // overwrite the first in every UI surface (single active-question
+        // slot) and orphan its oneshot — the turn would freeze. Failing loud
+        // here lets the model retry once the pending question is answered.
+        if !self.pending.lock().unwrap().is_empty() {
+            return ToolResult {
+                timed_out: false,
+                call_id: call.id.clone(),
+                success: false,
+                output: String::new(),
+                error: Some(
+                    "another question is already pending; wait for it to be answered \
+                     before asking again"
+                        .into(),
+                ),
+            };
+        }
+
         let payload = InteractiveQuestionPayload {
             question_id: question_id.clone(),
             call_id: call.id.clone(),
@@ -246,5 +266,80 @@ impl ToolExecutor for AskQuestionTool {
             output: summary,
             error: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: "ask_question".into(),
+            input: serde_json::json!({
+                "prompt": "Pick one",
+                "options": [
+                    {"id": "a", "label": "Alpha"},
+                    {"id": "b", "label": "Beta"}
+                ],
+                "suggested_answer": "a"
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_when_another_question_is_pending() {
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let pending: Arc<Mutex<HashMap<String, oneshot::Sender<QuestionSelection>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let tool = AskQuestionTool::new(event_tx, pending.clone());
+
+        // Simulate a live question from an earlier call.
+        let (tx, _rx) = oneshot::channel();
+        pending.lock().unwrap().insert("q-live".into(), tx);
+
+        let res = tool.execute(&valid_call("call_2")).await;
+        assert!(!res.success);
+        let err = res.error.expect("must carry an error");
+        assert!(err.contains("already pending"), "unexpected error: {err}");
+        // The pending entry from the live question must be untouched.
+        assert!(pending.lock().unwrap().contains_key("q-live"));
+    }
+
+    #[tokio::test]
+    async fn happy_path_emits_resolves_and_summarizes() {
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let pending: Arc<Mutex<HashMap<String, oneshot::Sender<QuestionSelection>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let tool = AskQuestionTool::new(event_tx, pending.clone());
+
+        let handle = tokio::spawn(async move { tool.execute(&valid_call("call_1")).await });
+
+        // Consume QuestionRequested and answer through the shared pending map.
+        let question = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("timed out waiting for QuestionRequested")
+            .expect("event channel closed");
+        match question {
+            AgentEvent::QuestionRequested { question } => {
+                let tx = pending
+                    .lock()
+                    .unwrap()
+                    .remove(&question.question_id)
+                    .expect("question must be registered in the pending map");
+                tx.send(QuestionSelection::Suggested).expect("send answer");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let res = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("execute must finish")
+            .expect("join must succeed");
+        assert!(res.success, "error: {:?}", res.error);
+        assert!(res.output.contains("Selected suggested answer"));
+        // The pending map must be empty again so the next question can fire.
+        assert!(pending.lock().unwrap().is_empty());
     }
 }

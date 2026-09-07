@@ -35,6 +35,14 @@ use std::sync::Arc;
 
 use crate::workspace_fs::WorkspaceFs;
 
+/// Tool names that block awaiting a human answer.
+///
+/// The tool pipeline runs these strictly one at a time (barrier semantics,
+/// see `tool_pipeline`): every UI surface tracks a single active question,
+/// so two simultaneous `QuestionRequested` events would overwrite the first
+/// in the UI, orphan its oneshot, and freeze the turn forever.
+const INTERACTIVE_TOOLS: &[&str] = &["ask_question"];
+
 /// Registry of available tools the agent can invoke.
 pub struct ToolRegistry {
     tools: Vec<Box<dyn ToolExecutor>>,
@@ -90,6 +98,20 @@ impl ToolRegistry {
             .iter()
             .find(|t| t.definition().name == name)
             .and_then(|t| t.definition().timeout_ms)
+    }
+
+    /// True when the named tool blocks awaiting a human answer (e.g.
+    /// `ask_question`). The tool pipeline serializes these so at most one is
+    /// ever pending — every UI surface tracks a single active question.
+    pub fn is_interactive(&self, name: &str) -> bool {
+        INTERACTIVE_TOOLS.contains(&name)
+    }
+
+    /// Remove the named tool from the registry (no-op when absent). Used to
+    /// strip interactive tools from sessions that have no user attached to
+    /// answer them (child subagent sessions).
+    pub fn unregister(&mut self, name: &str) {
+        self.tools.retain(|t| t.definition().name != name);
     }
 
     /// Retain only tools whose name is in `allowed`; remove all others.
@@ -344,6 +366,27 @@ mod tests {
         reg.restrict_to(&["nonexistent".into()]);
 
         assert!(reg.definitions().is_empty());
+    }
+
+    #[test]
+    fn is_interactive_marks_ask_question_only() {
+        let reg = stub_registry(&["ask_question", "read_file"]);
+        assert!(reg.is_interactive("ask_question"));
+        assert!(!reg.is_interactive("read_file"));
+        assert!(!reg.is_interactive("not_registered"));
+    }
+
+    #[test]
+    fn unregister_removes_only_the_named_tool() {
+        let mut reg = stub_registry(&["ask_question", "read_file", "write_file"]);
+        reg.unregister("ask_question");
+
+        let names: Vec<String> = reg.definitions().iter().map(|d| d.name.clone()).collect();
+        assert_eq!(names, vec!["read_file", "write_file"]);
+
+        // Unregistering an absent tool is a no-op.
+        reg.unregister("ask_question");
+        assert_eq!(reg.definitions().len(), 2);
     }
 
     #[test]
