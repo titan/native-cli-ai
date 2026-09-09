@@ -3589,6 +3589,90 @@ env_allow = []
     }
 
     #[test]
+    fn sandbox_host_session_tiers_default_off() {
+        // Host-session tiers expose the host user session (mic capture,
+        // D-Bus services, Wayland), so every flag must default to false.
+        let sandbox = &NcaConfig::default().permissions.sandbox;
+        assert!(!sandbox.host_audio, "host_audio must default to false");
+        assert!(
+            !sandbox.host_dbus_session,
+            "host_dbus_session must default to false"
+        );
+        assert!(
+            !sandbox.host_xdg_runtime,
+            "host_xdg_runtime must default to false"
+        );
+    }
+
+    #[test]
+    fn sandbox_host_session_tiers_parse_from_toml() {
+        // Combined case: all three keys in one `[permissions.sandbox]` table
+        // must land on the merged config.
+        let toml_str = r#"
+[permissions.sandbox]
+host_audio = true
+host_dbus_session = true
+host_xdg_runtime = true
+"#;
+        let partial: PartialNcaConfig = toml::from_str(toml_str).expect("parse");
+        let mut config = NcaConfig::default();
+        config.merge(partial);
+        let sandbox = &config.permissions.sandbox;
+        assert!(sandbox.host_audio);
+        assert!(sandbox.host_dbus_session);
+        assert!(sandbox.host_xdg_runtime);
+
+        // Per-key case: one flag set must not touch the others (merge is
+        // per-field, not whole-table).
+        for (key, is_audio, is_dbus, is_xdg) in [
+            ("host_audio", true, false, false),
+            ("host_dbus_session", false, true, false),
+            ("host_xdg_runtime", false, false, true),
+        ] {
+            let partial: PartialNcaConfig =
+                toml::from_str(&format!("[permissions.sandbox]\n{key} = true\n")).expect("parse");
+            let mut config = NcaConfig::default();
+            config.merge(partial);
+            let sandbox = &config.permissions.sandbox;
+            assert_eq!(sandbox.host_audio, is_audio, "{key}");
+            assert_eq!(sandbox.host_dbus_session, is_dbus, "{key}");
+            assert_eq!(sandbox.host_xdg_runtime, is_xdg, "{key}");
+        }
+    }
+
+    #[test]
+    fn sandbox_host_session_tiers_roundtrip_via_workspace_file() {
+        let tmp_home = tempfile::tempdir().expect("tempdir");
+        let _guard = EnvGuard::set(&[
+            ("HOME", Some(tmp_home.path().to_str().unwrap())),
+            ("MINIMAX_API_KEY", None),
+            ("OPENAI_API_KEY", None),
+            ("NCA_EDITOR", None),
+            ("EDITOR", None),
+        ]);
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Opted-in host-session tiers must survive a workspace-file roundtrip.
+        let mut config = NcaConfig::default();
+        config.permissions.sandbox.host_audio = true;
+        config.permissions.sandbox.host_dbus_session = true;
+        config.permissions.sandbox.host_xdg_runtime = true;
+        config.save_workspace_file(dir.path()).expect("save");
+
+        let raw =
+            std::fs::read_to_string(workspace_config_path(dir.path())).expect("read local config");
+        assert!(
+            raw.contains("host_audio"),
+            "persisted config should contain host_audio: {raw}"
+        );
+
+        let reloaded = NcaConfig::load_for_workspace(dir.path()).expect("reload");
+        assert!(reloaded.permissions.sandbox.host_audio);
+        assert!(reloaded.permissions.sandbox.host_dbus_session);
+        assert!(reloaded.permissions.sandbox.host_xdg_runtime);
+    }
+
+    #[test]
     fn extra_paths_roundtrip_via_workspace_file() {
         let tmp_home = tempfile::tempdir().expect("tempdir");
         let _guard = EnvGuard::set(&[

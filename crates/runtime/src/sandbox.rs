@@ -482,7 +482,32 @@ pub use fallback_backend::{backend_supported, exec_confined};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::env_read_lock;
+    use crate::test_util::{EnvGuard, env_read_lock};
+
+    /// Fixture `$XDG_RUNTIME_DIR` populated with every entry the host-session
+    /// tiers can grant: the PipeWire socket and lock, the PulseAudio compat
+    /// dir, and the D-Bus session socket. Returns the tempdir (keeps the
+    /// fixture alive) and its path.
+    fn host_session_runtime_dir() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().expect("runtime-dir fixture");
+        let rt = tmp.path().to_path_buf();
+        std::fs::write(rt.join("pipewire-0"), b"").expect("pipewire-0 fixture");
+        std::fs::write(rt.join("pipewire-0.lock"), b"").expect("pipewire-0.lock fixture");
+        std::fs::create_dir(rt.join("pulse")).expect("pulse fixture");
+        std::fs::write(rt.join("bus"), b"").expect("bus fixture");
+        (tmp, rt)
+    }
+
+    /// rw entries derived from `rt` that live INSIDE it (device nodes like
+    /// `/dev/null` are rw too but are unrelated to the runtime dir).
+    fn rw_inside(policy: &SandboxPolicy, rt: &std::path::Path) -> Vec<PathBuf> {
+        policy
+            .rw
+            .iter()
+            .filter(|p| p.starts_with(rt))
+            .cloned()
+            .collect()
+    }
 
     fn policy() -> SandboxPolicy {
         SandboxPolicy {
@@ -857,5 +882,260 @@ mod tests {
         let _ = std::fs::remove_dir_all(&mounted);
         assert_eq!(out.exit_code, Some(0), "{:?}", out.combined);
         assert!(out.combined.contains("ok"), "{:?}", out.combined);
+    }
+
+    #[test]
+    fn host_audio_grants_exactly_audio_entries() {
+        // host_audio must grant exactly the three audio entries — never the
+        // runtime dir itself (that is the host_xdg_runtime tier) and never
+        // the D-Bus session socket.
+        let (_tmp, rt) = host_session_runtime_dir();
+        let _guard = EnvGuard::set(&[("XDG_RUNTIME_DIR", Some(rt.to_str().unwrap()))]);
+        let config = SandboxConfig {
+            host_audio: true,
+            ..SandboxConfig::default()
+        };
+        let p = SandboxPolicy::from_config(&config, std::path::Path::new("/w"), &[], &[]);
+
+        let inside = rw_inside(&p, &rt);
+        for entry in ["pipewire-0", "pipewire-0.lock", "pulse"] {
+            assert!(
+                inside.contains(&rt.join(entry)),
+                "host_audio must grant {}: {inside:?}",
+                rt.join(entry).display()
+            );
+        }
+        assert!(
+            !inside.contains(&rt),
+            "host_audio must not grant the runtime dir itself"
+        );
+        assert!(
+            !inside.contains(&rt.join("bus")),
+            "host_audio must not grant the D-Bus session socket"
+        );
+        assert_eq!(
+            inside.len(),
+            3,
+            "exactly the three audio entries, nothing else: {inside:?}"
+        );
+    }
+
+    #[test]
+    fn host_audio_grants_are_existence_filtered() {
+        // A socket that does not exist on the host must not appear in the
+        // policy (headless hosts, pipewire not running, ...).
+        let (_tmp, rt) = host_session_runtime_dir();
+        std::fs::remove_file(rt.join("pipewire-0.lock")).expect("remove lock fixture");
+        let _guard = EnvGuard::set(&[("XDG_RUNTIME_DIR", Some(rt.to_str().unwrap()))]);
+        let config = SandboxConfig {
+            host_audio: true,
+            ..SandboxConfig::default()
+        };
+        let p = SandboxPolicy::from_config(&config, std::path::Path::new("/w"), &[], &[]);
+
+        let inside = rw_inside(&p, &rt);
+        assert!(
+            !inside.contains(&rt.join("pipewire-0.lock")),
+            "missing pipewire-0.lock must be filtered out: {inside:?}"
+        );
+        assert!(inside.contains(&rt.join("pipewire-0")));
+        assert!(inside.contains(&rt.join("pulse")));
+        assert_eq!(inside.len(), 2, "{inside:?}");
+    }
+
+    #[test]
+    fn host_dbus_session_grants_bus_only() {
+        let (_tmp, rt) = host_session_runtime_dir();
+        let _guard = EnvGuard::set(&[("XDG_RUNTIME_DIR", Some(rt.to_str().unwrap()))]);
+        let config = SandboxConfig {
+            host_dbus_session: true,
+            ..SandboxConfig::default()
+        };
+        let p = SandboxPolicy::from_config(&config, std::path::Path::new("/w"), &[], &[]);
+
+        let inside = rw_inside(&p, &rt);
+        assert_eq!(
+            inside,
+            vec![rt.join("bus")],
+            "host_dbus_session must grant the bus socket and nothing else"
+        );
+    }
+
+    #[test]
+    fn host_xdg_runtime_grants_whole_dir_subsuming_finer_tiers() {
+        // The coarse tier covers the finer ones: with all three flags set the
+        // runtime dir itself must be granted, and the subsumed per-entry
+        // grants must not be duplicated alongside it.
+        let (_tmp, rt) = host_session_runtime_dir();
+        let _guard = EnvGuard::set(&[("XDG_RUNTIME_DIR", Some(rt.to_str().unwrap()))]);
+        let config = SandboxConfig {
+            host_audio: true,
+            host_dbus_session: true,
+            host_xdg_runtime: true,
+            ..SandboxConfig::default()
+        };
+        let p = SandboxPolicy::from_config(&config, std::path::Path::new("/w"), &[], &[]);
+
+        let inside = rw_inside(&p, &rt);
+        assert!(
+            inside.contains(&rt),
+            "host_xdg_runtime must grant the whole runtime dir: {inside:?}"
+        );
+        for subsumed in ["pipewire-0", "pipewire-0.lock", "pulse", "bus"] {
+            assert!(
+                !inside.contains(&rt.join(subsumed)),
+                "host_xdg_runtime subsumes the per-entry grant for {subsumed}: {inside:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_session_tiers_off_grant_nothing_in_runtime_dir() {
+        // Default config (all tiers off): no rw entry may be inside the
+        // runtime dir even when the process env advertises one.
+        let (_tmp, rt) = host_session_runtime_dir();
+        let _guard = EnvGuard::set(&[("XDG_RUNTIME_DIR", Some(rt.to_str().unwrap()))]);
+        let p = SandboxPolicy::from_config(
+            &SandboxConfig::default(),
+            std::path::Path::new("/w"),
+            &[],
+            &[],
+        );
+
+        let inside = rw_inside(&p, &rt);
+        assert!(
+            inside.is_empty(),
+            "no tier enabled => nothing under the runtime dir: {inside:?}"
+        );
+    }
+
+    #[test]
+    fn host_session_tiers_degrade_when_runtime_dir_missing() {
+        // XDG_RUNTIME_DIR pointing at a nonexistent path (or unset — covered
+        // by the same resolve_xdg_runtime_dir filter) must degrade to no
+        // grants and no env, not a panic: graceful headless degradation.
+        let ghost = PathBuf::from("/definitely/not/a/real/runtime/dir");
+        let _guard = EnvGuard::set(&[("XDG_RUNTIME_DIR", Some(ghost.to_str().unwrap()))]);
+        let config = SandboxConfig {
+            host_audio: true,
+            host_dbus_session: true,
+            host_xdg_runtime: true,
+            ..SandboxConfig::default()
+        };
+
+        let p = SandboxPolicy::from_config(&config, std::path::Path::new("/w"), &[], &[]);
+        assert!(
+            p.rw.iter().all(|entry| !entry.starts_with(&ghost)),
+            "nonexistent runtime dir must yield no grants: {:?}",
+            p.rw
+        );
+        assert!(
+            host_session_env(&config).is_empty(),
+            "nonexistent runtime dir must yield no env passthrough"
+        );
+    }
+
+    #[test]
+    fn host_session_env_audio_sets_xdg_runtime_dir() {
+        // host_audio passes XDG_RUNTIME_DIR through so PipeWire/Pulse clients
+        // find their sockets by the standard path.
+        let (_tmp, rt) = host_session_runtime_dir();
+        let _guard = EnvGuard::set(&[("XDG_RUNTIME_DIR", Some(rt.to_str().unwrap()))]);
+        let config = SandboxConfig {
+            host_audio: true,
+            ..SandboxConfig::default()
+        };
+        let env = host_session_env(&config);
+        assert!(
+            env.contains(&("XDG_RUNTIME_DIR".to_string(), rt.display().to_string())),
+            "host_audio must pass XDG_RUNTIME_DIR: {env:?}"
+        );
+    }
+
+    #[test]
+    fn host_session_env_dbus_only_does_not_set_xdg_runtime_dir() {
+        // host_dbus_session alone must NOT leak XDG_RUNTIME_DIR: the D-Bus
+        // address is passed explicitly, so the runtime dir path stays hidden.
+        let (_tmp, rt) = host_session_runtime_dir();
+        let _guard = EnvGuard::set(&[("XDG_RUNTIME_DIR", Some(rt.to_str().unwrap()))]);
+        let config = SandboxConfig {
+            host_dbus_session: true,
+            ..SandboxConfig::default()
+        };
+        let env = host_session_env(&config);
+        assert!(
+            !env.iter().any(|(k, _)| k == "XDG_RUNTIME_DIR"),
+            "host_dbus_session alone must not set XDG_RUNTIME_DIR: {env:?}"
+        );
+    }
+
+    #[test]
+    fn host_session_env_dbus_prefers_exported_address_verbatim() {
+        // An exported DBUS_SESSION_BUS_ADDRESS wins over synthesis, even
+        // though the synthesized unix:path=... would differ.
+        let (_tmp, rt) = host_session_runtime_dir();
+        let _guard = EnvGuard::set(&[
+            ("XDG_RUNTIME_DIR", Some(rt.to_str().unwrap())),
+            (
+                "DBUS_SESSION_BUS_ADDRESS",
+                Some("unix:abstract=/tmp/nca-test-bus"),
+            ),
+        ]);
+        let config = SandboxConfig {
+            host_dbus_session: true,
+            ..SandboxConfig::default()
+        };
+        let env = host_session_env(&config);
+        assert!(
+            env.contains(&(
+                "DBUS_SESSION_BUS_ADDRESS".to_string(),
+                "unix:abstract=/tmp/nca-test-bus".to_string()
+            )),
+            "exported address must pass through verbatim: {env:?}"
+        );
+    }
+
+    #[test]
+    fn host_session_env_dbus_synthesizes_when_socket_exists() {
+        // No exported address + an existing bus socket → synthesize
+        // unix:path=$XDG_RUNTIME_DIR/bus.
+        let (_tmp, rt) = host_session_runtime_dir();
+        let _guard = EnvGuard::set(&[
+            ("XDG_RUNTIME_DIR", Some(rt.to_str().unwrap())),
+            ("DBUS_SESSION_BUS_ADDRESS", None),
+        ]);
+        let config = SandboxConfig {
+            host_dbus_session: true,
+            ..SandboxConfig::default()
+        };
+        let env = host_session_env(&config);
+        assert!(
+            env.contains(&(
+                "DBUS_SESSION_BUS_ADDRESS".to_string(),
+                format!("unix:path={}", rt.join("bus").display())
+            )),
+            "bus socket exists => synthesized unix:path address: {env:?}"
+        );
+    }
+
+    #[test]
+    fn host_session_env_dbus_omitted_when_no_socket_and_no_address() {
+        // No exported address and no bus socket: emit no DBUS variable at
+        // all — headless hosts must never get a dangling address.
+        let (_tmp, rt) = host_session_runtime_dir();
+        std::fs::remove_file(rt.join("bus")).expect("remove bus fixture");
+        let _guard = EnvGuard::set(&[
+            ("XDG_RUNTIME_DIR", Some(rt.to_str().unwrap())),
+            ("DBUS_SESSION_BUS_ADDRESS", None),
+        ]);
+        let config = SandboxConfig {
+            host_dbus_session: true,
+            ..SandboxConfig::default()
+        };
+        let env = host_session_env(&config);
+        assert!(
+            !env.iter().any(|(k, _)| k == "DBUS_SESSION_BUS_ADDRESS"),
+            "no socket and no address => no DBUS var: {env:?}"
+        );
     }
 }

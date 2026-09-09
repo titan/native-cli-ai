@@ -519,4 +519,96 @@ mod tests {
         assert!(a.stdout.contains('a'), "A stdout: {:?}", a.stdout);
         assert!(b.stdout.contains('b'), "B stdout: {:?}", b.stdout);
     }
+
+    /// End-to-end wiring for the host-session access tiers: a confined PTY
+    /// command must see XDG_RUNTIME_DIR and read the PulseAudio cookie when
+    /// `host_audio` is on, and see neither when all tiers are off. The
+    /// fixture runtime dir lives under bare $HOME — deliberately OUTSIDE the
+    /// default rw roots (unlike /tmp) — so observing the cookie proves the
+    /// tier grant, not a default root. (The pty.rs EnvGuard is crate-local
+    /// to nca-runtime, so this test stays in-crate.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exec_confined_host_audio_tier_end_to_end_on_supported_kernel() {
+        if !crate::sandbox::backend_supported() {
+            eprintln!("SKIP: Landlock unavailable on this kernel");
+            return;
+        }
+        let Some(home) = std::env::var_os("HOME") else {
+            eprintln!("SKIP: HOME unset");
+            return;
+        };
+        // Skip honestly when the hosting process is itself sandboxed and
+        // cannot create the fixture (nca dogfooding).
+        let fixture =
+            std::path::Path::new(&home).join(format!(".nca-sbox-host-tier-{}", std::process::id()));
+        let pulse = fixture.join("pulse");
+        if let Err(e) = std::fs::create_dir_all(&pulse) {
+            eprintln!("SKIP: cannot create host-tier fixture under HOME ({e})");
+            return;
+        }
+        let provisioned = std::fs::write(pulse.join("cookie"), b"tier-ok")
+            .and_then(|()| std::fs::write(fixture.join("pipewire-0"), b""))
+            .is_ok();
+        if !provisioned {
+            let _ = std::fs::remove_dir_all(&fixture);
+            eprintln!("SKIP: cannot populate host-tier fixture under HOME");
+            return;
+        }
+
+        // set_sandbox_config resolves XDG_RUNTIME_DIR from the process env,
+        // so the guard must be live for BOTH configs below.
+        let _guard = EnvGuard::set(&[
+            ("XDG_RUNTIME_DIR", Some(fixture.to_str().unwrap())),
+            ("DBUS_SESSION_BUS_ADDRESS", None),
+        ]);
+        let ws = tempfile::tempdir().expect("workspace tempdir");
+        let m = PtyManager::new(ws.path());
+        let probe = r#"test -n "$XDG_RUNTIME_DIR" && cat "$XDG_RUNTIME_DIR/pulse/cookie""#;
+
+        // Tier ON: the tier env var beats the allowlist filter and the grant
+        // makes the cookie readable.
+        m.set_sandbox_config(
+            SandboxConfig {
+                mode: nca_common::config::SandboxMode::Required,
+                host_audio: true,
+                ..SandboxConfig::default()
+            },
+            &[],
+            &[],
+        );
+        let out = m
+            .exec_streaming(probe, 30, &progress("tier-on"))
+            .await
+            .expect("tier-on command should succeed");
+        assert_eq!(out.exit_code, 0, "tier-on stdout: {:?}", out.stdout);
+        assert!(
+            out.stdout.contains("tier-ok"),
+            "confined command must read the pulse cookie via the host_audio grant: {:?}",
+            out.stdout
+        );
+
+        // Tier OFF (fresh config): XDG_RUNTIME_DIR is stripped by the
+        // allowlist and the cookie is outside every rw root — either failure
+        // mode proves the tier was the sole authority.
+        m.set_sandbox_config(
+            SandboxConfig {
+                mode: nca_common::config::SandboxMode::Required,
+                ..SandboxConfig::default()
+            },
+            &[],
+            &[],
+        );
+        let out = m
+            .exec_streaming(probe, 30, &progress("tier-off"))
+            .await
+            .expect("tier-off command should succeed");
+        assert!(
+            out.exit_code != 0 || !out.stdout.contains("tier-ok"),
+            "with host tiers off the cookie must be unreachable: rc={} stdout={:?}",
+            out.exit_code,
+            out.stdout
+        );
+
+        let _ = std::fs::remove_dir_all(&fixture);
+    }
 }
