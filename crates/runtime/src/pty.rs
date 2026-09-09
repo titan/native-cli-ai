@@ -43,6 +43,11 @@ pub struct PtyManager {
     /// Env names allowed through to confined commands (see
     /// [`Self::set_sandbox_config`]); ignored on the unconfined branch.
     env_allow: Mutex<Vec<String>>,
+    /// Extra env vars forced through to confined commands by the
+    /// host-session tiers (`host_audio` / `host_dbus_session` /
+    /// `host_xdg_runtime`), e.g. `XDG_RUNTIME_DIR`. Set explicitly after
+    /// [`apply_env_allow`] so the tier wins over the allowlist filter.
+    host_env: Mutex<Vec<(String, String)>>,
 }
 
 impl PtyManager {
@@ -51,6 +56,7 @@ impl PtyManager {
             workspace_root: Mutex::new(workspace_root.as_ref().to_path_buf()),
             sandbox: Mutex::new(None),
             env_allow: Mutex::new(default_sandbox_env_allow()),
+            host_env: Mutex::new(Vec::new()),
         }
     }
 
@@ -94,6 +100,7 @@ impl PtyManager {
         };
         *self.sandbox.lock().expect("sandbox lock poisoned") = policy;
         *self.env_allow.lock().expect("env_allow lock poisoned") = cfg.env_allow.clone();
+        *self.host_env.lock().expect("host_env lock poisoned") = sandbox::host_session_env(&cfg);
     }
 
     pub fn workspace_root(&self) -> std::path::PathBuf {
@@ -129,11 +136,18 @@ impl PtyManager {
             .lock()
             .expect("env_allow lock poisoned")
             .clone();
+        let host_env = self
+            .host_env
+            .lock()
+            .expect("host_env lock poisoned")
+            .clone();
         let mut cmd = if let Some(policy) = sandbox_policy {
             // Confined path: build the command as std::process::Command (same
             // sh -c / cwd / piped stdio / own process group), strip the
-            // environment down to the configured allowlist, attach the
-            // Landlock pre_exec via confine_cmd, then hand it to tokio.
+            // environment down to the configured allowlist, re-add the
+            // host-session tier vars (explicit set beats the allowlist
+            // filter), attach the Landlock pre_exec via confine_cmd, then
+            // hand it to tokio.
             let std_cmd = {
                 use std::os::unix::process::CommandExt;
                 let mut c = std::process::Command::new("sh");
@@ -144,6 +158,9 @@ impl PtyManager {
                     .stderr(Stdio::piped())
                     .process_group(0);
                 apply_env_allow(&mut c, &env_allow);
+                for (k, v) in &host_env {
+                    c.env(k, v);
+                }
                 sandbox::confine_cmd(c, &policy)
             };
             tokio::process::Command::from(std_cmd)

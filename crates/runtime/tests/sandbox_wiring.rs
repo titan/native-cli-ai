@@ -51,6 +51,9 @@ fn required_config() -> SandboxConfig {
         net: true,
         env_allow: nca_common::config::default_sandbox_env_allow(),
         inherit_mounts: true,
+        host_audio: false,
+        host_dbus_session: false,
+        host_xdg_runtime: false,
     }
 }
 

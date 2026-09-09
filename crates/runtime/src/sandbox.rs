@@ -46,6 +46,93 @@ const ESSENTIAL_DEVICES: [&str; 6] = [
     "/dev/tty",
 ];
 
+/// Resolve the host's `$XDG_RUNTIME_DIR` (typically `/run/user/<uid>`).
+///
+/// Returns `None` when the variable is unset or the path does not exist,
+/// which makes every host-session tier a graceful no-op on headless hosts,
+/// containers without a runtime dir, or CI. Deliberately no
+/// `/run/user/<uid>` synthesis: the env var is the contract, and guessing
+/// paths the session did not advertise adds nothing (YAGNI).
+pub(crate) fn resolve_xdg_runtime_dir() -> Option<PathBuf> {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
+}
+
+/// Landlock rw roots backing the host-session access tiers.
+///
+/// - `host_audio` → `$XDG_RUNTIME_DIR/{pipewire-0, pipewire-0.lock, pulse}`
+///   (the PipeWire native socket, its lock, and the PulseAudio compat dir
+///   with its `native` socket and `cookie`).
+/// - `host_dbus_session` → `$XDG_RUNTIME_DIR/bus` (D-Bus session socket).
+/// - `host_xdg_runtime` → the whole `$XDG_RUNTIME_DIR` (subsumes both).
+///
+/// All entries are existence-filtered, so tiers degrade to nothing on hosts
+/// without the corresponding sockets. Note these grants exist for env- and
+/// file-based discovery (socket paths, the pulse cookie, directory
+/// listings): connecting to an AF_UNIX filesystem socket is not itself
+/// mediated by Landlock at the ABI we target — the flags gate what the
+/// confined process can *discover and read*, and honestly document that.
+fn host_session_rw_grants(cfg: &SandboxConfig) -> Vec<PathBuf> {
+    let Some(rt) = resolve_xdg_runtime_dir() else {
+        return Vec::new();
+    };
+    if cfg.host_xdg_runtime {
+        // The coarse tier covers the finer ones; granting both is redundant.
+        return vec![rt];
+    }
+    let mut grants = Vec::new();
+    if cfg.host_audio {
+        grants.extend(["pipewire-0", "pipewire-0.lock"].map(|n| rt.join(n)));
+        grants.push(rt.join("pulse"));
+    }
+    if cfg.host_dbus_session {
+        grants.push(rt.join("bus"));
+    }
+    grants.retain(|p| p.exists());
+    grants
+}
+
+/// Environment variables the host-session tiers pass through the PTY env
+/// allowlist (which otherwise strips everything but the curated list).
+///
+/// - `host_audio` or `host_xdg_runtime` → `XDG_RUNTIME_DIR=<rt>` so
+///   PipeWire/Pulse clients locate their sockets by the standard path
+///   instead of falling back to `~/.config/pulse` (which is not writable
+///   under confinement and produces the misleading
+///   "Failed to create secure directory" error).
+/// - `host_dbus_session` → `DBUS_SESSION_BUS_ADDRESS`: the host value when
+///   exported, else `unix:path=$XDG_RUNTIME_DIR/bus` — but only when that
+///   socket actually exists, so headless hosts never get a dangling address.
+///
+/// Empty when no tier is enabled or `$XDG_RUNTIME_DIR` cannot be resolved.
+/// Unconfined children inherit the full parent environment and need nothing
+/// here.
+pub(crate) fn host_session_env(cfg: &SandboxConfig) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    let Some(rt) = resolve_xdg_runtime_dir() else {
+        return env;
+    };
+    if cfg.host_audio || cfg.host_xdg_runtime {
+        env.push(("XDG_RUNTIME_DIR".to_string(), rt.display().to_string()));
+    }
+    if cfg.host_dbus_session {
+        let bus = rt.join("bus");
+        if let Some(addr) = std::env::var_os("DBUS_SESSION_BUS_ADDRESS") {
+            env.push((
+                "DBUS_SESSION_BUS_ADDRESS".to_string(),
+                addr.to_string_lossy().into_owned(),
+            ));
+        } else if bus.exists() {
+            env.push((
+                "DBUS_SESSION_BUS_ADDRESS".to_string(),
+                format!("unix:path={}", bus.display()),
+            ));
+        }
+    }
+    env
+}
+
 impl SandboxPolicy {
     /// Build a policy from config: built-in read-only system roots plus
     /// `config.ro_paths`, workspace + temp plus `config.rw_paths`, and the
@@ -67,6 +154,16 @@ impl SandboxPolicy {
     /// the agent itself follows (file-tool write access is denied there
     /// too, so this matches file-tool visibility exactly). Roots already
     /// under the workspace are redundant with its rw root but harmless.
+    ///
+    /// Host-session tiers (`config.host_audio`, `host_dbus_session`,
+    /// `host_xdg_runtime`) additionally grant rw on the matching
+    /// `$XDG_RUNTIME_DIR` entries (see [`host_session_rw_grants`]); they
+    /// are opt-in because they expose the host user session (microphone
+    /// capture, D-Bus services, Wayland). Caveat for honesty: connecting to
+    /// an AF_UNIX filesystem socket is not mediated by Landlock at this
+    /// ABI — the tiers make the sockets *reachable by the standard
+    /// discovery path* (env var + readable socket/cookie files); they do
+    /// not, and cannot, gate the connect() itself.
     pub fn from_config(
         config: &SandboxConfig,
         workspace_root: &std::path::Path,
@@ -125,6 +222,15 @@ impl SandboxPolicy {
         // argument. Skipped entirely when `inherit_mounts = false`.
         if config.inherit_mounts {
             rw.extend(mounts.iter().filter(|p| p.exists()).cloned());
+        }
+        // Host-session tiers (rw) — audio / D-Bus / full runtime dir. Placed
+        // before the device nodes so those keep their must-be-last property;
+        // deduped against rw already collected (e.g. host_xdg_runtime when a
+        // mount already granted the runtime dir).
+        for grant in host_session_rw_grants(config) {
+            if !rw.contains(&grant) {
+                rw.push(grant);
+            }
         }
         // POSIX shell substrate: must come last so config `rw_paths` cannot
         // accidentally shadow them, and filtered by existence so non-Linux
@@ -398,6 +504,9 @@ mod tests {
             net: false,
             env_allow: nca_common::config::default_sandbox_env_allow(),
             inherit_mounts: true,
+            host_audio: false,
+            host_dbus_session: false,
+            host_xdg_runtime: false,
         };
         let p = SandboxPolicy::from_config(&config, std::path::Path::new("/work/root"), &[], &[]);
 

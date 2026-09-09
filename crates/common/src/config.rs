@@ -1633,6 +1633,28 @@ pub struct SandboxConfig {
     /// an explicit `rw_paths` entry.
     #[serde(default = "default_sandbox_inherit_mounts")]
     pub inherit_mounts: bool,
+    /// `true` = grant sandboxed commands access to the host audio stack
+    /// (PipeWire/PulseAudio): passes `XDG_RUNTIME_DIR` through the env
+    /// allowlist and adds rw grants for `$XDG_RUNTIME_DIR/pipewire-0`,
+    /// `pipewire-0.lock`, and `pulse/`. SECURITY CAVEAT: this allows playback,
+    /// reading audio output streams, AND — under PipeWire's default policy —
+    /// capturing from input devices (microphone). Default `false`.
+    #[serde(default)]
+    pub host_audio: bool,
+    /// `true` = grant sandboxed commands access to the host D-Bus session
+    /// bus: passes `DBUS_SESSION_BUS_ADDRESS` through (or synthesizes it)
+    /// and adds an rw grant for `$XDG_RUNTIME_DIR/bus`. SECURITY CAVEAT: the
+    /// session bus is broad user-service access (notifications, secret
+    /// service/keyring, media players, ...). Default `false`.
+    #[serde(default)]
+    pub host_dbus_session: bool,
+    /// `true` = pass `XDG_RUNTIME_DIR` through and grant rw on the whole
+    /// `$XDG_RUNTIME_DIR` (subsumes `host_audio` and `host_dbus_session`).
+    /// SECURITY CAVEAT: this exposes everything living there — Wayland (GUI
+    /// input events), pipewire, pulse, D-Bus session bus, and any other
+    /// per-user socket a desktop session keeps. Default `false`.
+    #[serde(default)]
+    pub host_xdg_runtime: bool,
 }
 
 fn default_sandbox_net() -> bool {
@@ -1675,6 +1697,9 @@ impl Default for SandboxConfig {
             net: true,
             env_allow: default_sandbox_env_allow(),
             inherit_mounts: true,
+            host_audio: false,
+            host_dbus_session: false,
+            host_xdg_runtime: false,
         }
     }
 }
@@ -2327,6 +2352,15 @@ impl SandboxConfig {
         if let Some(inherit_mounts) = partial.inherit_mounts {
             self.inherit_mounts = inherit_mounts;
         }
+        if let Some(host_audio) = partial.host_audio {
+            self.host_audio = host_audio;
+        }
+        if let Some(host_dbus_session) = partial.host_dbus_session {
+            self.host_dbus_session = host_dbus_session;
+        }
+        if let Some(host_xdg_runtime) = partial.host_xdg_runtime {
+            self.host_xdg_runtime = host_xdg_runtime;
+        }
     }
 }
 
@@ -2347,6 +2381,9 @@ struct PartialSandboxConfig {
     net: Option<bool>,
     env_allow: Option<Vec<String>>,
     inherit_mounts: Option<bool>,
+    host_audio: Option<bool>,
+    host_dbus_session: Option<bool>,
+    host_xdg_runtime: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

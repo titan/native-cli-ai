@@ -131,7 +131,7 @@ The Elm TUI (`tui/elm/model.rs::NcaModel`) runs inside `spawn_blocking` on a ded
 - Ratatui rendering must use `is_dirty()` guards to skip frames when nothing changed — without this, idle CPU stays at 7%+ instead of target <1%. The Elm architecture has a `redraw` guard and `BlockLineCache` for incremental rendering.
 - IPC channels must be bounded (buffer=100) to prevent unbounded message accumulation.
 - Use `Vec::with_capacity` when size is known at allocation time.
-- When the Landlock sandbox confines a PTY command, its environment is cleared and only an allowlisted set of variables (PATH, HOME, TERM, cargo/toolchain vars, any `LC_*`) passes through; the list is configurable via `[permissions.sandbox] env_allow` in config.
+- When the Landlock sandbox confines a PTY command, its environment is cleared and only an allowlisted set of variables (PATH, HOME, TERM, cargo/toolchain vars, any `LC_*`) passes through; the list is configurable via `[permissions.sandbox] env_allow` in config. Three opt-in host-session tiers (`host_audio`, `host_dbus_session`, `host_xdg_runtime`, all default off) additionally imply env passthrough (`XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`) plus Landlock rw grants on the matching `$XDG_RUNTIME_DIR` entries (sockets/cookie discovery; note AF_UNIX connect() itself is not Landlock-mediated — the tiers gate env + file access, and expose mic capture / D-Bus services / Wayland respectively).
 
 ## System Dependencies
 
