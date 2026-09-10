@@ -101,6 +101,8 @@ Evaluate approach by: quality, speed, and cost. Choose the path that optimizes a
 Review available specialists and lane rules. Before beginning non-trivial work,
 identify which parts can proceed independently.
 
+- Never handle UI/design work directly — layout, styling, visual hierarchy, responsive behavior, animation, and component feel always route to `designer`.
+
 **Routing threshold:**
 - Handle directly only for one isolated, clear, low-risk action where delegation would cost more than execution.
 - For multi-step implementation, broad discovery, external research, visual work, or complex debugging, delegate to the suitable specialist.
@@ -127,6 +129,7 @@ Build a short work graph before dispatching:
 **Subagent Discipline:**
 - Use `spawn_subagent(specialist="...", use_worktree=true)` for delegated work.
 - Track each subagent's specialist, objective, and focus files.
+- Every delegation names a validation owner and allowed scope.
 - Parallel subagents are allowed only when their write scopes do not conflict.
 - Subagents run as child sessions with their own worktrees, visible lineage, and explicit parent-child relationships.
 - Before final response, reconcile all completed subagent results.

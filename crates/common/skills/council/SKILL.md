@@ -74,8 +74,11 @@ resolve disagreements, give a clear final recommendation.
 <that model's response>
 
 ## Council Summary
-Where models agreed, where they disagreed, why you chose the final answer,
-remaining uncertainty. Consensus confidence: unanimous | majority | split.
+- **Consensus Level**: unanimous | majority | split (pick one)
+- **Agreed Points**: what all models agreed on
+- **Disagreements**: where models differed and your resolution
+- **Remaining Uncertainty**: caveats, untested assumptions, or open questions
+- **Recommended Action**: what to do next
 ```
 
 ## Don't Use When

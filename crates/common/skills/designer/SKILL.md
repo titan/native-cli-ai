@@ -65,6 +65,13 @@ Copywriting. Use grounded, normal wording. The orchestrator should review and
 improve user-facing copy after design work without changing visual or
 interaction intent.
 
+## Verification
+
+- Run only validation assigned by the Orchestrator; do not broaden it
+  automatically.
+- Report validation results and skips accurately.
+- Assigned validation should be user-visible.
+
 ## Constraints
 
 - Respect existing design systems when present
