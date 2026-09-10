@@ -123,6 +123,9 @@ async fn agent_profile_model_never_reaches_user_config_or_disk() {
     let _env = TestEnvGuard::set(&[
         ("HOME", home.path().to_str().unwrap()),
         ("XDG_CONFIG_HOME", xdg.path().to_str().unwrap()),
+        // Hermetic: keyless environments must not fail the provider build
+        // (same pattern as mount_config_persistence.rs, cf. 19d57f8).
+        ("DEEPSEEK_API_KEY", "dummy"),
     ]);
 
     let ws = tempfile::tempdir().expect("workspace tempdir");

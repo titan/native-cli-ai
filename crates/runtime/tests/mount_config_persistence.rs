@@ -119,6 +119,9 @@ async fn mounted_extra_paths_survive_whole_config_save_and_unmount_removes() {
     let _env = TestEnvGuard::set(&[
         ("HOME", home.path().to_str().unwrap()),
         ("XDG_CONFIG_HOME", xdg.path().to_str().unwrap()),
+        // Hermetic: deepseek validates its key eagerly at provider build
+        // (same pattern as 19d57f8 / agent_profile_config_purity.rs).
+        ("DEEPSEEK_API_KEY", "dummy"),
     ]);
 
     let ws = tempfile::tempdir().expect("workspace tempdir");
@@ -150,7 +153,7 @@ async fn mounted_extra_paths_survive_whole_config_save_and_unmount_removes() {
     let mut cfg = sup.config().clone();
     cfg.model.enable_thinking = !cfg.model.enable_thinking;
     sup.apply_nca_config(cfg)
-        .expect("keyless deepseek config rebuilds fine (validated lazily)");
+        .expect("config rebuild (dummy key injected via env guard)");
     sup.config()
         .save_workspace_file(ws.path())
         .expect("whole-config workspace save");
