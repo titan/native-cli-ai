@@ -155,6 +155,10 @@ impl Repl {
                     self.runtime.subagent_registry(),
                     self.runtime.fs(),
                     None,
+                    // P3 chunk C: stdio REPL parks on read_line — no cmd
+                    // queue, so no wake delivery path; foreground default.
+                    false,
+                    None,
                 ))
             } else {
                 None
@@ -1646,6 +1650,11 @@ impl Repl {
                     event_tx,
                     self.runtime.subagent_registry(),
                     self.runtime.fs(),
+                    None,
+                    // P3 chunk C: real TUI wiring lands here (scheduler
+                    // over TuiCmd::Submit + config.subagent.background);
+                    // foreground default until then.
+                    false,
                     None,
                 ))
             } else {

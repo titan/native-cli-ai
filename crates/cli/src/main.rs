@@ -958,6 +958,10 @@ async fn run_one_shot(
                 runtime.subagent_registry(),
                 runtime.fs(),
                 None,
+                // P3 chunk C: one-shot mode runs a single turn — no idle
+                // parent to wake; foreground default.
+                false,
+                None,
             )
         });
 

@@ -158,6 +158,10 @@ fn wire_consumer(ws: &Path, provider: Arc<dyn Provider>) -> ConsumerHarness {
         registry.clone(),
         parent_fs,
         Some(provider),
+        // P2 semantics preserved for these tests: every request passes an
+        // explicit `background` flag, and no wake scheduler is wired.
+        false,
+        None,
     );
     // Collect events on a side task so the tap receiver never blocks the
     // bounded channel; tests scan the collected log at assert time.

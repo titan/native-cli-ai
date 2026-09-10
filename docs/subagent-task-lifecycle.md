@@ -124,10 +124,20 @@ is the wake channel; `cancel_flag` is the abort mechanism.
   synchronous contract.
 - **Parent turn end + wake:** background children run on detached tokio
   tasks; the parent model ends its turn normally (its `TurnCompleted` still
-  fsyncs via the existing fanout barrier). On child terminal, the registry
-  emits `ChildSessionStatusChanged`; the wake scheduler (if enabled) enqueues
-  the static wake text through `inbox_sender()` — the next `run_turn` claims
-  it at turn start (`agent_driver.rs::claim_inbox`). No `wait_for_user` is
+  fsyncs via the existing fanout barrier). On child terminal, the spawn
+  consumer's background arm (and only that arm) calls the wake scheduler,
+  which delivers the static wake text as a **Submit through the CLI
+  cmd-queue** (`TuiCmd::Submit` → the single loop that serializes all
+  `run_turn` calls). This replaces the earlier `inbox_sender()`/
+  `InboxItem::UserPrompt` sketch: an idle parent is parked on
+  `cmd_rx.recv()` and never claims inbox items — inbox alone cannot start a
+  turn — so cmd-queue delivery keeps turn serialization in one place (the
+  busy flag stays truthful) with no double-delivery (the wake text IS the
+  next `run_turn`'s prompt, preserving "the next `run_turn` claims it at
+  turn start"). Wakes land BETWEEN turns, never mid-turn (steering during
+  a busy turn already has its own `InboxItem::Steering` path). stdio REPL
+  and one-shot modes have no cmd queue and run foreground defaults
+  (documented limitation: no wake delivery path). No `wait_for_user` is
   used for background completion.
 - **`wait_for_user`:** a **new** tool, not `ask_question` reuse — it has no
   options/oneshot and must not emit `QuestionRequested`. It returns
@@ -188,14 +198,25 @@ is the wake channel; `cancel_flag` is the abort mechanism.
   `background==false`.
 
 ### P3 — background jobs + wake (L)
-- `background` default-on for orchestrator; `run_child_session_background`
-  immediate return; completion notification → `ChildSessionStatusChanged`.
-- `wake_scheduler.rs`: idle resume after child terminal; static wake text
-  via `inbox_sender`.
-- Optional wall-clock timeout (timer + `cancel_flag`).
+- `background` default-on for orchestrator (`[subagent] background`,
+  default true; omitted flag inherits it, explicit flag always wins);
+  background spawn replies immediately (`status:"running"`) and runs the
+  child detached; completion notification → `ChildSessionStatusChanged`.
+- `wake_scheduler.rs`: idle resume after child terminal; debounced static
+  wake text delivered through the CLI cmd-queue as a Submit (see §3 — not
+  `inbox_sender`, per the implemented design).
+- Wall-clock timeout: **DEFERRED** (spec §4 already deferred it; no config
+  field shipped) — revisit only if usage shows stalls.
+- `OrchestratorWake` event: **CUT** (redundant — the wake text is
+  self-identifying and lands in the transcript via the wake turn itself;
+  add later only if observability demands it).
+- `wait_for_user`: **remains P4** (not folded into P3; no pause API ships
+  without a caller).
 - **Tests:** integration — parent turn ends while child runs; wake fires on
   terminal; no double-wake (reserve/commit); bounded channels never grow
-  unbounded.
+  unbounded. Landed: `tests/wake_integration.rs` (default-on + wake-once,
+  explicit-foreground no-wake, rollback default-off, cancel wake with
+  reason, revive no-wake, in-window coalescing).
 - **Rollback:** highest — gate behind `SubagentConfig.background`/
   `wake.enabled`; ship foreground fallback.
 
@@ -235,6 +256,10 @@ is the wake channel; `cancel_flag` is the abort mechanism.
   log after crash (emit `ChildSessionStatusChanged`/`ChildSessionSpawned`
   into the log; registry is an in-memory projection, mirroring
   `fold_child_session_ids`). Preserved.
+- **Wake hook scope (P3):** the terminal wake hook fires ONLY in the spawn
+  consumer's background (detached) arm. Foreground spawns never wake (their
+  output was returned inline) and `task_revive` never wakes (the reviving
+  parent is mid-turn holding the reply). Preserved.
 
 ## 7. Estimated Size
 

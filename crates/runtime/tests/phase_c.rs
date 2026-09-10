@@ -534,6 +534,8 @@ async fn t27_consumer_wiring_routes_child_spawn_into_parent_log() {
         Arc::new(nca_runtime::subagent_registry::SubagentRegistry::new()),
         parent_fs,
         None,
+        false,
+        None,
     );
 
     spawn_tx
