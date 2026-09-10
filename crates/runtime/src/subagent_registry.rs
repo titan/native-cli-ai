@@ -12,7 +12,10 @@ use crate::session_store::SessionStore;
 use nca_common::event::{AgentEvent, EventEnvelope};
 use nca_common::message::{ContentPart, MessageContent, Role};
 use nca_common::session::{ChildSessionState, SessionState};
+use nca_core::agent_driver::InboxItem;
 use nca_core::tools::subagent_control::{SubagentControlRequest, SubagentControlResponse};
+use std::collections::HashSet;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -29,6 +32,18 @@ pub struct SubagentRegistryEntry {
     pub branch: Option<String>,
     pub worktree_path: Option<String>,
     pub result_summary: Option<String>,
+    /// Live cancel handle of a running child (`AgentLoop::cancel_handle`).
+    /// `None` for terminal tasks (cleared by [`SubagentRegistry::record_terminal`])
+    /// and for entries re-derived from the event log at resume — handles are
+    /// runtime-only state, never persisted.
+    pub cancel_flag: Option<Arc<AtomicBool>>,
+    /// Live inbox sender of a running child (`Supervisor::inbox_sender`);
+    /// `task_message` steering is queued through it. Cleared on terminal.
+    pub inbox_tx: Option<mpsc::Sender<InboxItem>>,
+    /// Reason recorded by the last `task_cancel` request, folded into the
+    /// terminal `result_summary` ("cancelled: <reason>") and cleared when
+    /// the task goes terminal.
+    pub cancel_reason: Option<String>,
 }
 
 /// In-memory projection of spawned child tasks, keyed by child session id
@@ -37,6 +52,9 @@ pub struct SubagentRegistryEntry {
 #[derive(Default)]
 pub struct SubagentRegistry {
     entries: Mutex<Vec<SubagentRegistryEntry>>,
+    /// Session ids with an in-flight mutating control operation (see
+    /// [`SubagentRegistry::try_acquire_lease`]).
+    control_leases: Arc<Mutex<HashSet<String>>>,
 }
 
 impl SubagentRegistry {
@@ -69,7 +87,59 @@ impl SubagentRegistry {
             branch,
             worktree_path: None,
             result_summary: None,
+            cancel_flag: None,
+            inbox_tx: None,
+            cancel_reason: None,
         });
+    }
+
+    /// Record a live child's control handles (cancel flag + inbox sender)
+    /// right after spawn. No-op for ids the registry does not track.
+    pub fn record_handles(
+        &self,
+        child_session_id: &str,
+        cancel_flag: Arc<AtomicBool>,
+        inbox_tx: mpsc::Sender<InboxItem>,
+    ) {
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(entry) = entries
+            .iter_mut()
+            .find(|e| e.session_id == child_session_id)
+        else {
+            return;
+        };
+        entry.cancel_flag = Some(cancel_flag);
+        entry.inbox_tx = Some(inbox_tx);
+    }
+
+    /// Record the reason of a `task_cancel` request against a tracked child.
+    /// No-op for unknown ids; a `None` reason clears a previously recorded
+    /// one only by explicit request (cancel-without-reason is legitimate).
+    pub fn record_cancel_requested(&self, child_session_id: &str, reason: Option<String>) {
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(entry) = entries
+            .iter_mut()
+            .find(|e| e.session_id == child_session_id)
+        else {
+            return;
+        };
+        entry.cancel_reason = reason;
+    }
+
+    /// Drop a child's live control handles (and any spent cancel reason).
+    /// Called automatically by [`Self::record_terminal`] — terminal tasks
+    /// have no live handles — and safe to call directly/idempotently.
+    pub fn clear_handles(&self, child_session_id: &str) {
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(entry) = entries
+            .iter_mut()
+            .find(|e| e.session_id == child_session_id)
+        else {
+            return;
+        };
+        entry.cancel_flag = None;
+        entry.inbox_tx = None;
+        entry.cancel_reason = None;
     }
 
     /// Fold a terminal transition for a tracked child. Unknown ids are
@@ -94,6 +164,11 @@ impl SubagentRegistry {
         if result_summary.is_some() {
             entry.result_summary = result_summary;
         }
+        // Terminal tasks have no live handles; the cancel reason has been
+        // folded into the terminal result_summary by the caller.
+        entry.cancel_flag = None;
+        entry.inbox_tx = None;
+        entry.cancel_reason = None;
     }
 
     /// Apply one event-log envelope: `ChildSessionSpawned` records the
@@ -160,10 +235,74 @@ impl SubagentRegistry {
         entries.iter().find(|e| e.session_id == id).cloned()
     }
 
+    /// Resolve a control-request target by exact session id first, then by
+    /// parent-scoped alias.
+    ///
+    /// - Exact id match always wins (an alias may collide with another
+    ///   task's id; the id is the unambiguous handle).
+    /// - Otherwise entries whose `alias` equals `id_or_alias`: none →
+    ///   `Ok(None)`, exactly one → `Ok(Some)`, more than one →
+    ///   `Err("ambiguous alias '<x>' matches N tasks")`.
+    pub fn resolve(&self, id_or_alias: &str) -> Result<Option<SubagentRegistryEntry>, String> {
+        let entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(entry) = entries.iter().find(|e| e.session_id == id_or_alias) {
+            return Ok(Some(entry.clone()));
+        }
+        let matches: Vec<SubagentRegistryEntry> = entries
+            .iter()
+            .filter(|e| e.alias.as_deref() == Some(id_or_alias))
+            .cloned()
+            .collect();
+        match matches.len() {
+            0 => Ok(None),
+            1 => Ok(matches.into_iter().next()),
+            n => Err(format!("ambiguous alias '{id_or_alias}' matches {n} tasks")),
+        }
+    }
+
     /// All entries in spawn order.
     pub fn list(&self) -> Vec<SubagentRegistryEntry> {
         let entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         entries.clone()
+    }
+
+    /// Try to acquire the single in-flight mutating control lease for a
+    /// task (cancel/revive). Returns `None` when another control operation
+    /// is already in flight; the lease is released when the guard drops.
+    ///
+    /// Simplified per `docs/subagent-task-lifecycle.md` §4: one lease per
+    /// task id, no upstream `statusUncertain`/liveness-reconciliation
+    /// machinery — the consumer serializes requests on one channel anyway,
+    /// so the lease only guards against overlapping *asynchronous* control
+    /// sequences (e.g. revive-while-cancelling).
+    pub fn try_acquire_lease(&self, session_id: &str) -> Option<ControlLease> {
+        let mut held = self
+            .control_leases
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if held.contains(session_id) {
+            return None;
+        }
+        held.insert(session_id.to_string());
+        Some(ControlLease {
+            session_id: session_id.to_string(),
+            held: Arc::clone(&self.control_leases),
+        })
+    }
+}
+
+/// Guard for a task's single in-flight mutating control operation
+/// (cancel/revive). Released on drop; acquire via
+/// [`SubagentRegistry::try_acquire_lease`].
+pub struct ControlLease {
+    session_id: String,
+    held: Arc<Mutex<HashSet<String>>>,
+}
+
+impl Drop for ControlLease {
+    fn drop(&mut self) {
+        let mut held = self.held.lock().unwrap_or_else(|p| p.into_inner());
+        held.remove(&self.session_id);
     }
 }
 
@@ -372,6 +511,7 @@ mod tests {
     use nca_common::event::EventEnvelope;
     use nca_common::message::Message;
     use nca_common::session::{SessionMeta, SessionStatus};
+    use std::sync::atomic::AtomicBool;
     use tokio::sync::oneshot;
 
     fn spawned_envelope(id: u64, child: &str) -> EventEnvelope {
@@ -518,6 +658,195 @@ mod tests {
         registry.record_terminal("a", ChildSessionState::Completed, Some("done".into()));
         let ids: Vec<String> = registry.list().into_iter().map(|e| e.session_id).collect();
         assert_eq!(ids, vec!["a".to_string(), "b".into(), "c".into()]);
+    }
+
+    // ------------------------------------------------------------------
+    // P2 chunk B — live handles, alias resolution, control lease
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn record_handles_stores_cancel_flag_and_inbox() {
+        let registry = SubagentRegistry::new();
+        registry.record_spawned("p", "c1", "t", "/ws".into(), None);
+        let flag = Arc::new(AtomicBool::new(false));
+        let (inbox_tx, _inbox_rx) = mpsc::channel(16);
+        registry.record_handles("c1", flag.clone(), inbox_tx);
+
+        let entry = registry.get("c1").expect("entry");
+        let stored = entry.cancel_flag.expect("cancel flag recorded");
+        assert!(Arc::ptr_eq(&stored, &flag));
+        assert!(entry.inbox_tx.is_some(), "inbox sender recorded");
+        assert_eq!(entry.cancel_reason, None);
+    }
+
+    #[test]
+    fn record_handles_unknown_id_is_noop() {
+        let registry = SubagentRegistry::new();
+        registry.record_handles(
+            "ghost",
+            Arc::new(AtomicBool::new(false)),
+            mpsc::channel(16).0,
+        );
+        assert!(registry.get("ghost").is_none());
+        assert!(registry.list().is_empty());
+    }
+
+    #[test]
+    fn record_cancel_requested_sets_reason_and_terminal_clears_it() {
+        let registry = SubagentRegistry::new();
+        registry.record_spawned("p", "c1", "t", "/ws".into(), None);
+        registry.record_cancel_requested("c1", Some("wrong branch".into()));
+        assert_eq!(
+            registry.get("c1").expect("entry").cancel_reason.as_deref(),
+            Some("wrong branch")
+        );
+        // Unknown id is a no-op.
+        registry.record_cancel_requested("ghost", Some("x".into()));
+        assert!(registry.get("ghost").is_none());
+
+        // Terminal fold clears the live handles AND the spent reason.
+        registry.record_handles("c1", Arc::new(AtomicBool::new(false)), mpsc::channel(16).0);
+        registry.record_terminal(
+            "c1",
+            ChildSessionState::Cancelled,
+            Some("cancelled: wrong branch".into()),
+        );
+        let entry = registry.get("c1").expect("entry after terminal");
+        assert_eq!(entry.state, ChildSessionState::Cancelled);
+        assert!(
+            entry.cancel_flag.is_none(),
+            "terminal tasks have no live handles"
+        );
+        assert!(entry.inbox_tx.is_none(), "terminal tasks have no inbox");
+        assert_eq!(
+            entry.cancel_reason, None,
+            "reason is folded into the summary, then cleared"
+        );
+        assert_eq!(
+            entry.result_summary.as_deref(),
+            Some("cancelled: wrong branch")
+        );
+    }
+
+    #[test]
+    fn clear_handles_is_idempotent_and_safe_for_unknown() {
+        let registry = SubagentRegistry::new();
+        registry.record_spawned("p", "c1", "t", "/ws".into(), None);
+        registry.record_handles("c1", Arc::new(AtomicBool::new(false)), mpsc::channel(16).0);
+        registry.clear_handles("c1");
+        registry.clear_handles("c1");
+        registry.clear_handles("ghost");
+        let entry = registry.get("c1").expect("entry");
+        assert!(entry.cancel_flag.is_none());
+        assert!(entry.inbox_tx.is_none());
+    }
+
+    /// Give a tracked child an alias (mirrors a `ChildSessionStatusChanged`
+    /// fold carrying one).
+    fn aliased(registry: &SubagentRegistry, child: &str, alias: &str) {
+        registry.apply_envelope(&EventEnvelope::new(
+            1,
+            AgentEvent::ChildSessionStatusChanged {
+                parent_session_id: "parent".into(),
+                child_session_id: child.into(),
+                state: ChildSessionState::Running,
+                generation: 0,
+                alias: Some(alias.into()),
+                result_summary: None,
+            },
+        ));
+    }
+
+    #[test]
+    fn resolve_exact_session_id_wins_over_alias() {
+        let registry = SubagentRegistry::new();
+        registry.record_spawned("p", "c1", "t", "/ws".into(), None);
+        registry.record_spawned("p", "c2", "t", "/ws".into(), None);
+        aliased(&registry, "c2", "c1"); // alias collides with c1's id
+
+        let entry = registry
+            .resolve("c1")
+            .expect("no ambiguity")
+            .expect("found");
+        assert_eq!(entry.session_id, "c1", "exact id match must win");
+    }
+
+    #[test]
+    fn resolve_by_unique_alias() {
+        let registry = SubagentRegistry::new();
+        registry.record_spawned("p", "c1", "t", "/ws".into(), None);
+        aliased(&registry, "c1", "fixer");
+
+        let entry = registry
+            .resolve("fixer")
+            .expect("no ambiguity")
+            .expect("found");
+        assert_eq!(entry.session_id, "c1");
+        // The id still resolves too.
+        assert_eq!(
+            registry
+                .resolve("c1")
+                .expect("id")
+                .expect("found")
+                .session_id,
+            "c1"
+        );
+    }
+
+    #[test]
+    fn resolve_unknown_returns_none() {
+        let registry = SubagentRegistry::new();
+        assert!(registry.resolve("ghost").expect("no error").is_none());
+    }
+
+    #[test]
+    fn resolve_ambiguous_alias_errors_with_count() {
+        let registry = SubagentRegistry::new();
+        registry.record_spawned("p", "c1", "t", "/ws".into(), None);
+        registry.record_spawned("p", "c2", "t", "/ws".into(), None);
+        registry.record_spawned("p", "c3", "t", "/ws".into(), None);
+        aliased(&registry, "c1", "fixer");
+        aliased(&registry, "c2", "fixer");
+        aliased(&registry, "c3", "fixer");
+
+        let err = registry
+            .resolve("fixer")
+            .expect_err("3 aliases must be ambiguous");
+        assert!(
+            err.contains("ambiguous alias 'fixer'") && err.contains("3 tasks"),
+            "error must name the alias and the count: {err}"
+        );
+    }
+
+    #[test]
+    fn control_lease_is_exclusive_and_released_on_drop() {
+        let registry = SubagentRegistry::new();
+        registry.record_spawned("p", "c1", "t", "/ws".into(), None);
+
+        let lease = registry
+            .try_acquire_lease("c1")
+            .expect("first acquisition succeeds");
+        assert!(
+            registry.try_acquire_lease("c1").is_none(),
+            "second acquisition while held must fail"
+        );
+        drop(lease);
+        assert!(
+            registry.try_acquire_lease("c1").is_some(),
+            "lease must be released on drop"
+        );
+    }
+
+    #[test]
+    fn control_lease_per_session_not_global() {
+        let registry = SubagentRegistry::new();
+        registry.record_spawned("p", "c1", "t", "/ws".into(), None);
+        registry.record_spawned("p", "c2", "t", "/ws".into(), None);
+        let _lease_a = registry.try_acquire_lease("c1").expect("c1");
+        assert!(
+            registry.try_acquire_lease("c2").is_some(),
+            "leases are per-task; c2 is independent"
+        );
     }
 
     fn session_state(messages: Vec<Message>, status: SessionStatus) -> SessionState {
