@@ -38,6 +38,11 @@ pub struct ChildSessionConfig {
     /// set, spawn/terminal lifecycle transitions are folded into it and
     /// surfaced as `ChildSessionStatusChanged` events.
     pub registry: Option<std::sync::Arc<crate::subagent_registry::SubagentRegistry>>,
+    /// Optional pre-built provider, used verbatim by the child supervisor
+    /// (`build_provider` skipped) — test seam mirroring
+    /// [`crate::supervisor::SupervisorConfig::provider`]. Production
+    /// callers (`spawn_subagent_consumer`) always pass `None`.
+    pub provider: Option<Arc<dyn nca_core::provider::Provider>>,
 }
 
 /// Result of a spawned child session.
@@ -172,7 +177,7 @@ pub async fn spawn_child_session(
         approval_handler: Some(Arc::new(AutoDenyHandler) as Arc<dyn ApprovalHandler>),
         orchestration_context: None,
         agent_name: cfg.specialist.clone(),
-        provider: None,
+        provider: cfg.provider,
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -644,6 +649,7 @@ pub fn spawn_subagent_consumer(
                 model_override: req.model_override.clone(),
                 specialist: req.specialist.clone(),
                 registry: Some(registry.clone()),
+                provider: None,
             };
 
             tokio::spawn(async move {
