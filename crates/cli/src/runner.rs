@@ -277,19 +277,7 @@ impl SessionRuntime {
         if entries.is_empty() {
             return vec!["No subagent tasks tracked.".into()];
         }
-        entries
-            .into_iter()
-            .map(|entry| {
-                let state = format!("{:?}", entry.state).to_ascii_lowercase();
-                let task: String = entry.task.chars().take(60).collect();
-                match entry.branch {
-                    Some(branch) => {
-                        format!("{}  {}  {}  [{}]", entry.session_id, state, task, branch)
-                    }
-                    None => format!("{}  {}  {}", entry.session_id, state, task),
-                }
-            })
-            .collect()
+        entries.iter().map(format_job_line).collect()
     }
 
     /// Live config. The supervisor owns the single authoritative copy;
@@ -410,6 +398,29 @@ impl SessionRuntime {
     }
 }
 
+/// One `/jobs` line: `id [@alias]  state [gN]  task  [branch]`. The alias
+/// rides after the id so users can see the name `task_*` tools accept;
+/// the generation appears only when > 0 (a revived task).
+pub(crate) fn format_job_line(
+    entry: &nca_runtime::subagent_registry::SubagentRegistryEntry,
+) -> String {
+    let state = format!("{:?}", entry.state).to_ascii_lowercase();
+    let task: String = entry.task.chars().take(60).collect();
+    let id = match entry.alias.as_deref() {
+        Some(alias) => format!("{} @{}", entry.session_id, alias),
+        None => entry.session_id.clone(),
+    };
+    let state = if entry.generation > 0 {
+        format!("{state} g{}", entry.generation)
+    } else {
+        state
+    };
+    match entry.branch.as_deref() {
+        Some(branch) => format!("{id}  {state}  {task}  [{branch}]"),
+        None => format!("{id}  {state}  {task}"),
+    }
+}
+
 pub async fn build_session_runtime(
     config: NcaConfig,
     workspace_root: &Path,
@@ -472,6 +483,68 @@ pub async fn build_resumed_session_runtime(
         safe_mode,
         interactive_approvals,
     })
+}
+
+#[cfg(test)]
+mod job_line_tests {
+    use super::format_job_line;
+    use nca_common::session::ChildSessionState;
+    use nca_runtime::subagent_registry::SubagentRegistryEntry;
+
+    fn entry(
+        state: ChildSessionState,
+        alias: Option<&str>,
+        generation: u64,
+    ) -> SubagentRegistryEntry {
+        SubagentRegistryEntry {
+            session_id: "sess-1".into(),
+            parent_session_id: "parent".into(),
+            task: "do the thing".into(),
+            state,
+            generation,
+            alias: alias.map(String::from),
+            workspace: "/ws".into(),
+            branch: Some("nca/sess-1".into()),
+            worktree_path: None,
+            result_summary: None,
+            cancel_flag: None,
+            inbox_tx: None,
+            cancel_reason: None,
+            specialist: None,
+        }
+    }
+
+    #[test]
+    fn plain_running_task_shows_id_state_task_branch() {
+        let line = format_job_line(&entry(ChildSessionState::Running, None, 0));
+        assert_eq!(line, "sess-1  running  do the thing  [nca/sess-1]");
+    }
+
+    #[test]
+    fn alias_rides_after_the_id() {
+        let line = format_job_line(&entry(ChildSessionState::Running, Some("fixer-2"), 0));
+        assert!(line.starts_with("sess-1 @fixer-2  running"), "got: {line}");
+    }
+
+    #[test]
+    fn generation_shown_only_when_revived() {
+        let revived = format_job_line(&entry(ChildSessionState::Completed, Some("fixer-2"), 1));
+        assert!(revived.contains("completed g1"), "got: {revived}");
+        let fresh = format_job_line(&entry(ChildSessionState::Completed, None, 0));
+        assert_eq!(fresh, "sess-1  completed  do the thing  [nca/sess-1]");
+    }
+
+    #[test]
+    fn long_task_text_is_capped_at_60_chars() {
+        let mut long = entry(ChildSessionState::Running, None, 0);
+        long.task = "x".repeat(200);
+        let line = format_job_line(&long);
+        assert!(
+            line.contains(&"x".repeat(60)),
+            "task must be capped: {line}"
+        );
+        assert!(!line.contains(&"x".repeat(61)));
+    }
 }
 
 #[cfg(test)]
