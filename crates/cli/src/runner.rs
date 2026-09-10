@@ -534,6 +534,10 @@ mod tests {
         let _env = TestEnvGuard::set(&[
             ("HOME", home.path().to_str().unwrap()),
             ("XDG_CONFIG_HOME", xdg.path().to_str().unwrap()),
+            // Hermeticity: default config uses deepseek, which validates its
+            // API key eagerly at provider build. Inject a dummy key so the
+            // runtime constructs regardless of the host environment.
+            ("DEEPSEEK_API_KEY", "dummy"),
         ]);
 
         let ws = tempfile::tempdir().expect("workspace tempdir");
@@ -548,7 +552,7 @@ mod tests {
             None,
         )
         .await
-        .expect("session runtime builds (keyless deepseek validates lazily)");
+        .expect("session runtime builds (dummy key injected via env guard)");
 
         rt.mount_path(ext.path()).await.expect("mount");
 
@@ -563,7 +567,7 @@ mod tests {
         let mut cfg = rt.config().clone();
         cfg.apply_model_override("deepseek-chat");
         rt.apply_nca_config(cfg)
-            .expect("apply (keyless deepseek validates lazily)");
+            .expect("apply (dummy key injected via env guard)");
         rt.config()
             .save_workspace_file(ws.path())
             .expect("workspace save");
