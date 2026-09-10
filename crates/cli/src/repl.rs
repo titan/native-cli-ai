@@ -15,6 +15,7 @@ use nca_common::config::{PermissionMode, ProviderKind};
 use nca_common::event::{EndReason, QuestionSelection};
 use nca_core::skills::SkillCatalog;
 use nca_runtime::memory_store::MemoryStore;
+use nca_runtime::wake_scheduler::{WakeScheduler, WakeTrigger};
 use reedline::{
     Emacs, FileBackedHistory, Hinter, KeyCode, KeyModifiers, Reedline, ReedlineEvent, Signal, Vi,
     default_emacs_keybindings,
@@ -22,6 +23,7 @@ use reedline::{
 use std::io::Write;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::process::Command;
 
 /// Where slash-command and preset output goes (TTY transcript vs full-screen TUI).
@@ -155,8 +157,9 @@ impl Repl {
                     self.runtime.subagent_registry(),
                     self.runtime.fs(),
                     None,
-                    // P3 chunk C: stdio REPL parks on read_line — no cmd
-                    // queue, so no wake delivery path; foreground default.
+                    // stdio REPL parks on read_line — no cmd queue, so
+                    // there is no wake delivery path; keeps P2 foreground
+                    // defaults per the spec amendment (docs §3).
                     false,
                     None,
                 ))
@@ -1626,6 +1629,23 @@ impl Repl {
         let busy_flag = tui_feedback.busy_flag_handle();
         let inbox_tx = self.runtime.inbox_sender();
 
+        // Cmd queue: every parent-turn entry point (user Submits, wake
+        // Submits, TUI commands) funnels through this one channel; the
+        // loop below is its single consumer, which keeps run_turn
+        // serialized in one place. The P3 wake trigger delivers its wake
+        // text as an ordinary Submit here (spec §3 cmd-queue delivery).
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+
+        // P3 wake scheduler for background children, held by this session
+        // wiring: cloned into the spawn consumer (terminal hook) and the
+        // bridge (TodosUpdated fold). Constructed only when
+        // `[subagent.wake] enabled` — `None` is the wake rollback gate
+        // (`[subagent] background` still applies to spawn defaults).
+        let wake_scheduler = self.runtime.config().subagent.wake.enabled.then(|| {
+            let interval = Duration::from_millis(self.runtime.config().subagent.wake.interval_ms);
+            WakeScheduler::new(true, interval, wake_submit_trigger(cmd_tx.clone()))
+        });
+
         let commit_tx = self.runtime.take_turn_commit_tx().map(|(tx, _flag)| tx);
         let _bridge = spawn_tui_bridge(
             rx,
@@ -1635,6 +1655,7 @@ impl Repl {
             question.clone(),
             feedback_tx.clone(),
             commit_tx,
+            wake_scheduler.clone(),
         );
 
         let _spawn_task = {
@@ -1651,11 +1672,13 @@ impl Repl {
                     self.runtime.subagent_registry(),
                     self.runtime.fs(),
                     None,
-                    // P3 chunk C: real TUI wiring lands here (scheduler
-                    // over TuiCmd::Submit + config.subagent.background);
-                    // foreground default until then.
-                    false,
-                    None,
+                    // P3: background default-on for the top-level TUI
+                    // session — spawns that omit the flag inherit
+                    // `[subagent] background` (explicit flag always wins);
+                    // detached terminals wake the idle parent via the
+                    // scheduler above.
+                    self.runtime.config().subagent.background,
+                    wake_scheduler.clone(),
                 ))
             } else {
                 None
@@ -1705,7 +1728,6 @@ impl Repl {
         let approval_for_tui = approval_tx.clone();
         drop(approval_tx);
 
-        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
         let cancel_flag = self.runtime.cancel_handle();
 
         // Elm NcaModel params
@@ -2058,6 +2080,13 @@ impl Repl {
                         }
                     }
                     TuiCmd::Submit(line) => {
+                        // P3 wake choke point: every consumed Submit — user
+                        // or wake-injected — re-arms the wake scheduler
+                        // (consumes a queued wake, cancels a pending one).
+                        // Cheap atomics only, no await.
+                        if let Some(sched) = wake_scheduler.as_ref() {
+                            sched.note_input();
+                        }
                         let line = line.trim().to_string();
                         if line.starts_with('!') {
                             let shell_cmd = line.trim_start_matches('!').trim();
@@ -2238,6 +2267,17 @@ impl Hinter for SlashHinter {
     fn next_hint_token(&self) -> String {
         self.hint_suffix.clone()
     }
+}
+
+/// P3 wake delivery: hand the fully rendered wake text to the cmd queue as
+/// an ordinary Submit — the single loop that serializes all `run_turn`
+/// calls. Fire-and-forget: unbounded-channel `send` never blocks, and an
+/// error only means the receiver (TUI loop) is gone — ignored, never a
+/// panic.
+fn wake_submit_trigger(cmd_tx: tokio::sync::mpsc::UnboundedSender<Msg>) -> WakeTrigger {
+    Arc::new(move |text: &str| {
+        let _ = cmd_tx.send(Msg::Cmd(TuiCmd::Submit(text.to_string())));
+    })
 }
 
 fn build_model_picker_entries(

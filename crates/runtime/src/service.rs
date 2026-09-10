@@ -171,8 +171,8 @@ async fn run_service_session_with_startup(
             supervisor.subagent_registry(),
             supervisor.fs(),
             None,
-            // P3 chunk C: service (IPC) sessions have no wake delivery
-            // path wired yet — foreground default (P2 semantics).
+            // Service (IPC) sessions have no cmd-queue wake delivery
+            // path — foreground default (P2 semantics, spec §3).
             false,
             None,
         ))

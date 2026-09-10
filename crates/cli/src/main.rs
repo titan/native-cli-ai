@@ -958,8 +958,10 @@ async fn run_one_shot(
                 runtime.subagent_registry(),
                 runtime.fs(),
                 None,
-                // P3 chunk C: one-shot mode runs a single turn — no idle
-                // parent to wake; foreground default.
+                // One-shot mode exits after the parent turn — no idle
+                // parent to wake and no cmd queue to deliver through;
+                // keeps P2 foreground defaults per the spec amendment
+                // (docs/subagent-task-lifecycle.md §3).
                 false,
                 None,
             )

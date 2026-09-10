@@ -3,9 +3,11 @@
 use crate::ipc_pending::{ApprovalPendingMap, QuestionPendingMap};
 use crate::tui::elm::feedback::TuiFeedbackMsg;
 use nca_common::event::{AgentEvent, EventEnvelope};
+use nca_common::todo::TodoStatus;
 use nca_runtime::event_log::EventLogWriter;
 use nca_runtime::ipc::IpcHandle;
 use nca_runtime::supervisor;
+use nca_runtime::wake_scheduler::WakeScheduler;
 
 struct IpcFanout {
     tx: tokio::sync::broadcast::Sender<String>,
@@ -14,6 +16,8 @@ struct IpcFanout {
 /// Disk + IPC + TUI state; starts IPC command consumer when needed.
 /// `commit_tx` receives the turn id of each `TurnCompleted` committed
 /// (flush + fsync) to the log — the supervisor's `run_turn` barrier.
+/// `wake`, when set, receives the P3 todo-gate fold of live
+/// `TodosUpdated` events (see [`fold_wake_todos`]).
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_tui_bridge(
     mut rx: tokio::sync::mpsc::Receiver<AgentEvent>,
@@ -23,6 +27,7 @@ pub fn spawn_tui_bridge(
     question_pending: Option<QuestionPendingMap>,
     feedback_tx: tokio::sync::mpsc::UnboundedSender<TuiFeedbackMsg>,
     commit_tx: Option<tokio::sync::watch::Sender<u64>>,
+    wake: Option<WakeScheduler>,
 ) -> tokio::task::JoinHandle<()> {
     let (event_tx_ipc, command_rx) = match ipc_handle {
         Some(h) => {
@@ -42,6 +47,12 @@ pub fn spawn_tui_bridge(
         let mut writer = EventLogWriter::open(&log_path).await;
 
         while let Some(event) = rx.recv().await {
+            // P3 todo gate: live TodosUpdated events feed the wake
+            // scheduler. Replay does not rebuild the gate (TodoStore is
+            // not replayed), so after a restart the scheduler stays
+            // conservative (always wake) — documented limitation.
+            fold_wake_todos(&event, wake.as_ref());
+
             let id = writer.next_id();
             let envelope = EventEnvelope::new(id, event.clone());
 
@@ -73,4 +84,19 @@ pub fn spawn_tui_bridge(
             }
         }
     })
+}
+
+/// P3 wake todo gate: fold `TodosUpdated` into the scheduler — any todo
+/// still `pending`/`in_progress` keeps background wakes armed; an
+/// all-completed list (`note_todos(false)`) mutes pending and future
+/// wakes (the result stays queryable via `task_status`/`/jobs`).
+fn fold_wake_todos(event: &AgentEvent, wake: Option<&WakeScheduler>) {
+    if let AgentEvent::TodosUpdated { todos } = event
+        && let Some(sched) = wake
+    {
+        let incomplete = todos
+            .iter()
+            .any(|t| matches!(t.status, TodoStatus::Pending | TodoStatus::InProgress));
+        sched.note_todos(incomplete);
+    }
 }
