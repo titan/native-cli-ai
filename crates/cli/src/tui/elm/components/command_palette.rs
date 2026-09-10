@@ -40,6 +40,10 @@ const PALETTE_CATALOG: &[PaletteRow] = &[
         shortcut: "ctrl+x l",
     },
     PaletteRow::Entry {
+        label: "Subagent jobs",
+        shortcut: "",
+    },
+    PaletteRow::Entry {
         label: "New session",
         shortcut: "ctrl+x n",
     },
@@ -169,6 +173,7 @@ fn palette_command_for_label(label: &str) -> &'static str {
         "Connect provider" => "/connect",
         "Open editor" => "/editor",
         "Switch session" => "/sessions",
+        "Subagent jobs" => "/jobs",
         "New session" => "/new",
         "Compact" => "/compact",
         "Export session" => "/export",

@@ -17,6 +17,7 @@ use crate::model_limits_api;
 use crate::plugin_host::PluginHost;
 use crate::pty::PtyManager;
 use crate::session_store::SessionStore;
+use crate::subagent_registry::{SubagentRegistry, subagent_control_consumer};
 use chrono::Utc;
 use nca_common::config::{AgentProfileConfig, NcaConfig};
 use nca_common::event::{AgentEvent, EndReason, EventEnvelope};
@@ -41,6 +42,7 @@ use nca_core::tools::InvokeSkillTool;
 use nca_core::tools::ToolRegistry;
 use nca_core::tools::mcp::load_mcp_tools;
 use nca_core::tools::spawn_subagent::{SpawnRequest, SpawnSubagentTool};
+use nca_core::tools::subagent_control::{SubagentControlRequest, TaskResultTool, TaskStatusTool};
 use nca_core::tools::{TodoStore, UpdateTodosTool};
 use nca_core::workspace_fs::{RealFs, WorkspaceFs};
 use serde_json::json;
@@ -48,6 +50,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 
 /// Reusable runtime supervisor that owns session lifecycle, IPC, event fanout,
@@ -71,6 +74,10 @@ pub struct Supervisor {
     /// start and read by [`SpawnSubagentTool`] when collecting images for a
     /// child session. `Arc`-shared so the tool sees fresh history.
     spawn_history: Arc<Mutex<Vec<Message>>>,
+    /// Read-only projection of child-session lifecycle state (P1:
+    /// `task_status`/`task_result` introspection). Rebuilt at resume by
+    /// folding the event log; never written to session json from here.
+    subagent_registry: Arc<SubagentRegistry>,
     pub(crate) worktree_path: Option<PathBuf>,
     pub(crate) branch: Option<String>,
     pub(crate) base_branch: Option<String>,
@@ -515,11 +522,25 @@ impl Supervisor {
 
         let (spawn_tx, spawn_rx) = mpsc::channel::<SpawnRequest>(16);
         let spawn_history = Arc::new(Mutex::new(Vec::<Message>::new()));
+        let registry = Arc::new(SubagentRegistry::new());
+        // P1 read-only introspection: bounded control channel for
+        // `task_status`/`task_result`. The consumer (spawned below once the
+        // session store exists) is owned by the supervisor — embedders only
+        // wire the spawn consumer as before.
+        let mut subagent_control_rx = None;
         if !cfg.safe_mode {
             tools.register(Box::new(SpawnSubagentTool::new(
                 spawn_tx,
                 Arc::clone(&spawn_history),
             )));
+            let (control_tx, control_rx) = mpsc::channel::<SubagentControlRequest>(100);
+            let control_timeout = Duration::from_millis(config.subagent.result_timeout_ms);
+            tools.register(Box::new(TaskStatusTool::new(
+                control_tx.clone(),
+                control_timeout,
+            )));
+            tools.register(Box::new(TaskResultTool::new(control_tx, control_timeout)));
+            subagent_control_rx = Some(control_rx);
         }
 
         let approval_pending: Option<ApprovalPendingMap>;
@@ -579,6 +600,17 @@ impl Supervisor {
 
         let session_id = cfg.session_id.unwrap_or_else(generate_session_id);
         let session_store = SessionStore::new(workspace_root.join(&config.session.history_dir));
+
+        // Control consumer answers task_status/task_result against the
+        // registry + a read-only store handle (never saves — single-writer
+        // invariant, `docs/subagent-task-lifecycle.md` §6).
+        if let Some(control_rx) = subagent_control_rx.take() {
+            tokio::spawn(subagent_control_consumer(
+                control_rx,
+                Arc::clone(&registry),
+                SessionStore::new(workspace_root.join(&config.session.history_dir)),
+            ));
+        }
 
         let ipc_server = IpcServer::new(&session_id);
         let socket_path = ipc_server.socket_path();
@@ -681,6 +713,7 @@ impl Supervisor {
             question_pending: Some(question_pending),
             spawn_rx: Some(spawn_rx),
             spawn_history,
+            subagent_registry: registry,
             worktree_path: None,
             branch: None,
             base_branch: None,
@@ -879,6 +912,14 @@ impl Supervisor {
         // recovering children of a parent that crashed before a finish() save.
         sup.child_session_ids = fold_child_session_ids(&sup.child_session_ids, &envelopes);
 
+        // Rebuild the subagent task registry from the same envelopes (P1):
+        // the registry is an in-memory projection, so children's latest
+        // known lifecycle state is re-derived from the log. Read-only —
+        // no session json is written from here (single-writer invariant).
+        for envelope in &envelopes {
+            sup.subagent_registry.apply_envelope(envelope);
+        }
+
         // Re-save immediately after restore: closes the create()-saves-empty-
         // state window so a crash right after resume no longer wipes the json.
         sup.save().await.map_err(ProviderError::Other)?;
@@ -915,6 +956,14 @@ impl Supervisor {
     /// conversation as of spawn time, not session-create time.
     pub fn spawn_history(&self) -> Arc<Mutex<Vec<Message>>> {
         Arc::clone(&self.spawn_history)
+    }
+
+    /// Read-only subagent task registry (P1 introspection). Shared with the
+    /// spawn consumer (live fold) and the control consumer
+    /// (`task_status`/`task_result` replies); rebuilt at resume from the
+    /// event log.
+    pub fn subagent_registry(&self) -> Arc<SubagentRegistry> {
+        Arc::clone(&self.subagent_registry)
     }
 
     pub async fn run_turn(&mut self, prompt: &str) -> Result<String, ProviderError> {
@@ -1978,6 +2027,7 @@ pub(crate) fn should_overflow_retry(err: &ProviderError, already_retried: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nca_common::session::ChildSessionState;
 
     fn spawned_envelope(id: u64, child: &str) -> EventEnvelope {
         EventEnvelope::new(
@@ -2055,6 +2105,109 @@ mod tests {
             fold_child_session_ids(&["z".to_string()], &envelopes),
             vec!["z".to_string()]
         );
+    }
+
+    #[test]
+    fn resume_fold_rebuilds_registry_from_envelopes() {
+        // P1: the registry is an in-memory projection — resume must rebuild
+        // it from the same envelopes used for the lineage fold. A
+        // Spawned+Completed pair yields a terminal entry with the mapped
+        // state; a lone Spawned stays Running.
+        let registry = crate::subagent_registry::SubagentRegistry::new();
+        let envelopes = vec![
+            spawned_envelope(1, "done-child"),
+            EventEnvelope::new(
+                2,
+                AgentEvent::ChildSessionCompleted {
+                    parent_session_id: "parent".into(),
+                    child_session_id: "done-child".into(),
+                    status: "completed".into(),
+                },
+            ),
+            spawned_envelope(3, "live-child"),
+            // A Completed for a child whose Spawned never made the log (torn
+            // tail) is intentionally ignored — mirrors `fold_child_session_ids`,
+            // which can also only recover ids it saw spawn.
+            EventEnvelope::new(
+                4,
+                AgentEvent::ChildSessionCompleted {
+                    parent_session_id: "parent".into(),
+                    child_session_id: "ghost-child".into(),
+                    status: "completed".into(),
+                },
+            ),
+            spawned_envelope(5, "err-child"),
+            EventEnvelope::new(
+                6,
+                AgentEvent::ChildSessionCompleted {
+                    parent_session_id: "parent".into(),
+                    child_session_id: "err-child".into(),
+                    status: "error".into(),
+                },
+            ),
+        ];
+        for envelope in &envelopes {
+            registry.apply_envelope(envelope);
+        }
+
+        let done = registry.get("done-child").expect("done entry");
+        assert_eq!(done.state, ChildSessionState::Completed);
+        assert_eq!(done.task, "t");
+
+        let live = registry.get("live-child").expect("live entry");
+        assert_eq!(live.state, ChildSessionState::Running);
+
+        let errored = registry.get("err-child").expect("err entry");
+        assert_eq!(errored.state, ChildSessionState::Failed);
+
+        // The ghost Completed (no Spawned on record) must NOT create an entry.
+        assert!(registry.get("ghost-child").is_none());
+
+        // Spawn order preserved across the fold.
+        let ids: Vec<String> = registry.list().into_iter().map(|e| e.session_id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "done-child".to_string(),
+                "live-child".into(),
+                "err-child".into()
+            ]
+        );
+    }
+
+    #[test]
+    fn resume_fold_completed_after_status_changed_keeps_summary() {
+        // The richer StatusChanged carries the result summary; a later
+        // coarser Completed must not wipe it during the resume fold.
+        let registry = crate::subagent_registry::SubagentRegistry::new();
+        let envelopes = vec![
+            spawned_envelope(1, "c1"),
+            EventEnvelope::new(
+                2,
+                AgentEvent::ChildSessionStatusChanged {
+                    parent_session_id: "parent".into(),
+                    child_session_id: "c1".into(),
+                    state: ChildSessionState::Failed,
+                    generation: 0,
+                    alias: None,
+                    result_summary: Some("provider 502".into()),
+                },
+            ),
+            EventEnvelope::new(
+                3,
+                AgentEvent::ChildSessionCompleted {
+                    parent_session_id: "parent".into(),
+                    child_session_id: "c1".into(),
+                    status: "error".into(),
+                },
+            ),
+        ];
+        for envelope in &envelopes {
+            registry.apply_envelope(envelope);
+        }
+        let entry = registry.get("c1").expect("entry");
+        assert_eq!(entry.state, ChildSessionState::Failed);
+        assert_eq!(entry.result_summary.as_deref(), Some("provider 502"));
     }
 
     #[test]

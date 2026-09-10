@@ -206,6 +206,138 @@ pub enum SessionStatus {
     Cancelled,
 }
 
+/// Lifecycle state of a child (subagent) session, tracked by the parent's
+/// `SubagentRegistry`. Terminal states: Completed | Cancelled | Failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildSessionState {
+    /// Spawned but not yet observed running (reserved; not emitted in P1).
+    Pending,
+    /// Child session is executing its task.
+    Running,
+    /// Child finished successfully.
+    Completed,
+    /// Child was cancelled (P2+; mapped from `SessionStatus::Cancelled`).
+    Cancelled,
+    /// Child errored.
+    Failed,
+}
+
+impl ChildSessionState {
+    /// True for terminal states (the child will not transition again).
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            ChildSessionState::Completed | ChildSessionState::Cancelled | ChildSessionState::Failed
+        )
+    }
+
+    /// Map a persisted [`SessionStatus`] to the registry lifecycle state.
+    pub fn from_session_status(s: SessionStatus) -> Self {
+        match s {
+            SessionStatus::Running => ChildSessionState::Running,
+            SessionStatus::Completed => ChildSessionState::Completed,
+            SessionStatus::Error => ChildSessionState::Failed,
+            SessionStatus::Cancelled => ChildSessionState::Cancelled,
+        }
+    }
+
+    /// Map the string statuses used by `ChildSessionCompleted`/
+    /// `ChildSessionResult` ("completed" | "error" | "cancelled") to the
+    /// registry lifecycle state; unknown strings map to `Running` so an
+    /// unrecognized value never fabricates a terminal state.
+    pub fn from_spawn_status(s: &str) -> Self {
+        match s {
+            "completed" => ChildSessionState::Completed,
+            "error" => ChildSessionState::Failed,
+            "cancelled" => ChildSessionState::Cancelled,
+            _ => ChildSessionState::Running,
+        }
+    }
+}
+
+#[cfg(test)]
+mod child_state_tests {
+    use super::{ChildSessionState, SessionStatus};
+
+    #[test]
+    fn child_session_state_serde_snake_case_roundtrip() {
+        for state in [
+            ChildSessionState::Pending,
+            ChildSessionState::Running,
+            ChildSessionState::Completed,
+            ChildSessionState::Cancelled,
+            ChildSessionState::Failed,
+        ] {
+            let json = serde_json::to_string(&state).expect("serialize");
+            let expected = match state {
+                ChildSessionState::Pending => "\"pending\"",
+                ChildSessionState::Running => "\"running\"",
+                ChildSessionState::Completed => "\"completed\"",
+                ChildSessionState::Cancelled => "\"cancelled\"",
+                ChildSessionState::Failed => "\"failed\"",
+            };
+            assert_eq!(json, expected, "snake_case wire form");
+            let back: ChildSessionState = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, state);
+        }
+    }
+
+    #[test]
+    fn child_session_state_from_session_status_maps_all_variants() {
+        assert_eq!(
+            ChildSessionState::from_session_status(SessionStatus::Running),
+            ChildSessionState::Running
+        );
+        assert_eq!(
+            ChildSessionState::from_session_status(SessionStatus::Completed),
+            ChildSessionState::Completed
+        );
+        assert_eq!(
+            ChildSessionState::from_session_status(SessionStatus::Error),
+            ChildSessionState::Failed
+        );
+        assert_eq!(
+            ChildSessionState::from_session_status(SessionStatus::Cancelled),
+            ChildSessionState::Cancelled
+        );
+    }
+
+    #[test]
+    fn child_session_state_from_spawn_status_maps_and_defaults_to_running() {
+        assert_eq!(
+            ChildSessionState::from_spawn_status("completed"),
+            ChildSessionState::Completed
+        );
+        assert_eq!(
+            ChildSessionState::from_spawn_status("error"),
+            ChildSessionState::Failed
+        );
+        assert_eq!(
+            ChildSessionState::from_spawn_status("cancelled"),
+            ChildSessionState::Cancelled
+        );
+        // Unknown strings must never fabricate a terminal state.
+        assert_eq!(
+            ChildSessionState::from_spawn_status("weird"),
+            ChildSessionState::Running
+        );
+        assert_eq!(
+            ChildSessionState::from_spawn_status(""),
+            ChildSessionState::Running
+        );
+    }
+
+    #[test]
+    fn child_session_state_terminal_classification() {
+        assert!(!ChildSessionState::Pending.is_terminal());
+        assert!(!ChildSessionState::Running.is_terminal());
+        assert!(ChildSessionState::Completed.is_terminal());
+        assert!(ChildSessionState::Cancelled.is_terminal());
+        assert!(ChildSessionState::Failed.is_terminal());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::OrchestrationContext;

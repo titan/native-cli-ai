@@ -30,6 +30,10 @@ pub struct NcaConfig {
     /// canonical (symlinks resolved) at the time they were mounted.
     #[serde(default)]
     pub extra_paths: Vec<PathBuf>,
+    /// `[subagent]` — subagent task lifecycle tuning
+    /// (P1: read-only introspection).
+    #[serde(default)]
+    pub subagent: SubagentConfig,
 }
 
 impl NcaConfig {
@@ -201,6 +205,9 @@ impl NcaConfig {
         }
         if let Some(agents) = partial.agents {
             self.merge_agents(agents);
+        }
+        if let Some(subagent) = partial.subagent {
+            self.subagent.merge(subagent);
         }
 
         if let Some(extra_paths) = partial.extra_paths {
@@ -557,6 +564,35 @@ pub struct UiConfig {
 
 fn default_scroll_speed() -> u16 {
     3
+}
+
+fn default_subagent_result_timeout_ms() -> u64 {
+    30_000
+}
+
+/// `[subagent]` — subagent task lifecycle tuning (P1: read-only
+/// introspection via `task_status`/`task_result`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentConfig {
+    /// Max wait for a `task_status`/`task_result` reply, milliseconds.
+    #[serde(default = "default_subagent_result_timeout_ms")]
+    pub result_timeout_ms: u64,
+}
+
+impl Default for SubagentConfig {
+    fn default() -> Self {
+        Self {
+            result_timeout_ms: default_subagent_result_timeout_ms(),
+        }
+    }
+}
+
+impl SubagentConfig {
+    fn merge(&mut self, partial: PartialSubagentConfig) {
+        if let Some(result_timeout_ms) = partial.result_timeout_ms {
+            self.result_timeout_ms = result_timeout_ms;
+        }
+    }
 }
 
 impl Default for UiConfig {
@@ -2224,6 +2260,12 @@ struct PartialNcaConfig {
     middleware: Option<PartialMiddlewareConfig>,
     agents: Option<BTreeMap<String, PartialAgentProfileConfig>>,
     extra_paths: Option<Vec<PathBuf>>,
+    subagent: Option<PartialSubagentConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PartialSubagentConfig {
+    result_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -2550,6 +2592,40 @@ mod tests {
         let partial: PartialNcaConfig = toml::from_str(raw).expect("parse");
         let session = partial.session.expect("session table");
         assert_eq!(session.max_turns_per_run, Some(99));
+    }
+
+    #[test]
+    fn subagent_config_defaults_to_30s_result_timeout() {
+        let config = NcaConfig::default();
+        assert_eq!(config.subagent.result_timeout_ms, 30_000);
+
+        // Field-level serde default must match the Default impl so a
+        // partial `[subagent]` table (or a bare `subagent = {}`) resolves
+        // to the same value.
+        let raw = r#"
+            [subagent]
+        "#;
+        let partial: PartialNcaConfig = toml::from_str(raw).expect("parse");
+        let mut config = NcaConfig::default();
+        config.merge(partial);
+        assert_eq!(config.subagent.result_timeout_ms, 30_000);
+    }
+
+    #[test]
+    fn subagent_config_partial_merge_overrides_result_timeout() {
+        let raw = r#"
+            [subagent]
+            result_timeout_ms = 5000
+        "#;
+        let partial: PartialNcaConfig = toml::from_str(raw).expect("parse");
+        let mut config = NcaConfig::default();
+        config.merge(partial);
+        assert_eq!(config.subagent.result_timeout_ms, 5000);
+
+        // Round-trips through Serialize/Deserialize (config file writes).
+        let json = serde_json::to_string(&config).expect("serialize");
+        let back: NcaConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.subagent.result_timeout_ms, 5000);
     }
 
     #[test]

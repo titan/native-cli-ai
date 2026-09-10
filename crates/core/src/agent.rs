@@ -327,7 +327,9 @@ pub(crate) fn sanitize_tool_call_pairs(messages: &mut Vec<Message>) {
 }
 
 /// Truncate a string to `max_chars` characters, appending "…" if truncated.
-pub(crate) fn truncate_str(s: &str, max_chars: usize) -> String {
+/// `pub` for cross-crate use (runtime's subagent registry truncates result
+/// summaries with the same bound as the spawn tool's error surfacing).
+pub fn truncate_str(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         s.to_string()
     } else {

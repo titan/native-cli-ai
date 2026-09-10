@@ -168,6 +168,7 @@ async fn run_service_session_with_startup(
             request.config.clone(),
             supervisor.spawn_history(),
             supervisor.event_tx(),
+            supervisor.subagent_registry(),
             supervisor.fs(),
         ))
     } else {

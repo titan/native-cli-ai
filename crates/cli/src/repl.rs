@@ -152,6 +152,7 @@ impl Repl {
                     self.runtime.config().clone(),
                     self.runtime.spawn_history(),
                     event_tx,
+                    self.runtime.subagent_registry(),
                     self.runtime.fs(),
                 ))
             } else {
@@ -518,6 +519,7 @@ impl Repl {
                     "  /set-editor <cmd>  Persist editor command".into(),
                     "  /mcp               List MCP servers".into(),
                     "  /sessions          List/switch sessions".into(),
+                    "  /jobs              List tracked subagent tasks".into(),
                     "  /permissions [m]   Show or set permission mode".into(),
                     "  /config            Show runtime config".into(),
                     "  /doctor            Run config checks".into(),
@@ -1362,6 +1364,13 @@ impl Repl {
                     out.eprintln(&format!("failed to list sessions: {error}"));
                 }
             },
+            "/jobs" | "/tasks" => {
+                // P1 read-only introspection: lines from the supervisor's
+                // subagent registry (spawn order, live lifecycle states).
+                for line in self.runtime.list_subagent_jobs() {
+                    out.println(&line);
+                }
+            }
             "/new" => {
                 let summary = self.runtime.compact_summary();
                 self.runtime.set_session_summary(Some(summary.clone()));
@@ -1634,6 +1643,7 @@ impl Repl {
                     self.runtime.config().clone(),
                     self.runtime.spawn_history(),
                     event_tx,
+                    self.runtime.subagent_registry(),
                     self.runtime.fs(),
                 ))
             } else {

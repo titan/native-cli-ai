@@ -955,6 +955,7 @@ async fn run_one_shot(
                 config.clone(),
                 runtime.spawn_history(),
                 event_tx,
+                runtime.subagent_registry(),
                 runtime.fs(),
             )
         });
