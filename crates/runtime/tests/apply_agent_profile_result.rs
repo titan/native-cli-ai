@@ -17,17 +17,51 @@
 //! finish → resume restoring the verbatim recorded name, which then
 //! (correctly) resolves to nothing and warns instead of failing.
 //!
-//! No network: DeepSeek (default) validates its key lazily, so keyless
-//! configs build providers fine and are never called.
+//! No network: providers are built with a dummy injected key (see
+//! `TestEnvGuard`) and are never called.
 //!
 //! Run: `cargo test -p nca-runtime --test apply_agent_profile_result`
 
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
 
 use nca_common::config::{AgentProfileConfig, NcaConfig, PermissionMode};
 use nca_common::event::EndReason;
 use nca_runtime::session_store::SessionStore;
 use nca_runtime::supervisor::{Supervisor, SupervisorConfig};
+
+/// Env isolation (same pattern as agent_profile_config_purity.rs / 19d57f8):
+/// the default deepseek provider validates its API key eagerly at build, so
+/// keyless environments inject a dummy key for the test's duration.
+static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+struct TestEnvGuard {
+    previous: Option<std::ffi::OsString>,
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl TestEnvGuard {
+    fn dummy_deepseek_key() -> Self {
+        let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("DEEPSEEK_API_KEY");
+        // SAFETY: the mutex serializes env mutation within this binary.
+        unsafe { std::env::set_var("DEEPSEEK_API_KEY", "dummy") };
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for TestEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: still holding the env mutex.
+        match self.previous.take() {
+            Some(value) => unsafe { std::env::set_var("DEEPSEEK_API_KEY", value) },
+            None => unsafe { std::env::remove_var("DEEPSEEK_API_KEY") },
+        }
+    }
+}
 
 /// Deterministic offline config with NO API key (mirrors
 /// resume_agent_profile.rs::offline_config_no_key).
@@ -74,6 +108,7 @@ async fn create_sup(ws: &Path, session_id: &str, config: NcaConfig) -> Superviso
 /// A1 — a registered `[agents.x]` profile switch reports the applied name.
 #[tokio::test(flavor = "multi_thread")]
 async fn a1_registered_profile_returns_ok_some() {
+    let _env = TestEnvGuard::dummy_deepseek_key();
     let ws = tempfile::tempdir().expect("tempdir");
     let mut sup = create_sup(ws.path(), "a1", config_with_registered_agent()).await;
 
@@ -89,6 +124,7 @@ async fn a1_registered_profile_returns_ok_some() {
 /// report `Ok(None)` (default persona) without failing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a2_default_persona_paths_return_ok_none() {
+    let _env = TestEnvGuard::dummy_deepseek_key();
     let ws = tempfile::tempdir().expect("tempdir");
     let mut sup = create_sup(ws.path(), "a2", config_with_registered_agent()).await;
 
@@ -119,6 +155,7 @@ async fn a2_default_persona_paths_return_ok_none() {
 /// resolves to nothing and warns instead of failing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a2b_bogus_name_records_verbatim_for_resume_symmetry() {
+    let _env = TestEnvGuard::dummy_deepseek_key();
     let ws = tempfile::tempdir().expect("tempdir");
     let config = config_with_registered_agent();
 

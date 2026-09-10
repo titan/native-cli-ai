@@ -210,7 +210,18 @@ fn response_from_state(session_id: &str, state: &SessionState) -> SubagentContro
         note: None,
         ok: true,
         error_message: None,
+        generation: None,
     }
+}
+
+/// Placeholder reply for P2 write-side operations (`Message`/`Cancel`/
+/// `Revive`): the wire types land in chunk A, but executing them needs the
+/// control lease (chunk B/C) — fail loudly instead of pretending success.
+fn operation_not_available(session_id: &str) -> SubagentControlResponse {
+    SubagentControlResponse::unknown(
+        session_id,
+        "task control operation is not available in this build",
+    )
 }
 
 /// Consume `task_status`/`task_result` control requests against the
@@ -241,6 +252,7 @@ pub fn subagent_control_consumer(
                             note: None,
                             ok: true,
                             error_message: None,
+                            generation: None,
                         },
                         None => match session_store.load(&session_id).await {
                             Ok(state) => response_from_state(&session_id, &state),
@@ -288,6 +300,25 @@ pub fn subagent_control_consumer(
                     };
                     let _ = reply.send(response);
                 }
+                // P2 chunk A placeholders: the write-side operations are
+                // executed by the control lease + revive path in chunk B/C;
+                // until then every request fails loudly (never silently
+                // succeeds against a live child).
+                SubagentControlRequest::Message {
+                    session_id, reply, ..
+                } => {
+                    let _ = reply.send(operation_not_available(&session_id));
+                }
+                SubagentControlRequest::Cancel {
+                    session_id, reply, ..
+                } => {
+                    let _ = reply.send(operation_not_available(&session_id));
+                }
+                SubagentControlRequest::Revive {
+                    session_id, reply, ..
+                } => {
+                    let _ = reply.send(operation_not_available(&session_id));
+                }
             }
         }
     })
@@ -313,6 +344,7 @@ async fn build_result_response(
         note: None,
         ok: true,
         error_message: None,
+        generation: None,
     };
     if !state.is_terminal() {
         response.note = Some("task is still running".into());
@@ -693,5 +725,65 @@ mod tests {
         let resp = reply_rx.await.expect("reply");
         assert!(!resp.ok);
         assert!(resp.error_message.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn control_consumer_write_operations_reply_not_available_yet() {
+        // P2 chunk A: the Message/Cancel/Revive wire types exist, but this
+        // build's consumer cannot execute them (the control lease lands in
+        // chunk B) — every write op must fail loudly instead of pretending
+        // success, even for a registry-known, still-running child.
+        let (tx, rx) = mpsc::channel(8);
+        let registry = Arc::new(SubagentRegistry::new());
+        registry.record_spawned("p", "c1", "t", "/ws".into(), None);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::new(dir.path());
+        let _consumer = subagent_control_consumer(rx, registry, store);
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(SubagentControlRequest::Message {
+            session_id: "c1".into(),
+            text: "pivot to tests".into(),
+            reply: reply_tx,
+        })
+        .await
+        .expect("send");
+        let resp = reply_rx.await.expect("reply");
+        assert!(!resp.ok);
+        assert_eq!(resp.session_id, "c1");
+        assert_eq!(
+            resp.error_message.as_deref(),
+            Some("task control operation is not available in this build")
+        );
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(SubagentControlRequest::Cancel {
+            session_id: "c1".into(),
+            reason: Some("wrong branch".into()),
+            reply: reply_tx,
+        })
+        .await
+        .expect("send");
+        let resp = reply_rx.await.expect("reply");
+        assert!(!resp.ok);
+        assert_eq!(
+            resp.error_message.as_deref(),
+            Some("task control operation is not available in this build")
+        );
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(SubagentControlRequest::Revive {
+            session_id: "c1".into(),
+            prompt: "finish the tests".into(),
+            reply: reply_tx,
+        })
+        .await
+        .expect("send");
+        let resp = reply_rx.await.expect("reply");
+        assert!(!resp.ok);
+        assert_eq!(
+            resp.error_message.as_deref(),
+            Some("task control operation is not available in this build")
+        );
     }
 }

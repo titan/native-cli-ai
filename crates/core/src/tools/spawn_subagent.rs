@@ -22,6 +22,14 @@ pub struct SpawnRequest {
     /// native image input; paths are relative to the parent workspace root.
     pub images: Vec<ImageAttachment>,
     pub use_worktree: bool,
+    /// When `true`, the child runs detached: the spawn reply returns
+    /// immediately with the child session id and the final output is
+    /// fetched later via `task_result` (P2; the consumer may ignore it in
+    /// builds without background support).
+    pub background: bool,
+    /// Parent-scoped name usable in place of the session id for the
+    /// `task_*` control tools (P2).
+    pub alias: Option<String>,
     pub provider_override: Option<ProviderKind>,
     pub model_override: Option<String>,
     /// Optional specialist agent name (e.g. "explorer", "oracle").
@@ -110,6 +118,14 @@ impl ToolExecutor for SpawnSubagentTool {
                         "type": "boolean",
                         "description": "If true, the sub-agent runs in an isolated git worktree branch. Defaults to true."
                     },
+                    "background": {
+                        "type": "boolean",
+                        "description": "Return immediately with the child session id while the task runs detached — the result is fetched later via task_result. Defaults to false (waits for the child to finish)."
+                    },
+                    "alias": {
+                        "type": "string",
+                        "description": "Parent-scoped name usable in place of the session id for task_* tools."
+                    },
                     "provider": {
                         "type": "string",
                         "description": "Optional provider override. Only used when `specialist` is NOT set — a specialist profile's provider is authoritative and takes precedence over this. Use one of the configured provider names."
@@ -152,6 +168,15 @@ impl ToolExecutor for SpawnSubagentTool {
 
         let use_worktree = call.input["use_worktree"].as_bool().unwrap_or(true);
 
+        // P2 wire fields: background spawn + parent-scoped alias. A blank
+        // alias is treated as absent (never an empty-string alias).
+        let background = call.input["background"].as_bool().unwrap_or(false);
+        let alias = call.input["alias"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+
         // Parse optional provider/model overrides for per-agent routing.
         let provider_override = call.input["provider"]
             .as_str()
@@ -174,6 +199,8 @@ impl ToolExecutor for SpawnSubagentTool {
             focus_files,
             images,
             use_worktree,
+            background,
+            alias,
             provider_override,
             model_override,
             specialist,
@@ -376,5 +403,73 @@ mod tests {
         let images = responder.await.expect("responder");
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].path, "shot.png");
+    }
+
+    #[tokio::test]
+    async fn execute_parses_background_and_alias_with_defaults() {
+        // Explicit values ride the request.
+        let (spawn_tx, mut spawn_rx) = mpsc::channel::<SpawnRequest>(1);
+        let capture = tokio::spawn(async move {
+            match spawn_rx.recv().await {
+                Some(req) => {
+                    let _ = req.reply.send(response("completed", "ok"));
+                    (req.background, req.alias)
+                }
+                None => panic!("spawn request must arrive"),
+            }
+        });
+        let tool = SpawnSubagentTool::new(spawn_tx, empty_history());
+        let result = tool
+            .execute(&ToolCall {
+                id: "call-1".into(),
+                name: "spawn_subagent".into(),
+                input: serde_json::json!({
+                    "task": "do the thing",
+                    "background": true,
+                    "alias": "fixer-2"
+                }),
+            })
+            .await;
+        assert!(result.success);
+        let (background, alias) = capture.await.expect("capture");
+        assert!(background);
+        assert_eq!(alias.as_deref(), Some("fixer-2"));
+
+        // Defaults: background=false, alias=None; a blank alias is treated
+        // as absent rather than an empty-string alias.
+        let (spawn_tx, mut spawn_rx) = mpsc::channel::<SpawnRequest>(1);
+        let capture = tokio::spawn(async move {
+            match spawn_rx.recv().await {
+                Some(req) => {
+                    let _ = req.reply.send(response("completed", "ok"));
+                    (req.background, req.alias)
+                }
+                None => panic!("spawn request must arrive"),
+            }
+        });
+        let tool = SpawnSubagentTool::new(spawn_tx, empty_history());
+        let result = tool
+            .execute(&ToolCall {
+                id: "call-2".into(),
+                name: "spawn_subagent".into(),
+                input: serde_json::json!({ "task": "do the thing", "alias": "   " }),
+            })
+            .await;
+        assert!(result.success);
+        let (background, alias) = capture.await.expect("capture");
+        assert!(!background, "background must default to false");
+        assert_eq!(alias, None, "blank alias must be treated as absent");
+    }
+
+    #[test]
+    fn definition_declares_background_and_alias() {
+        let (tx, _rx) = mpsc::channel(1);
+        let tool = SpawnSubagentTool::new(tx, empty_history());
+        let def = tool.definition();
+        let props = def.parameters["properties"]
+            .as_object()
+            .expect("properties");
+        assert_eq!(props["background"]["type"], "boolean", "schema: {props:?}");
+        assert_eq!(props["alias"]["type"], "string", "schema: {props:?}");
     }
 }

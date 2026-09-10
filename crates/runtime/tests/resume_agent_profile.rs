@@ -34,9 +34,23 @@ const R1_PERSONA: &str = "You are R1-SPECIALIST, keeper of the resumed persona."
 // Scaffolding (mirrors provider_injection.rs)
 // ---------------------------------------------------------------------------
 
-/// Deterministic offline config with NO API key. DeepSeek (default) validates
-/// its key lazily at request time, so `build_provider` succeeds without one —
-/// tests that never make a provider call need no injection.
+/// Hermeticity: the default deepseek provider validates its API key eagerly
+/// at build, so keyless dev environments must inject a dummy key before any
+/// `Supervisor::create`/`resume`/`apply_agent_profile` rebuild. Set-once,
+/// never restored: no test in this binary asserts missing-key behavior
+/// (same intent as 19d57f8).
+static DUMMY_KEY: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+fn hermetic_dummy_key() {
+    DUMMY_KEY.get_or_init(|| {
+        // SAFETY: set once before any test assertion can race it; the value
+        // is a placeholder that no assertion inspects.
+        unsafe { std::env::set_var("DEEPSEEK_API_KEY", "dummy") };
+    });
+}
+
+/// Deterministic offline config with NO explicit API key — providers build
+/// against the injected dummy key and are never called (no network).
 fn offline_config_no_key() -> NcaConfig {
     let mut config = NcaConfig::default();
     config.permissions.mode = PermissionMode::BypassPermissions;
@@ -96,6 +110,7 @@ async fn create_sup(
     agent_name: Option<&str>,
     provider: Option<Arc<dyn Provider>>,
 ) -> Supervisor {
+    hermetic_dummy_key();
     let mut sup = Supervisor::create(SupervisorConfig {
         config,
         workspace_root: ws.to_path_buf(),
@@ -120,6 +135,7 @@ async fn resume_sup(
     config: NcaConfig,
     provider: Option<Arc<dyn Provider>>,
 ) -> Supervisor {
+    hermetic_dummy_key();
     let mut sup = Supervisor::resume(config, ws, true, false, session_id, None, provider)
         .await
         .expect("supervisor resume must succeed");
@@ -189,6 +205,7 @@ async fn drain_fanout(sup: Supervisor, fanout: tokio::task::JoinHandle<()>) {
 async fn r6_resume_restores_orchestration_context_section() {
     let ws = tempfile::tempdir().expect("tempdir");
     let config = offline_config_no_key();
+    hermetic_dummy_key();
     let orchestration = OrchestrationContext {
         orchestrator: Some("probe-wrapper".into()),
         run_id: Some("run-1".into()),

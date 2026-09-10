@@ -28,7 +28,8 @@ pub mod write_file;
 pub use ask_question::AskQuestionTool;
 pub use invoke_skill::InvokeSkillTool;
 pub use subagent_control::{
-    SubagentControlRequest, SubagentControlResponse, TaskResultTool, TaskStatusTool,
+    SubagentControlRequest, SubagentControlResponse, TaskCancelTool, TaskMessageTool,
+    TaskResultTool, TaskReviveTool, TaskStatusTool,
 };
 pub use update_todos::{TodoStore, UpdateTodosTool, validate_todos};
 
