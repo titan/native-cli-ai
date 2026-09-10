@@ -1,9 +1,11 @@
 use crate::session_utils::spawn_event_fanout;
 use crate::supervisor::{AutoDenyHandler, Supervisor, SupervisorConfig};
+use crate::wake_scheduler::WakeScheduler;
 use nca_common::config::{NcaConfig, ProviderKind};
 use nca_common::event::{AgentEvent, EndReason};
 use nca_common::message::ImageAttachment;
 use nca_common::model_caps::model_accepts_native_images;
+use nca_common::session::ChildSessionState;
 use nca_core::approval::ApprovalHandler;
 use nca_core::hooks::{HookEventKind, HookRunner};
 use nca_core::tools::spawn_subagent::{MAX_FORWARD_IMAGES, SpawnRequest};
@@ -96,6 +98,19 @@ pub(crate) fn build_parent_summary(messages: &[nca_common::message::Message]) ->
     }
 
     summary
+}
+
+/// Wake-text state label for a terminal child: the `ChildSessionState`
+/// rendered as its wire word (matches the spec §3 state vocabulary —
+/// notably `failed`, not the internal `error` status string).
+fn child_state_label(state: ChildSessionState) -> &'static str {
+    match state {
+        ChildSessionState::Pending => "pending",
+        ChildSessionState::Running => "running",
+        ChildSessionState::Completed => "completed",
+        ChildSessionState::Cancelled => "cancelled",
+        ChildSessionState::Failed => "failed",
+    }
 }
 
 /// Whether a failed child turn was a cooperative cancellation: either the
@@ -900,6 +915,13 @@ fn apply_child_routing(
 ///
 /// `child_provider` is a test seam (injected verbatim into every child,
 /// mirroring `SupervisorConfig::provider`); production callers pass `None`.
+///
+/// `background_default` is the P3 policy default applied to spawns that
+/// OMIT the `background` flag (`req.background.unwrap_or(background_default)`);
+/// an explicit flag always wins. `wake`, when set, is notified when a
+/// DETACHED (background) child reaches a terminal state so an idle parent
+/// can be woken — foreground spawns and `task_revive` never notify (their
+/// callers already hold the reply).
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_subagent_consumer(
     mut spawn_rx: mpsc::Receiver<SpawnRequest>,
@@ -911,6 +933,8 @@ pub fn spawn_subagent_consumer(
     registry: std::sync::Arc<crate::subagent_registry::SubagentRegistry>,
     parent_fs: Arc<dyn WorkspaceFs>,
     child_provider: Option<Arc<dyn nca_core::provider::Provider>>,
+    background_default: bool,
+    wake: Option<WakeScheduler>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(req) = spawn_rx.recv().await {
@@ -928,6 +952,7 @@ pub fn spawn_subagent_consumer(
             let event_tx = event_tx.clone();
             let registry = registry.clone();
             let child_provider = child_provider.clone();
+            let wake = wake.clone();
 
             // Summary of the parent conversation as of THIS spawn (the
             // supervisor refreshes the mirror at each turn start), so a child
@@ -1007,11 +1032,9 @@ pub fn spawn_subagent_consumer(
                         let _ = req.reply.send(response);
                     }
                     Ok((sup, prepared)) => {
-                        // P3 chunk A compile bridge: absent background
-                        // currently resolves to foreground (exact P2
-                        // behavior); chunk B replaces this with the
-                        // `background_default` policy parameter.
-                        if req.background.unwrap_or(false) {
+                        // P3: absent flag inherits the caller's policy
+                        // default; an explicit flag always wins.
+                        if req.background.unwrap_or(background_default) {
                             // §6 invariant ("600s timeout interplay"): answer
                             // the oneshot IMMEDIATELY after prepare — the
                             // reply channel is consumed HERE and the
@@ -1033,6 +1056,11 @@ pub fn spawn_subagent_consumer(
                             let parent = parent_session_id.clone();
                             let tx = event_tx.clone();
                             let hooks = hook_runner.clone();
+                            let wake = wake.clone();
+                            let child_ref = req
+                                .alias
+                                .clone()
+                                .unwrap_or_else(|| prepared.child_id.clone());
                             tokio::spawn(async move {
                                 let result = run_prepared_child(sup, prepared).await;
                                 complete_child_request(
@@ -1042,6 +1070,30 @@ pub fn spawn_subagent_consumer(
                                     hooks.as_ref(),
                                 )
                                 .await;
+                                // P3 wake hook — BACKGROUND ARM ONLY: the
+                                // detached child just reached a terminal
+                                // state, so an idle parent is woken with
+                                // one debounced reconciled prompt. Never
+                                // called from the foreground arm (its
+                                // output was returned inline) or
+                                // `task_revive` (the parent is mid-turn
+                                // holding the reply). Fires for completed,
+                                // cancelled, AND failed terminals; the
+                                // summary is the one `run_prepared_child`
+                                // already folded into the registry.
+                                if let Some(wake) = wake {
+                                    let summary = registry
+                                        .get(&result.child_session_id)
+                                        .and_then(|e| e.result_summary.clone())
+                                        .unwrap_or_else(|| "(no output)".into());
+                                    wake.notify_terminal(
+                                        &child_ref,
+                                        child_state_label(ChildSessionState::from_spawn_status(
+                                            &result.status,
+                                        )),
+                                        &summary,
+                                    );
+                                }
                             });
                         } else {
                             // Foreground: unchanged synchronous contract —
