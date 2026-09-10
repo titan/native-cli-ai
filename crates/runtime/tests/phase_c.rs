@@ -542,7 +542,7 @@ async fn t27_consumer_wiring_routes_child_spawn_into_parent_log() {
             focus_files: Vec::new(),
             images: Vec::new(),
             use_worktree: false,
-            background: false,
+            background: Some(false),
             alias: None,
             provider_override: None,
             model_override: None,

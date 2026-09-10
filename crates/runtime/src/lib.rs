@@ -19,4 +19,5 @@ pub mod supervisor;
 #[cfg(test)]
 pub(crate) mod test_util;
 pub mod tmux;
+pub mod wake_scheduler;
 pub mod worktree;

@@ -22,11 +22,13 @@ pub struct SpawnRequest {
     /// native image input; paths are relative to the parent workspace root.
     pub images: Vec<ImageAttachment>,
     pub use_worktree: bool,
-    /// When `true`, the child runs detached: the spawn reply returns
-    /// immediately with the child session id and the final output is
-    /// fetched later via `task_result` (P2; the consumer may ignore it in
-    /// builds without background support).
-    pub background: bool,
+    /// Detached execution: `Some(true)` runs the child detached — the spawn
+    /// reply returns immediately with the child session id and the final
+    /// output is fetched later via `task_result`; completion auto-wakes the
+    /// parent. `None` (flag absent) means inherit the session default,
+    /// resolved by the runtime consumer (top-level TUI sessions default to
+    /// background; P3). An explicit value always wins.
+    pub background: Option<bool>,
     /// Parent-scoped name usable in place of the session id for the
     /// `task_*` control tools (P2).
     pub alias: Option<String>,
@@ -120,7 +122,7 @@ impl ToolExecutor for SpawnSubagentTool {
                     },
                     "background": {
                         "type": "boolean",
-                        "description": "Return immediately with the child session id while the task runs detached — the result is fetched later via task_result. Defaults to false (the call then waits synchronously for the child, up to the 600s tool timeout)."
+                        "description": "Detached execution: the reply returns immediately with status \"running\" and the final output is fetched later via task_result; completion auto-wakes the parent (else poll task_status/task_result). Absent = inherit the session default (top-level TUI sessions default to background); an explicit true/false always wins."
                     },
                     "alias": {
                         "type": "string",
@@ -168,9 +170,10 @@ impl ToolExecutor for SpawnSubagentTool {
 
         let use_worktree = call.input["use_worktree"].as_bool().unwrap_or(true);
 
-        // P2 wire fields: background spawn + parent-scoped alias. A blank
+        // P3 wire field: background is now optional — absent (None) means
+        // inherit the session default; the consumer resolves it. A blank
         // alias is treated as absent (never an empty-string alias).
-        let background = call.input["background"].as_bool().unwrap_or(false);
+        let background = call.input["background"].as_bool();
         let alias = call.input["alias"]
             .as_str()
             .map(str::trim)
@@ -432,11 +435,11 @@ mod tests {
             .await;
         assert!(result.success);
         let (background, alias) = capture.await.expect("capture");
-        assert!(background);
+        assert_eq!(background, Some(true));
         assert_eq!(alias.as_deref(), Some("fixer-2"));
 
-        // Defaults: background=false, alias=None; a blank alias is treated
-        // as absent rather than an empty-string alias.
+        // Defaults: background=None (inherit the session default); a blank
+        // alias is treated as absent rather than an empty-string alias.
         let (spawn_tx, mut spawn_rx) = mpsc::channel::<SpawnRequest>(1);
         let capture = tokio::spawn(async move {
             match spawn_rx.recv().await {
@@ -457,7 +460,10 @@ mod tests {
             .await;
         assert!(result.success);
         let (background, alias) = capture.await.expect("capture");
-        assert!(!background, "background must default to false");
+        assert_eq!(
+            background, None,
+            "absent background must ride as None (inherit), not false"
+        );
         assert_eq!(alias, None, "blank alias must be treated as absent");
     }
 
