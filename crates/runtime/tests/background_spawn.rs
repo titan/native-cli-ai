@@ -126,7 +126,7 @@ fn spawn_request(
         focus_files: Vec::new(),
         images: Vec::new(),
         use_worktree: true,
-        background,
+        background: Some(background),
         alias: alias.map(String::from),
         provider_override: None,
         model_override: None,

@@ -1007,7 +1007,11 @@ pub fn spawn_subagent_consumer(
                         let _ = req.reply.send(response);
                     }
                     Ok((sup, prepared)) => {
-                        if req.background {
+                        // P3 chunk A compile bridge: absent background
+                        // currently resolves to foreground (exact P2
+                        // behavior); chunk B replaces this with the
+                        // `background_default` policy parameter.
+                        if req.background.unwrap_or(false) {
                             // §6 invariant ("600s timeout interplay"): answer
                             // the oneshot IMMEDIATELY after prepare — the
                             // reply channel is consumed HERE and the
