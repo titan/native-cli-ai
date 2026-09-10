@@ -13,6 +13,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 /// Configuration for spawning a child session.
@@ -34,6 +35,11 @@ pub struct ChildSessionConfig {
     /// Optional specialist agent name. When set, the matching agent profile is
     /// loaded to override provider/model/system prompt for this child.
     pub specialist: Option<String>,
+    /// Parent-scoped alias for the `task_*` control tools (P2). Recorded on
+    /// the registry entry and surfaced through the running
+    /// `ChildSessionStatusChanged` event (the spawn event itself carries no
+    /// alias field).
+    pub alias: Option<String>,
     /// Parent's subagent task registry (P1 read-only introspection). When
     /// set, spawn/terminal lifecycle transitions are folded into it and
     /// surfaced as `ChildSessionStatusChanged` events.
@@ -41,7 +47,7 @@ pub struct ChildSessionConfig {
     /// Optional pre-built provider, used verbatim by the child supervisor
     /// (`build_provider` skipped) — test seam mirroring
     /// [`crate::supervisor::SupervisorConfig::provider`]. Production
-    /// callers (`spawn_subagent_consumer`) always pass `None`.
+    /// callers pass `None`.
     pub provider: Option<Arc<dyn nca_core::provider::Provider>>,
 }
 
@@ -119,12 +125,38 @@ fn terminal_result_summary(
     (!summary.is_empty()).then_some(summary)
 }
 
-/// Spawn a child session that inherits parent context and runs to completion.
-/// Returns the result of the child run. This is a blocking async call.
-pub async fn spawn_child_session(
+/// Everything `run_prepared_child` needs after the prepare phase: the
+/// built context prompt + images, registry/event handles for lifecycle
+/// folding, and the generation the run reports in
+/// `ChildSessionStatusChanged` events (0 for a fresh spawn; a revived child
+/// passes its bumped generation).
+pub struct PreparedChild {
+    pub child_id: String,
+    pub parent_session_id: String,
+    pub context_prompt: String,
+    pub images: Vec<ImageAttachment>,
+    pub generation: u64,
+    pub registry: Option<Arc<crate::subagent_registry::SubagentRegistry>>,
+    /// Event channel for terminal `ChildSessionStatusChanged` emissions
+    /// (clone of the parent's bounded channel).
+    pub terminal_tx: Option<mpsc::Sender<AgentEvent>>,
+}
+
+/// Phase 1 of a child spawn: everything up to (but not including) the
+/// first `run_turn` — routing config, image resolution,
+/// `Supervisor::create`, `ask_question` strip, parent linkage, worktree
+/// create+switch, spawn/running events, registry record (handles + alias +
+/// specialist + worktree path), and the built context prompt. Returns the
+/// live supervisor plus a [`PreparedChild`] for [`run_prepared_child`].
+///
+/// Split from the old monolithic `spawn_child_session` so a
+/// `background: true` spawn can reply IMMEDIATELY after this phase and run
+/// the turn detached (P2 §6: the oneshot is never held for the foreground
+/// 600s window).
+pub async fn prepare_child_session(
     cfg: ChildSessionConfig,
     event_tx: Option<tokio::sync::mpsc::Sender<AgentEvent>>,
-) -> Result<ChildSessionResult, String> {
+) -> Result<(Supervisor, PreparedChild), String> {
     // Child sessions are non-interactive and already authorized by the parent
     // approval. Elevate to BypassPermissions so sub-agents can write files,
     // run tools, and spawn their own children without being auto-denied.
@@ -244,6 +276,16 @@ pub async fn spawn_child_session(
             sup.branch.clone(),
         );
         registry.record_handles(&child_id, sup.cancel_handle(), sup.inbox_sender());
+        // `ChildSessionSpawned` has no alias/specialist/worktree fields —
+        // they are runtime-only entry state, set post-record. The alias
+        // rides the running `ChildSessionStatusChanged` event so the
+        // registry stays re-derivable from the event log at resume.
+        registry.set_alias(&child_id, cfg.alias.as_deref());
+        registry.set_specialist(&child_id, cfg.specialist.clone());
+        registry.set_worktree(
+            &child_id,
+            sup.worktree_path.as_ref().map(|p| p.display().to_string()),
+        );
         if let Some(ref tx) = event_tx {
             let _ = tx
                 .send(AgentEvent::ChildSessionStatusChanged {
@@ -251,7 +293,7 @@ pub async fn spawn_child_session(
                     child_session_id: child_id.clone(),
                     state: nca_common::session::ChildSessionState::Running,
                     generation: 0,
-                    alias: None,
+                    alias: cfg.alias.clone(),
                     result_summary: None,
                 })
                 .await;
@@ -270,12 +312,46 @@ pub async fn spawn_child_session(
         context_prompt.push_str(&note);
     }
 
+    Ok((
+        sup,
+        PreparedChild {
+            child_id,
+            parent_session_id: cfg.parent_session_id,
+            context_prompt,
+            images,
+            generation: 0,
+            registry: cfg.registry,
+            terminal_tx,
+        },
+    ))
+}
+
+/// Phase 2 of a child spawn: run the prepared first turn to a terminal
+/// state and fold the lifecycle transitions (registry + events + session
+/// json via the child's own `finish`). Returns the terminal result — errors
+/// are mapped into `status: "error"`/`"cancelled"`, never propagated.
+/// Used verbatim by the foreground path, the background (detached) path,
+/// and `task_revive` (with a bumped generation).
+pub async fn run_prepared_child(
+    mut sup: Supervisor,
+    prepared: PreparedChild,
+) -> ChildSessionResult {
+    let PreparedChild {
+        child_id,
+        parent_session_id,
+        context_prompt,
+        images,
+        generation,
+        registry,
+        terminal_tx,
+    } = prepared;
+
     let mut handle = sup.take_handle();
     let event_rx = handle.take_event_rx();
     let log_path = handle.event_log_path.clone();
 
     let commit_tx = handle.take_turn_commit_tx().map(|(tx, _flag)| tx);
-    let parent_forward = event_tx.map(|tx| (child_id.clone(), tx));
+    let parent_forward = terminal_tx.clone().map(|tx| (child_id.clone(), tx));
     let mut fanout =
         event_rx.map(|rx| spawn_event_fanout(rx, log_path, None, None, parent_forward, commit_tx));
 
@@ -311,34 +387,6 @@ pub async fn spawn_child_session(
         }
     };
 
-    // P1 read-only introspection + P2 cancel bookkeeping: fold the terminal
-    // transition into the parent's registry (bounded summary — a cancelled
-    // task folds its recorded reason into "cancelled: <reason>"; live
-    // handles + the spent reason are cleared inside `record_terminal`) and
-    // emit the matching `ChildSessionStatusChanged` before the drain — same
-    // event channel the spawn events used. Foreground reply behavior is
-    // unchanged.
-    if let Some(ref registry) = cfg.registry {
-        let state = nca_common::session::ChildSessionState::from_spawn_status(&status);
-        let cancel_reason = registry
-            .get(&child_id)
-            .and_then(|entry| entry.cancel_reason.clone());
-        let result_summary = terminal_result_summary(&status, &output, cancel_reason.as_deref());
-        registry.record_terminal(&child_id, state, result_summary.clone());
-        if let Some(ref tx) = terminal_tx {
-            let _ = tx
-                .send(AgentEvent::ChildSessionStatusChanged {
-                    parent_session_id: cfg.parent_session_id.clone(),
-                    child_session_id: child_id.clone(),
-                    state,
-                    generation: 0,
-                    alias: None,
-                    result_summary,
-                })
-                .await;
-        }
-    }
-
     // Snapshot meta BEFORE dropping the supervisor: `switch_to_worktree`
     // mutates `sup.workspace_root` (supervisor.rs) and the result reads it,
     // while `drop(sup)` moves `sup` out of reach.
@@ -355,14 +403,263 @@ pub async fn spawn_child_session(
         crate::session_utils::drain_event_fanout(f, "child session").await;
     }
 
-    Ok(ChildSessionResult {
+    // P1 read-only introspection + P2 cancel bookkeeping: fold the terminal
+    // transition into the parent's registry (bounded summary — a cancelled
+    // task folds its recorded reason into "cancelled: <reason>"; live
+    // handles + the spent reason are cleared inside `record_terminal`) and
+    // emit the matching `ChildSessionStatusChanged`. This runs AFTER the
+    // drain so "registry says terminal" implies "child fully drained" —
+    // `task_revive` polls exactly that state before resuming the child's
+    // session json/event log, and resuming mid-drain could read a truncated
+    // replay projection.
+    if let Some(ref registry) = registry {
+        let state = nca_common::session::ChildSessionState::from_spawn_status(&status);
+        let cancel_reason = registry
+            .get(&child_id)
+            .and_then(|entry| entry.cancel_reason.clone());
+        let result_summary = terminal_result_summary(&status, &output, cancel_reason.as_deref());
+        registry.record_terminal(&child_id, state, result_summary.clone());
+        if let Some(ref tx) = terminal_tx {
+            let _ = tx
+                .send(AgentEvent::ChildSessionStatusChanged {
+                    parent_session_id: parent_session_id.clone(),
+                    child_session_id: child_id.clone(),
+                    state,
+                    generation,
+                    alias: registry.get(&child_id).and_then(|e| e.alias),
+                    result_summary,
+                })
+                .await;
+        }
+    }
+
+    ChildSessionResult {
         child_session_id: child_id,
         status,
         output,
         workspace: workspace_root,
         branch,
         worktree_path: wt_path,
-    })
+    }
+}
+
+/// Spawn a child session that inherits parent context and runs to completion.
+/// Returns the result of the child run. This is a blocking async call —
+/// the foreground composition of [`prepare_child_session`] +
+/// [`run_prepared_child`] (P2 chunk C split; behavior unchanged).
+pub async fn spawn_child_session(
+    cfg: ChildSessionConfig,
+    event_tx: Option<tokio::sync::mpsc::Sender<AgentEvent>>,
+) -> Result<ChildSessionResult, String> {
+    let (sup, prepared) = prepare_child_session(cfg, event_tx).await?;
+    Ok(run_prepared_child(sup, prepared).await)
+}
+
+/// Execute a `task_revive` request (P2 C2, §3 "task_revive"): resume a
+/// terminal child in its retained session + worktree with a new prompt and
+/// run that turn to a new terminal state, bumping the generation.
+///
+/// Order of operations (port of upstream `task-revive.ts`):
+/// 1. resolve id/alias → unknown/ambiguous error reply;
+/// 2. acquire the control lease for the WHOLE cancel-then-run sequence
+///    (a concurrent cancel/revive reports "in flight" instead);
+/// 3. a still-`Running` target is cancelled first (cooperative flag flip)
+///    and awaited to terminal — bounded 30s;
+/// 4. `Supervisor::resume` folds the child's own json + event log (the
+///    single writer of that json is the child's own supervisor — this new
+///    instance replaces the finished one), re-attaches the retained
+///    worktree, and `ask_question` is stripped like any child;
+/// 5. `record_revive` (state=Running, generation+=1) + fresh handles +
+///    running `ChildSessionStatusChanged`;
+/// 6. the new turn runs through [`run_prepared_child`] with the bumped
+///    generation (same terminal mapping as a spawn).
+///
+/// `provider` is a test seam (used verbatim by the resumed supervisor,
+/// mirroring `SupervisorConfig::provider`); production callers pass `None`.
+/// Runs LONG — the control consumer invokes it on its own tokio task so
+/// its loop keeps serving status/result/message/cancel meanwhile; the
+/// reply rides the request's oneshot from inside that task.
+pub async fn handle_revive_request(
+    registry: Arc<crate::subagent_registry::SubagentRegistry>,
+    config: NcaConfig,
+    workspace_root: PathBuf,
+    event_tx: Option<tokio::sync::mpsc::Sender<AgentEvent>>,
+    provider: Option<Arc<dyn nca_core::provider::Provider>>,
+    session_id: String,
+    prompt: String,
+) -> nca_core::tools::subagent_control::SubagentControlResponse {
+    use nca_common::session::ChildSessionState;
+    use nca_core::tools::subagent_control::SubagentControlResponse;
+
+    let entry = match registry.resolve(&session_id) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => {
+            return SubagentControlResponse::unknown(&session_id, "unknown subagent task id");
+        }
+        Err(message) => return SubagentControlResponse::unknown(&session_id, message),
+    };
+    let child_id = entry.session_id.clone();
+    let base =
+        |state, note: Option<String>, ok: bool, error: Option<String>| SubagentControlResponse {
+            session_id: child_id.clone(),
+            state,
+            task: None,
+            workspace: None,
+            branch: None,
+            result_summary: None,
+            output: None,
+            note,
+            ok,
+            error_message: error,
+            generation: None,
+        };
+
+    // The lease is held for the WHOLE revive (cancel-wait + resume + run):
+    // a concurrent cancel/revive must not interleave with this sequence.
+    let Some(_lease) = registry.try_acquire_lease(&child_id) else {
+        return base(
+            entry.state,
+            Some("another control operation is in flight for this task".into()),
+            false,
+            None,
+        );
+    };
+
+    // A still-running target is cancelled first and awaited to terminal —
+    // revive never runs a second supervisor for a live child.
+    if entry.state == ChildSessionState::Running {
+        if let Some(flag) = entry.cancel_flag.as_ref() {
+            flag.store(true, Ordering::SeqCst);
+            // Fold a reason so the old child's terminal summary reads as a
+            // revive-triggered cancel (mirrors task_cancel bookkeeping).
+            registry.record_cancel_requested(&child_id, Some("revive".into()));
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let terminal = registry
+                .get(&child_id)
+                .map(|e| e.state.is_terminal())
+                .unwrap_or(false);
+            if terminal {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return base(
+                    ChildSessionState::Running,
+                    Some("cancel before revive did not complete in 30s".into()),
+                    false,
+                    None,
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    // Rebuild the child config exactly like the spawn path: children run
+    // BypassPermissions with the same routing treatment (specialist profile
+    // authoritative; meta.agent_name re-applies the persona inside resume).
+    let mut child_config = config;
+    child_config.permissions.mode = nca_common::config::PermissionMode::BypassPermissions;
+    apply_child_routing(&mut child_config, entry.specialist.as_deref(), None, None);
+
+    let mut sup = match Supervisor::resume(
+        child_config,
+        &workspace_root,
+        false,
+        false,
+        &child_id,
+        Some(Arc::new(AutoDenyHandler) as Arc<dyn ApprovalHandler>),
+        provider,
+    )
+    .await
+    {
+        Ok(sup) => sup,
+        Err(e) => {
+            // Registry stays terminal — no zombie Running entry.
+            return base(
+                entry.state,
+                None,
+                false,
+                Some(format!("failed to resume child session: {e}")),
+            );
+        }
+    };
+
+    // Child sessions are non-interactive: strip ask_question (same rationale
+    // as the spawn path — a child question nobody can answer would hang the
+    // revive forever).
+    sup.agent_mut().tools.unregister("ask_question");
+
+    // The retained worktree: `Supervisor::resume` restores the worktree
+    // FIELDS from the child's meta but NOT the fs/pty cwd (pinned by
+    // `resume_restores_worktree_fields_but_not_fs_root`) — switch
+    // explicitly so the revived child's file tools + shell run inside the
+    // retained worktree. Cancel never deleted it; revive reuses it as-is.
+    if let Some(worktree_path) = sup.worktree_path.clone() {
+        let branch = sup.branch.clone().unwrap_or_default();
+        let base_branch = sup.base_branch.clone().unwrap_or_default();
+        sup.switch_to_worktree(worktree_path, branch, base_branch);
+    }
+
+    let Some(generation) = registry.record_revive(&child_id) else {
+        return SubagentControlResponse::unknown(&child_id, "unknown subagent task id");
+    };
+    registry.record_handles(&child_id, sup.cancel_handle(), sup.inbox_sender());
+    if let Some(ref tx) = event_tx {
+        let _ = tx
+            .send(AgentEvent::ChildSessionStatusChanged {
+                parent_session_id: entry.parent_session_id.clone(),
+                child_session_id: child_id.clone(),
+                state: ChildSessionState::Running,
+                generation,
+                alias: entry.alias.clone(),
+                result_summary: None,
+            })
+            .await;
+    }
+
+    let result = run_prepared_child(
+        sup,
+        PreparedChild {
+            child_id: child_id.clone(),
+            parent_session_id: entry.parent_session_id.clone(),
+            context_prompt: prompt,
+            images: Vec::new(),
+            generation,
+            registry: Some(registry.clone()),
+            terminal_tx: event_tx.clone(),
+        },
+    )
+    .await;
+
+    // Lineage event for the resumed run (same channel the spawn path uses —
+    // folded into the parent meta at resume).
+    if let Some(ref tx) = event_tx {
+        let _ = tx
+            .send(AgentEvent::ChildSessionCompleted {
+                parent_session_id: entry.parent_session_id.clone(),
+                child_session_id: child_id.clone(),
+                status: result.status.clone(),
+            })
+            .await;
+    }
+
+    let state = ChildSessionState::from_spawn_status(&result.status);
+    SubagentControlResponse {
+        session_id: child_id.clone(),
+        state,
+        task: None,
+        workspace: Some(result.workspace),
+        branch: result.branch,
+        result_summary: registry.get(&child_id).and_then(|e| e.result_summary),
+        output: Some(result.output),
+        note: Some(format!(
+            "revived task (generation {generation}) ran to a new terminal state"
+        )),
+        ok: true,
+        error_message: None,
+        generation: Some(generation),
+    }
 }
 
 /// Build the child's first user message: parent context, task, focus files.
@@ -600,6 +897,9 @@ fn apply_child_routing(
 /// and runs child sessions. Each child session inherits parent context — both
 /// the text summary and any images are taken from the live `parent_history`
 /// mirror at spawn time, never from a wiring-time snapshot.
+///
+/// `child_provider` is a test seam (injected verbatim into every child,
+/// mirroring `SupervisorConfig::provider`); production callers pass `None`.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_subagent_consumer(
     mut spawn_rx: mpsc::Receiver<SpawnRequest>,
@@ -610,6 +910,7 @@ pub fn spawn_subagent_consumer(
     event_tx: Option<tokio::sync::mpsc::Sender<AgentEvent>>,
     registry: std::sync::Arc<crate::subagent_registry::SubagentRegistry>,
     parent_fs: Arc<dyn WorkspaceFs>,
+    child_provider: Option<Arc<dyn nca_core::provider::Provider>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(req) = spawn_rx.recv().await {
@@ -626,6 +927,7 @@ pub fn spawn_subagent_consumer(
             }
             let event_tx = event_tx.clone();
             let registry = registry.clone();
+            let child_provider = child_provider.clone();
 
             // Summary of the parent conversation as of THIS spawn (the
             // supervisor refreshes the mirror at each turn start), so a child
@@ -648,8 +950,9 @@ pub fn spawn_subagent_consumer(
                 provider_override: req.provider_override,
                 model_override: req.model_override.clone(),
                 specialist: req.specialist.clone(),
+                alias: req.alias.clone(),
                 registry: Some(registry.clone()),
-                provider: None,
+                provider: child_provider,
             };
 
             tokio::spawn(async move {
@@ -670,45 +973,7 @@ pub fn spawn_subagent_consumer(
                         )
                         .await;
                 }
-                let result = spawn_child_session(child_cfg, event_tx.clone()).await;
-                match result {
-                    Ok(res) => {
-                        // Lineage is recorded via ChildSessionSpawned on the
-                        // parent's event channel (folded into meta at resume —
-                        // P2 Phase C §3); no direct parent-json write here.
-                        if let Some(ref tx) = event_tx {
-                            let _ = tx
-                                .send(AgentEvent::ChildSessionCompleted {
-                                    parent_session_id: parent_session_id.clone(),
-                                    child_session_id: res.child_session_id.clone(),
-                                    status: res.status.clone(),
-                                })
-                                .await;
-                        }
-                        if let Some(hooks) = &hook_runner {
-                            hooks
-                                .run_best_effort(
-                                    HookEventKind::SubagentStop,
-                                    None,
-                                    &json!({
-                                        "parent_session_id": parent_session_id.clone(),
-                                        "child_session_id": res.child_session_id.clone(),
-                                        "status": res.status.clone(),
-                                        "workspace": res.workspace.clone(),
-                                    }),
-                                )
-                                .await;
-                        }
-                        let response = nca_core::tools::spawn_subagent::SpawnResponse {
-                            child_session_id: res.child_session_id,
-                            status: res.status,
-                            output: res.output,
-                            workspace: res.workspace,
-                            branch: res.branch,
-                            worktree_path: res.worktree_path,
-                        };
-                        let _ = req.reply.send(response);
-                    }
+                match prepare_child_session(child_cfg, event_tx.clone()).await {
                     Err(e) => {
                         if let Some(hooks) = &hook_runner {
                             hooks
@@ -741,10 +1006,104 @@ pub fn spawn_subagent_consumer(
                         };
                         let _ = req.reply.send(response);
                     }
+                    Ok((sup, prepared)) => {
+                        if req.background {
+                            // §6 invariant ("600s timeout interplay"): answer
+                            // the oneshot IMMEDIATELY after prepare — the
+                            // reply channel is consumed HERE and the
+                            // detached run below must never send again.
+                            // The parent turn ends now; the final output is
+                            // fetched later via `task_result`.
+                            let response = nca_core::tools::spawn_subagent::SpawnResponse {
+                                child_session_id: prepared.child_id.clone(),
+                                status: "running".into(),
+                                output: String::new(),
+                                workspace: sup.workspace_root.display().to_string(),
+                                branch: sup.branch.clone(),
+                                worktree_path: sup
+                                    .worktree_path
+                                    .as_ref()
+                                    .map(|p| p.display().to_string()),
+                            };
+                            let _ = req.reply.send(response);
+                            let parent = parent_session_id.clone();
+                            let tx = event_tx.clone();
+                            let hooks = hook_runner.clone();
+                            tokio::spawn(async move {
+                                let result = run_prepared_child(sup, prepared).await;
+                                complete_child_request(
+                                    &result,
+                                    &parent,
+                                    tx.as_ref(),
+                                    hooks.as_ref(),
+                                )
+                                .await;
+                            });
+                        } else {
+                            // Foreground: unchanged synchronous contract —
+                            // await the child, then reply with its terminal
+                            // output (the 600s window lives in the tool).
+                            let result = run_prepared_child(sup, prepared).await;
+                            complete_child_request(
+                                &result,
+                                &parent_session_id,
+                                event_tx.as_ref(),
+                                hook_runner.as_ref(),
+                            )
+                            .await;
+                            let response = nca_core::tools::spawn_subagent::SpawnResponse {
+                                child_session_id: result.child_session_id,
+                                status: result.status,
+                                output: result.output,
+                                workspace: result.workspace,
+                                branch: result.branch,
+                                worktree_path: result.worktree_path,
+                            };
+                            let _ = req.reply.send(response);
+                        }
+                    }
                 }
             });
         }
     })
+}
+
+/// Post-run bookkeeping shared by the foreground and background (detached)
+/// child paths: the `ChildSessionCompleted` lineage event on the parent's
+/// channel + `SubagentStop` hooks. The reply itself is the caller's concern
+/// (foreground replies after this; background already replied at spawn).
+async fn complete_child_request(
+    result: &ChildSessionResult,
+    parent_session_id: &str,
+    event_tx: Option<&tokio::sync::mpsc::Sender<AgentEvent>>,
+    hook_runner: Option<&HookRunner>,
+) {
+    // Lineage is recorded via ChildSessionSpawned/Completed on the parent's
+    // event channel (folded into meta at resume — P2 Phase C §3); no direct
+    // parent-json write here.
+    if let Some(tx) = event_tx {
+        let _ = tx
+            .send(AgentEvent::ChildSessionCompleted {
+                parent_session_id: parent_session_id.to_string(),
+                child_session_id: result.child_session_id.clone(),
+                status: result.status.clone(),
+            })
+            .await;
+    }
+    if let Some(hooks) = hook_runner {
+        hooks
+            .run_best_effort(
+                HookEventKind::SubagentStop,
+                None,
+                &json!({
+                    "parent_session_id": parent_session_id,
+                    "child_session_id": result.child_session_id,
+                    "status": result.status,
+                    "workspace": result.workspace,
+                }),
+            )
+            .await;
+    }
 }
 
 #[cfg(test)]

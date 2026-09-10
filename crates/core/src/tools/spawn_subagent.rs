@@ -120,7 +120,7 @@ impl ToolExecutor for SpawnSubagentTool {
                     },
                     "background": {
                         "type": "boolean",
-                        "description": "Return immediately with the child session id while the task runs detached — the result is fetched later via task_result. Defaults to false (waits for the child to finish)."
+                        "description": "Return immediately with the child session id while the task runs detached — the result is fetched later via task_result. Defaults to false (the call then waits synchronously for the child, up to the 600s tool timeout)."
                     },
                     "alias": {
                         "type": "string",

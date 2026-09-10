@@ -957,6 +957,7 @@ async fn run_one_shot(
                 event_tx,
                 runtime.subagent_registry(),
                 runtime.fs(),
+                None,
             )
         });
 
