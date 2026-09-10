@@ -223,6 +223,27 @@ impl SubagentRegistry {
         entry.cancel_reason = None;
     }
 
+    /// Fold a revive transition: the entry flips back to `Running` with a
+    /// bumped `generation` and a clean slate — the old `result_summary`/
+    /// `cancel_reason` are spent, live handles were already cleared by the
+    /// terminal fold and are re-recorded by the caller right after the
+    /// resumed supervisor exists. Returns the new generation, or `None`
+    /// for ids the registry does not track.
+    ///
+    /// Alias, specialist, and worktree path SURVIVE — revive reuses the
+    /// retained worktree and keeps addressing the task by its alias.
+    pub fn record_revive(&self, child_session_id: &str) -> Option<u64> {
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = entries
+            .iter_mut()
+            .find(|e| e.session_id == child_session_id)?;
+        entry.state = ChildSessionState::Running;
+        entry.generation += 1;
+        entry.result_summary = None;
+        entry.cancel_reason = None;
+        Some(entry.generation)
+    }
+
     /// Apply one event-log envelope: `ChildSessionSpawned` records the
     /// spawn, `ChildSessionStatusChanged` updates tracked fields, and
     /// `ChildSessionCompleted` folds the terminal state (without
@@ -405,18 +426,8 @@ fn response_from_state(session_id: &str, state: &SessionState) -> SubagentContro
     }
 }
 
-/// Placeholder reply for P2 write-side operations (`Message`/`Cancel`/
-/// `Revive`): the wire types land in chunk A, but executing them needs the
-/// control lease (chunk B/C) — fail loudly instead of pretending success.
-fn operation_not_available(session_id: &str) -> SubagentControlResponse {
-    SubagentControlResponse::unknown(
-        session_id,
-        "task control operation is not available in this build",
-    )
-}
-
 /// Consume control requests (`task_status`/`task_result`/`task_message`/
-/// `task_cancel`, and the chunk-C `task_revive` stub) against the registry,
+/// `task_cancel`/`task_revive`) against the registry,
 /// with a read-only `SessionStore::load` fallback for ids the registry
 /// never saw (e.g. spawned before this process started). Spawned by
 /// `Supervisor::create`; replies ride per-request oneshot channels.
@@ -431,6 +442,8 @@ pub fn subagent_control_consumer(
     mut control_rx: mpsc::Receiver<SubagentControlRequest>,
     registry: Arc<SubagentRegistry>,
     session_store: SessionStore,
+    config: nca_common::config::NcaConfig,
+    workspace_root: std::path::PathBuf,
     event_tx: Option<mpsc::Sender<AgentEvent>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -523,13 +536,34 @@ pub fn subagent_control_consumer(
                     let response = handle_cancel_request(&registry, &session_id, reason).await;
                     let _ = reply.send(response);
                 }
-                // P2 chunk A/C placeholder: `task_revive` needs the resume +
-                // worktree-reuse path (chunk C); until then it fails loudly
-                // (never silently succeeds against a live child).
+                // P2 C2: `task_revive` runs LONG (cancel-wait + resume + a
+                // full child turn) — execute it on its own tokio task so
+                // this loop keeps serving status/result/message/cancel;
+                // the reply rides the request's oneshot from inside that
+                // task. The lease is held for the whole sequence inside
+                // `handle_revive_request`.
                 SubagentControlRequest::Revive {
-                    session_id, reply, ..
+                    session_id,
+                    prompt,
+                    reply,
                 } => {
-                    let _ = reply.send(operation_not_available(&session_id));
+                    let registry = Arc::clone(&registry);
+                    let config = config.clone();
+                    let workspace_root = workspace_root.clone();
+                    let event_tx = event_tx.clone();
+                    tokio::spawn(async move {
+                        let response = crate::subagent::handle_revive_request(
+                            registry,
+                            config,
+                            workspace_root,
+                            event_tx,
+                            None,
+                            session_id,
+                            prompt,
+                        )
+                        .await;
+                        let _ = reply.send(response);
+                    });
                 }
             }
         }
@@ -719,6 +753,7 @@ async fn build_result_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nca_common::config::NcaConfig;
     use nca_common::event::EventEnvelope;
     use nca_common::message::Message;
     use nca_common::session::{SessionMeta, SessionStatus};
@@ -1011,6 +1046,61 @@ mod tests {
     }
 
     #[test]
+    fn record_revive_bumps_generation_and_resets_terminal_fields() {
+        // P2 C2: revive flips a terminal entry back to Running with a
+        // bumped generation and a clean slate — the old summary/reason are
+        // spent, and fresh handles arrive right after via record_handles.
+        let registry = SubagentRegistry::new();
+        registry.record_spawned("p", "c1", "t", "/ws".into(), None);
+        registry.set_alias("c1", Some("fixer-x"));
+        registry.set_worktree("c1", Some("/ws/.nca/worktrees/c1".into()));
+        registry.set_specialist("c1", Some("fixer".into()));
+        registry.record_cancel_requested("c1", Some("wrong branch".into()));
+        registry.record_terminal(
+            "c1",
+            ChildSessionState::Cancelled,
+            Some("cancelled: wrong branch".into()),
+        );
+
+        let generation = registry.record_revive("c1").expect("revive generation");
+        assert_eq!(generation, 1, "first revive bumps 0 → 1");
+        let entry = registry.get("c1").expect("entry");
+        assert_eq!(entry.state, ChildSessionState::Running);
+        assert_eq!(entry.generation, 1);
+        assert_eq!(entry.result_summary, None, "old summary is spent");
+        assert_eq!(entry.cancel_reason, None);
+        assert_eq!(entry.alias.as_deref(), Some("fixer-x"), "alias survives");
+        assert_eq!(entry.specialist.as_deref(), Some("fixer"));
+        assert_eq!(
+            entry.worktree_path.as_deref(),
+            Some("/ws/.nca/worktrees/c1")
+        );
+
+        let generation = registry.record_revive("c1").expect("second revive");
+        assert_eq!(generation, 2, "generation keeps counting up");
+        assert_eq!(registry.get("c1").expect("entry").generation, 2);
+    }
+
+    #[test]
+    fn record_revive_unknown_id_is_none() {
+        let registry = SubagentRegistry::new();
+        assert!(registry.record_revive("ghost").is_none());
+    }
+
+    #[test]
+    fn setters_ignore_unknown_ids_and_blank_alias() {
+        let registry = SubagentRegistry::new();
+        registry.set_alias("ghost", Some("x"));
+        registry.set_worktree("ghost", Some("/wt".into()));
+        registry.set_specialist("ghost", Some("fixer".into()));
+        assert!(registry.get("ghost").is_none(), "no entry is created");
+
+        registry.record_spawned("p", "c1", "t", "/ws".into(), None);
+        registry.set_alias("c1", Some("   "));
+        assert_eq!(registry.get("c1").expect("entry").alias, None);
+    }
+
+    #[test]
     fn resolve_ambiguous_alias_errors_with_count() {
         let registry = SubagentRegistry::new();
         registry.record_spawned("p", "c1", "t", "/ws".into(), None);
@@ -1149,7 +1239,14 @@ mod tests {
         // Store with no sessions: unknown ids must fail through it.
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SessionStore::new(dir.path());
-        let _consumer = subagent_control_consumer(rx, registry, store, None);
+        let _consumer = subagent_control_consumer(
+            rx,
+            registry,
+            store,
+            NcaConfig::default(),
+            std::path::PathBuf::from("/tmp/nca-registry-test-ws"),
+            None,
+        );
 
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(SubagentControlRequest::Status {
@@ -1191,7 +1288,14 @@ mod tests {
 
         let (tx, rx) = mpsc::channel(4);
         let registry = Arc::new(SubagentRegistry::new());
-        let _consumer = subagent_control_consumer(rx, registry, store, None);
+        let _consumer = subagent_control_consumer(
+            rx,
+            registry,
+            store,
+            NcaConfig::default(),
+            std::path::PathBuf::from("/tmp/nca-registry-test-ws"),
+            None,
+        );
 
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(SubagentControlRequest::Status {
@@ -1225,7 +1329,14 @@ mod tests {
         // Terminal entry pointing at the saved json.
         registry.record_spawned("p", "c1", "t", "/ws".into(), None);
         registry.record_terminal("c1", ChildSessionState::Completed, Some("ok".into()));
-        let _consumer = subagent_control_consumer(rx, registry, store, None);
+        let _consumer = subagent_control_consumer(
+            rx,
+            registry,
+            store,
+            NcaConfig::default(),
+            std::path::PathBuf::from("/tmp/nca-registry-test-ws"),
+            None,
+        );
 
         // Running → note, no output.
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -1268,20 +1379,25 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn control_consumer_revive_replies_not_available_yet() {
-        // P2 chunk A/B: the Revive wire type exists and Message/Cancel are
-        // executed by the consumer, but revive lands in chunk C — it must
-        // fail loudly instead of pretending success against a live child.
+    async fn control_consumer_revive_unknown_id_is_unknown() {
+        // P2 C2: revive is live in the consumer — an unknown id replies
+        // unknown (the stub "not available" arm is gone).
         let (tx, rx) = mpsc::channel(8);
         let registry = Arc::new(SubagentRegistry::new());
-        registry.record_spawned("p", "c1", "t", "/ws".into(), None);
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SessionStore::new(dir.path());
-        let _consumer = subagent_control_consumer(rx, registry, store, None);
+        let _consumer = subagent_control_consumer(
+            rx,
+            registry,
+            store,
+            NcaConfig::default(),
+            std::path::PathBuf::from("/tmp/nca-registry-test-ws"),
+            None,
+        );
 
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(SubagentControlRequest::Revive {
-            session_id: "c1".into(),
+            session_id: "ghost".into(),
             prompt: "finish the tests".into(),
             reply: reply_tx,
         })
@@ -1289,10 +1405,9 @@ mod tests {
         .expect("send");
         let resp = reply_rx.await.expect("reply");
         assert!(!resp.ok);
-        assert_eq!(resp.session_id, "c1");
         assert_eq!(
             resp.error_message.as_deref(),
-            Some("task control operation is not available in this build")
+            Some("unknown subagent task id")
         );
     }
 
@@ -1354,7 +1469,14 @@ mod tests {
         let (_flag, mut inbox_rx) = running_child_with_inbox(&registry, "c1", 16);
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SessionStore::new(dir.path());
-        let _consumer = subagent_control_consumer(rx, registry.clone(), store, Some(event_tx));
+        let _consumer = subagent_control_consumer(
+            rx,
+            registry.clone(),
+            store,
+            NcaConfig::default(),
+            std::path::PathBuf::from("/tmp/nca-registry-test-ws"),
+            Some(event_tx),
+        );
 
         let resp = send_message(&tx, "c1", "pivot to tests").await;
         assert!(resp.ok, "steering to a running child must be accepted");
@@ -1392,7 +1514,14 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SessionStore::new(dir.path());
-        let _consumer = subagent_control_consumer(rx, registry, store, Some(event_tx));
+        let _consumer = subagent_control_consumer(
+            rx,
+            registry,
+            store,
+            NcaConfig::default(),
+            std::path::PathBuf::from("/tmp/nca-registry-test-ws"),
+            Some(event_tx),
+        );
 
         let resp = send_message(&tx, "c1", "steer").await;
         assert!(!resp.ok);
@@ -1421,7 +1550,14 @@ mod tests {
             .expect("pre-fill");
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SessionStore::new(dir.path());
-        let _consumer = subagent_control_consumer(rx, registry, store, None);
+        let _consumer = subagent_control_consumer(
+            rx,
+            registry,
+            store,
+            NcaConfig::default(),
+            std::path::PathBuf::from("/tmp/nca-registry-test-ws"),
+            None,
+        );
 
         let resp = send_message(&tx, "c1", "overflow").await;
         assert!(!resp.ok);
@@ -1442,7 +1578,14 @@ mod tests {
         drop(inbox_rx);
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SessionStore::new(dir.path());
-        let _consumer = subagent_control_consumer(rx, registry, store, None);
+        let _consumer = subagent_control_consumer(
+            rx,
+            registry,
+            store,
+            NcaConfig::default(),
+            std::path::PathBuf::from("/tmp/nca-registry-test-ws"),
+            None,
+        );
 
         let resp = send_message(&tx, "c1", "steer").await;
         assert!(!resp.ok);
@@ -1455,7 +1598,14 @@ mod tests {
         let registry = Arc::new(SubagentRegistry::new());
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SessionStore::new(dir.path());
-        let _consumer = subagent_control_consumer(rx, registry, store, None);
+        let _consumer = subagent_control_consumer(
+            rx,
+            registry,
+            store,
+            NcaConfig::default(),
+            std::path::PathBuf::from("/tmp/nca-registry-test-ws"),
+            None,
+        );
 
         let resp = send_message(&tx, "ghost", "steer").await;
         assert!(!resp.ok);
@@ -1472,7 +1622,14 @@ mod tests {
         let (flag, _inbox_rx) = running_child_with_inbox(&registry, "c1", 16);
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SessionStore::new(dir.path());
-        let _consumer = subagent_control_consumer(rx, registry.clone(), store, None);
+        let _consumer = subagent_control_consumer(
+            rx,
+            registry.clone(),
+            store,
+            NcaConfig::default(),
+            std::path::PathBuf::from("/tmp/nca-registry-test-ws"),
+            None,
+        );
 
         let resp = send_cancel(&tx, "c1", Some("wrong branch")).await;
         assert!(resp.ok, "cancel of a running child must be accepted");
@@ -1505,7 +1662,14 @@ mod tests {
         registry.record_terminal("c1", ChildSessionState::Cancelled, Some("cancelled".into()));
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SessionStore::new(dir.path());
-        let _consumer = subagent_control_consumer(rx, registry, store, None);
+        let _consumer = subagent_control_consumer(
+            rx,
+            registry,
+            store,
+            NcaConfig::default(),
+            std::path::PathBuf::from("/tmp/nca-registry-test-ws"),
+            None,
+        );
 
         let resp = send_cancel(&tx, "c1", None).await;
         assert!(!resp.ok);
@@ -1519,7 +1683,14 @@ mod tests {
         let registry = Arc::new(SubagentRegistry::new());
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SessionStore::new(dir.path());
-        let _consumer = subagent_control_consumer(rx, registry, store, None);
+        let _consumer = subagent_control_consumer(
+            rx,
+            registry,
+            store,
+            NcaConfig::default(),
+            std::path::PathBuf::from("/tmp/nca-registry-test-ws"),
+            None,
+        );
 
         let resp = send_cancel(&tx, "ghost", None).await;
         assert!(!resp.ok);
@@ -1536,7 +1707,14 @@ mod tests {
         let (flag, _inbox_rx) = running_child_with_inbox(&registry, "c1", 16);
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SessionStore::new(dir.path());
-        let _consumer = subagent_control_consumer(rx, registry.clone(), store, None);
+        let _consumer = subagent_control_consumer(
+            rx,
+            registry.clone(),
+            store,
+            NcaConfig::default(),
+            std::path::PathBuf::from("/tmp/nca-registry-test-ws"),
+            None,
+        );
 
         // Hold the lease externally (simulating an in-flight control op):
         // the cancel must be refused, and must NOT touch the flag.

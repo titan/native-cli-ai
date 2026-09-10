@@ -145,6 +145,8 @@ async fn cancel_mid_turn_ends_child_cancelled_and_retains_worktree() {
         control_rx,
         registry.clone(),
         SessionStore::new(sessions_dir.clone()),
+        offline_config(),
+        ws.path().to_path_buf(),
         Some(parent_tx.clone()),
     );
     let store = SessionStore::new(sessions_dir);

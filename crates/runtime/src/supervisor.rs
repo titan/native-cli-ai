@@ -615,15 +615,19 @@ impl Supervisor {
         let session_store = SessionStore::new(workspace_root.join(&config.session.history_dir));
 
         // Control consumer answers task_status/task_result/task_message/
-        // task_cancel against the registry + a read-only store handle (never
-        // saves — single-writer invariant, `docs/subagent-task-lifecycle.md`
-        // §6). `ChildMessageQueued` envelopes ride the session's own bounded
-        // event channel.
+        // task_cancel/task_revive against the registry + a read-only store
+        // handle (never saves — single-writer invariant,
+        // `docs/subagent-task-lifecycle.md` §6). `ChildMessageQueued`
+        // envelopes ride the session's own bounded event channel. Revive
+        // additionally needs the parent config + workspace root to rebuild
+        // the child (resume), so they ride along here.
         if let Some(control_rx) = subagent_control_rx.take() {
             tokio::spawn(subagent_control_consumer(
                 control_rx,
                 Arc::clone(&registry),
                 SessionStore::new(workspace_root.join(&config.session.history_dir)),
+                config.clone(),
+                workspace_root.clone(),
                 Some(event_tx.clone()),
             ));
         }
@@ -2044,6 +2048,81 @@ pub(crate) fn should_overflow_retry(err: &ProviderError, already_retried: bool) 
 mod tests {
     use super::*;
     use nca_common::session::ChildSessionState;
+
+    /// Offline default config for supervisor construction in tests (mirrors
+    /// the integration suites' `offline_config`).
+    async fn offline_supervisor(root: &Path) -> Supervisor {
+        let mut config = NcaConfig::default();
+        config.provider.deepseek.api_key = Some("test-key".into());
+        config.permissions.mode = nca_common::config::PermissionMode::BypassPermissions;
+        config.memory.context.auto_detect_context_window = false;
+        config.memory.context.query_provider_models_api = false;
+        config.memory.context.enable_auto_summarize = false;
+        Supervisor::create(SupervisorConfig {
+            config,
+            workspace_root: root.to_path_buf(),
+            safe_mode: false,
+            interactive_approvals: false,
+            session_id: Some("pin-resume-worktree".into()),
+            approval_handler: None,
+            orchestration_context: None,
+            agent_name: None,
+            provider: None,
+        })
+        .await
+        .expect("offline supervisor")
+    }
+
+    /// P2 C2 finding, pinned: `Supervisor::resume` restores the worktree
+    /// FIELDS (`workspace_root`/`worktree_path`/`branch`/`base_branch` from
+    /// the child's own meta) but does NOT re-root the filesystem adapter or
+    /// PTY manager — `fs.root()` stays the caller's root until an explicit
+    /// `switch_to_worktree`. Any revive-style resume MUST therefore call
+    /// `switch_to_worktree` explicitly, or the revived child's file tools
+    /// and shell commands silently run in the PARENT workspace.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_restores_worktree_fields_but_not_fs_root() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        let wt = tempfile::tempdir().expect("worktree tempdir");
+        let wt_path = wt.path().canonicalize().expect("canonicalize wt");
+
+        let mut sup = offline_supervisor(ws.path()).await;
+        sup.set_worktree_info(wt_path.clone(), "nca/pin".into(), "main".into());
+        sup.save().await.expect("persist meta with worktree info");
+        drop(sup);
+
+        let mut config = NcaConfig::default();
+        config.provider.deepseek.api_key = Some("test-key".into());
+        let mut resumed = Supervisor::resume(
+            config,
+            ws.path(),
+            false,
+            false,
+            "pin-resume-worktree",
+            None,
+            None,
+        )
+        .await
+        .expect("resume");
+
+        // Fields restored from meta…
+        assert_eq!(resumed.worktree_path.as_deref(), Some(wt_path.as_path()));
+        assert_eq!(resumed.branch.as_deref(), Some("nca/pin"));
+        // …but the fs adapter is still rooted at the caller's workspace.
+        let fs_root = resumed.fs.root().canonicalize().expect("canonical fs root");
+        assert_ne!(
+            fs_root, wt_path,
+            "resume must NOT re-root the fs adapter on its own — revive has to \
+             call switch_to_worktree explicitly"
+        );
+
+        // The explicit switch (what task_revive does) fixes the cwd.
+        resumed.switch_to_worktree(wt_path.clone(), "nca/pin".into(), "main".into());
+        assert_eq!(
+            resumed.fs.root().canonicalize().expect("canonical fs root"),
+            wt_path
+        );
+    }
 
     fn spawned_envelope(id: u64, child: &str) -> EventEnvelope {
         EventEnvelope::new(
