@@ -43,7 +43,8 @@ use nca_core::tools::ToolRegistry;
 use nca_core::tools::mcp::load_mcp_tools;
 use nca_core::tools::spawn_subagent::{SpawnRequest, SpawnSubagentTool};
 use nca_core::tools::subagent_control::{
-    SubagentControlRequest, TaskCancelTool, TaskMessageTool, TaskResultTool, TaskStatusTool,
+    SubagentControlRequest, TaskCancelTool, TaskMessageTool, TaskResultTool, TaskReviveTool,
+    TaskStatusTool,
 };
 use nca_core::tools::{TodoStore, UpdateTodosTool};
 use nca_core::workspace_fs::{RealFs, WorkspaceFs};
@@ -552,7 +553,20 @@ impl Supervisor {
                 control_tx.clone(),
                 control_timeout,
             )));
-            tools.register(Box::new(TaskCancelTool::new(control_tx, cancel_timeout)));
+            tools.register(Box::new(TaskCancelTool::new(
+                control_tx.clone(),
+                cancel_timeout,
+            )));
+            // Revive runs a FULL child turn (cancel-wait + resume + run) —
+            // give it the same 600s budget as a foreground spawn so the
+            // two spawn modes share one wall-clock contract (§2 tightened
+            // the wire table's "no hard cap for revive" to a bounded one;
+            // on timeout the revive keeps running detached and its result
+            // stays fetchable via task_result).
+            tools.register(Box::new(TaskReviveTool::new(
+                control_tx,
+                Duration::from_secs(600),
+            )));
             subagent_control_rx = Some(control_rx);
         }
 

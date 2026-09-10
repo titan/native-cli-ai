@@ -1,10 +1,9 @@
 # Async Task Lifecycle for nca Subagents
 
-Status: P1 implemented (task_status/task_result + SubagentRegistry,
-read-only). P2 chunk B implemented (registry live handles + control lease,
-task_message/task_cancel consumer semantics, cancelled end-state mapping,
-ChildSessionConfig::provider test seam; task_revive + background spawn
-still pending). P3–P4 pending. Researched against
+Status: P2 implemented (task_status/task_result/task_message/task_cancel/
+task_revive + background spawn + SubagentRegistry with live handles,
+control lease, alias resolution, and generation-tracked revive).
+P3–P4 pending. Researched against
 oh-my-opencode-slim 2.2.18 (`task`/`task_result`/`task_status`/`task_message`/
 `task_cancel`/`task_revive`, Background Job Board, orchestrator wake
 scheduler, `wait_for_user`).
