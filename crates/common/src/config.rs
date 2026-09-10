@@ -570,27 +570,91 @@ fn default_subagent_result_timeout_ms() -> u64 {
     30_000
 }
 
+fn default_subagent_background() -> bool {
+    true
+}
+
+fn default_wake_enabled() -> bool {
+    true
+}
+
+fn default_wake_interval_ms() -> u64 {
+    1000
+}
+
+/// `[subagent.wake]` — parent wake-on-terminal scheduling (P3): when a
+/// background child task reaches a terminal state, an idle parent session
+/// is woken with a single reconciled prompt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WakeConfig {
+    /// Master switch for wake delivery. `false` is the P3 rollback gate:
+    /// background children still run detached, but the parent is never
+    /// woken (poll `task_status`/`/jobs` instead).
+    #[serde(default = "default_wake_enabled")]
+    pub enabled: bool,
+    /// Terminal→wake debounce window, milliseconds. Terminal states arriving
+    /// within the window coalesce into a single wake.
+    #[serde(default = "default_wake_interval_ms")]
+    pub interval_ms: u64,
+}
+
+impl Default for WakeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_wake_enabled(),
+            interval_ms: default_wake_interval_ms(),
+        }
+    }
+}
+
+impl WakeConfig {
+    fn merge(&mut self, partial: PartialWakeConfig) {
+        if let Some(enabled) = partial.enabled {
+            self.enabled = enabled;
+        }
+        if let Some(interval_ms) = partial.interval_ms {
+            self.interval_ms = interval_ms;
+        }
+    }
+}
+
 /// `[subagent]` — subagent task lifecycle tuning (P1: read-only
 /// introspection via `task_status`/`task_result`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubagentConfig {
+    /// Default for `spawn_subagent` calls that OMIT the `background` flag
+    /// (P3): `true` detaches by default in top-level TUI sessions; explicit
+    /// flag values always win. `false` restores the P2 foreground default.
+    #[serde(default = "default_subagent_background")]
+    pub background: bool,
     /// Max wait for a `task_status`/`task_result` reply, milliseconds.
     #[serde(default = "default_subagent_result_timeout_ms")]
     pub result_timeout_ms: u64,
+    /// Wake scheduler settings for background children (P3).
+    #[serde(default)]
+    pub wake: WakeConfig,
 }
 
 impl Default for SubagentConfig {
     fn default() -> Self {
         Self {
+            background: default_subagent_background(),
             result_timeout_ms: default_subagent_result_timeout_ms(),
+            wake: WakeConfig::default(),
         }
     }
 }
 
 impl SubagentConfig {
     fn merge(&mut self, partial: PartialSubagentConfig) {
+        if let Some(background) = partial.background {
+            self.background = background;
+        }
         if let Some(result_timeout_ms) = partial.result_timeout_ms {
             self.result_timeout_ms = result_timeout_ms;
+        }
+        if let Some(wake) = partial.wake {
+            self.wake.merge(wake);
         }
     }
 }
@@ -2265,7 +2329,15 @@ struct PartialNcaConfig {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 struct PartialSubagentConfig {
+    background: Option<bool>,
     result_timeout_ms: Option<u64>,
+    wake: Option<PartialWakeConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PartialWakeConfig {
+    enabled: Option<bool>,
+    interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -2626,6 +2698,87 @@ mod tests {
         let json = serde_json::to_string(&config).expect("serialize");
         let back: NcaConfig = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.subagent.result_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn subagent_config_p3_defaults_background_true_and_wake_enabled() {
+        let config = NcaConfig::default();
+        assert!(
+            config.subagent.background,
+            "background defaults to true (P3 default-on detach)"
+        );
+        assert!(
+            config.subagent.wake.enabled,
+            "wake.enabled defaults to true"
+        );
+        assert_eq!(
+            config.subagent.wake.interval_ms, 1000,
+            "wake interval defaults to 1s debounce"
+        );
+        assert_eq!(config.subagent.result_timeout_ms, 30_000);
+    }
+
+    #[test]
+    fn subagent_config_partial_merge_overrides_nested_wake() {
+        let raw = r#"
+[subagent]
+background = false
+
+[subagent.wake]
+enabled = false
+interval_ms = 250
+"#;
+        let partial: PartialNcaConfig = toml::from_str(raw).expect("parse");
+        let mut config = NcaConfig::default();
+        config.merge(partial);
+        assert!(!config.subagent.background);
+        assert!(!config.subagent.wake.enabled);
+        assert_eq!(config.subagent.wake.interval_ms, 250);
+        assert_eq!(
+            config.subagent.result_timeout_ms, 30_000,
+            "untouched sibling keeps its default"
+        );
+
+        // Nested per-field merge: a partial `[subagent.wake]` that sets only
+        // `enabled` leaves `interval_ms` at the default.
+        let raw = r#"
+[subagent.wake]
+enabled = false
+"#;
+        let partial: PartialNcaConfig = toml::from_str(raw).expect("parse");
+        let mut config = NcaConfig::default();
+        config.merge(partial);
+        assert!(!config.subagent.wake.enabled);
+        assert_eq!(config.subagent.wake.interval_ms, 1000);
+    }
+
+    #[test]
+    fn subagent_wake_config_toml_roundtrip() {
+        let raw = r#"
+[subagent]
+background = true
+result_timeout_ms = 45000
+
+[subagent.wake]
+enabled = false
+interval_ms = 500
+"#;
+        let partial: PartialNcaConfig = toml::from_str(raw).expect("parse");
+        let mut config = NcaConfig::default();
+        config.merge(partial);
+        assert!(config.subagent.background);
+        assert_eq!(config.subagent.result_timeout_ms, 45000);
+        assert!(!config.subagent.wake.enabled);
+        assert_eq!(config.subagent.wake.interval_ms, 500);
+
+        // Round-trips through Serialize/Deserialize (config file writes) —
+        // nested wake must survive a full NcaConfig serialization.
+        let json = serde_json::to_string(&config).expect("serialize");
+        let back: NcaConfig = serde_json::from_str(&json).expect("deserialize");
+        assert!(back.subagent.background);
+        assert_eq!(back.subagent.result_timeout_ms, 45000);
+        assert!(!back.subagent.wake.enabled);
+        assert_eq!(back.subagent.wake.interval_ms, 500);
     }
 
     #[test]
