@@ -44,6 +44,9 @@ pub struct SubagentRegistryEntry {
     /// terminal `result_summary` ("cancelled: <reason>") and cleared when
     /// the task goes terminal.
     pub cancel_reason: Option<String>,
+    /// Specialist agent name the child was spawned with (revive rebuilds
+    /// its config routing from this).
+    pub specialist: Option<String>,
 }
 
 /// In-memory projection of spawned child tasks, keyed by child session id
@@ -90,7 +93,56 @@ impl SubagentRegistry {
             cancel_flag: None,
             inbox_tx: None,
             cancel_reason: None,
+            specialist: None,
         });
+    }
+
+    /// Attach a parent-scoped alias to a tracked child (spawn path).
+    /// The `ChildSessionSpawned` event has no alias field, so the alias is
+    /// applied post-record and surfaced through the running
+    /// `ChildSessionStatusChanged` event (which DOES carry it, keeping the
+    /// registry re-derivable from the event log at resume). No-op for
+    /// unknown ids; a blank alias is ignored.
+    pub fn set_alias(&self, child_session_id: &str, alias: Option<&str>) {
+        let Some(alias) = alias.filter(|a| !a.trim().is_empty()) else {
+            return;
+        };
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(entry) = entries
+            .iter_mut()
+            .find(|e| e.session_id == child_session_id)
+        else {
+            return;
+        };
+        entry.alias = Some(alias.to_string());
+    }
+
+    /// Record the child's worktree path on its entry (spawn path). Needed
+    /// by `task_revive` to reuse the retained worktree (cancel never deletes
+    /// it) and by tests pinning worktree identity across generations.
+    pub fn set_worktree(&self, child_session_id: &str, worktree_path: Option<String>) {
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(entry) = entries
+            .iter_mut()
+            .find(|e| e.session_id == child_session_id)
+        else {
+            return;
+        };
+        entry.worktree_path = worktree_path;
+    }
+
+    /// Record the specialist name a child was spawned with, so `task_revive`
+    /// can rebuild the child config with the same routing treatment
+    /// (`apply_child_routing`).
+    pub fn set_specialist(&self, child_session_id: &str, specialist: Option<String>) {
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(entry) = entries
+            .iter_mut()
+            .find(|e| e.session_id == child_session_id)
+        else {
+            return;
+        };
+        entry.specialist = specialist;
     }
 
     /// Record a live child's control handles (cancel flag + inbox sender)

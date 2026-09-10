@@ -154,6 +154,7 @@ impl Repl {
                     event_tx,
                     self.runtime.subagent_registry(),
                     self.runtime.fs(),
+                    None,
                 ))
             } else {
                 None
@@ -1645,6 +1646,7 @@ impl Repl {
                     event_tx,
                     self.runtime.subagent_registry(),
                     self.runtime.fs(),
+                    None,
                 ))
             } else {
                 None

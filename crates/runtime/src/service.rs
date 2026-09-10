@@ -170,6 +170,7 @@ async fn run_service_session_with_startup(
             supervisor.event_tx(),
             supervisor.subagent_registry(),
             supervisor.fs(),
+            None,
         ))
     } else {
         None

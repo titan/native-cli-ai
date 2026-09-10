@@ -26,7 +26,6 @@ use nca_common::session::{ChildSessionState, SessionStatus};
 use nca_common::tool::ToolDefinition;
 use nca_core::provider::{Provider, ProviderError, StreamChunk};
 use nca_core::tools::subagent_control::SubagentControlRequest;
-use nca_core::workspace_fs::RealFs;
 use nca_runtime::session_store::SessionStore;
 use nca_runtime::subagent::{ChildSessionConfig, spawn_child_session};
 use nca_runtime::subagent_registry::{SubagentRegistry, subagent_control_consumer};
@@ -169,6 +168,7 @@ async fn cancel_mid_turn_ends_child_cancelled_and_retains_worktree() {
             provider_override: None,
             model_override: None,
             specialist: None,
+            alias: None,
             registry: Some(registry.clone()),
             provider: Some(provider),
         },
