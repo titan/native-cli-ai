@@ -164,6 +164,12 @@ impl SessionRuntime {
         self.supervisor.spawn_history()
     }
 
+    /// Read-only subagent task registry (P1 `/jobs`, `task_status`/
+    /// `task_result` replies). Shared with the spawn consumer.
+    pub fn subagent_registry(&self) -> Arc<nca_runtime::subagent_registry::SubagentRegistry> {
+        self.supervisor.subagent_registry()
+    }
+
     pub fn set_model(&mut self, model: impl Into<String>) {
         let model = model.into();
         self.supervisor.model = model.clone();
@@ -261,6 +267,29 @@ impl SessionRuntime {
             }
         }
         Ok(snapshots)
+    }
+
+    /// Lines describing tracked subagent tasks (P1 `/jobs`), formatted
+    /// `<child_id>  <state>  <task ≤60 chars>  [branch]` in spawn order.
+    /// An empty registry yields a single "no tasks" line.
+    pub fn list_subagent_jobs(&self) -> Vec<String> {
+        let entries = self.supervisor.subagent_registry().list();
+        if entries.is_empty() {
+            return vec!["No subagent tasks tracked.".into()];
+        }
+        entries
+            .into_iter()
+            .map(|entry| {
+                let state = format!("{:?}", entry.state).to_ascii_lowercase();
+                let task: String = entry.task.chars().take(60).collect();
+                match entry.branch {
+                    Some(branch) => {
+                        format!("{}  {}  {}  [{}]", entry.session_id, state, task, branch)
+                    }
+                    None => format!("{}  {}  {}", entry.session_id, state, task),
+                }
+            })
+            .collect()
     }
 
     /// Live config. The supervisor owns the single authoritative copy;

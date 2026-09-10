@@ -33,6 +33,10 @@ pub struct ChildSessionConfig {
     /// Optional specialist agent name. When set, the matching agent profile is
     /// loaded to override provider/model/system prompt for this child.
     pub specialist: Option<String>,
+    /// Parent's subagent task registry (P1 read-only introspection). When
+    /// set, spawn/terminal lifecycle transitions are folded into it and
+    /// surfaced as `ChildSessionStatusChanged` events.
+    pub registry: Option<std::sync::Arc<crate::subagent_registry::SubagentRegistry>>,
 }
 
 /// Result of a spawned child session.
@@ -191,6 +195,32 @@ pub async fn spawn_child_session(
             .await;
     }
 
+    // P1 read-only introspection: fold the spawn into the parent's registry
+    // and surface the lifecycle transition on the same bounded event channel
+    // (the registry is also re-derivable from these events at resume).
+    let terminal_tx = event_tx.clone();
+    if let Some(ref registry) = cfg.registry {
+        registry.record_spawned(
+            &cfg.parent_session_id,
+            &child_id,
+            &cfg.task,
+            sup.workspace_root.display().to_string(),
+            sup.branch.clone(),
+        );
+        if let Some(ref tx) = event_tx {
+            let _ = tx
+                .send(AgentEvent::ChildSessionStatusChanged {
+                    parent_session_id: cfg.parent_session_id.clone(),
+                    child_session_id: child_id.clone(),
+                    state: nca_common::session::ChildSessionState::Running,
+                    generation: 0,
+                    alias: None,
+                    result_summary: None,
+                })
+                .await;
+        }
+    }
+
     let mut context_prompt = build_context_prompt(&cfg.parent_summary, &cfg.task, &cfg.focus_files);
     if task_image_count > 0 && !images.is_empty() {
         context_prompt.push_str(&format!(
@@ -228,6 +258,33 @@ pub async fn spawn_child_session(
             ("error".to_string(), e.to_string())
         }
     };
+
+    // P1 read-only introspection: fold the terminal transition into the
+    // parent's registry (bounded summary) and emit the matching
+    // `ChildSessionStatusChanged` before the drain — same event channel the
+    // spawn events used. Foreground reply behavior is unchanged.
+    if let Some(ref registry) = cfg.registry {
+        let state = nca_common::session::ChildSessionState::from_spawn_status(&status);
+        let result_summary = nca_core::agent::truncate_str(output.trim(), 300);
+        let result_summary = if result_summary.is_empty() {
+            None
+        } else {
+            Some(result_summary)
+        };
+        registry.record_terminal(&child_id, state, result_summary.clone());
+        if let Some(ref tx) = terminal_tx {
+            let _ = tx
+                .send(AgentEvent::ChildSessionStatusChanged {
+                    parent_session_id: cfg.parent_session_id.clone(),
+                    child_session_id: child_id.clone(),
+                    state,
+                    generation: 0,
+                    alias: None,
+                    result_summary,
+                })
+                .await;
+        }
+    }
 
     // Snapshot meta BEFORE dropping the supervisor: `switch_to_worktree`
     // mutates `sup.workspace_root` (supervisor.rs) and the result reads it,
@@ -490,6 +547,7 @@ fn apply_child_routing(
 /// and runs child sessions. Each child session inherits parent context — both
 /// the text summary and any images are taken from the live `parent_history`
 /// mirror at spawn time, never from a wiring-time snapshot.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_subagent_consumer(
     mut spawn_rx: mpsc::Receiver<SpawnRequest>,
     parent_session_id: String,
@@ -497,6 +555,7 @@ pub fn spawn_subagent_consumer(
     config: NcaConfig,
     parent_history: Arc<Mutex<Vec<nca_common::message::Message>>>,
     event_tx: Option<tokio::sync::mpsc::Sender<AgentEvent>>,
+    registry: std::sync::Arc<crate::subagent_registry::SubagentRegistry>,
     parent_fs: Arc<dyn WorkspaceFs>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -513,6 +572,7 @@ pub fn spawn_subagent_consumer(
                 config.extra_paths = live_mounts;
             }
             let event_tx = event_tx.clone();
+            let registry = registry.clone();
 
             // Summary of the parent conversation as of THIS spawn (the
             // supervisor refreshes the mirror at each turn start), so a child
@@ -535,6 +595,7 @@ pub fn spawn_subagent_consumer(
                 provider_override: req.provider_override,
                 model_override: req.model_override.clone(),
                 specialist: req.specialist.clone(),
+                registry: Some(registry.clone()),
             };
 
             tokio::spawn(async move {

@@ -196,6 +196,21 @@ pub enum AgentEvent {
         child_session_id: String,
         status: String,
     },
+    /// A child session's tracked lifecycle state changed
+    /// (spawn → running → terminal). Informational: replay surfaces ignore
+    /// it; the parent's `SubagentRegistry` folds it (P1 read-only
+    /// introspection, `docs/subagent-task-lifecycle.md` §2).
+    ChildSessionStatusChanged {
+        parent_session_id: String,
+        child_session_id: String,
+        state: crate::session::ChildSessionState,
+        #[serde(default)]
+        generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        alias: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result_summary: Option<String>,
+    },
     /// Live activity from a child session (tools, checkpoints, nested spawns), for parent UI.
     ChildSessionActivity {
         child_session_id: String,
@@ -554,6 +569,101 @@ mod interactive_question_serde_tests {
             } => {
                 assert_eq!(tokens_after, 4_000);
                 assert!(kv_prefix_broken);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn child_session_status_changed_roundtrip() {
+        let ev = AgentEvent::ChildSessionStatusChanged {
+            parent_session_id: "parent-1".into(),
+            child_session_id: "child-1".into(),
+            state: crate::session::ChildSessionState::Running,
+            generation: 0,
+            alias: None,
+            result_summary: None,
+        };
+        let json = serde_json::to_string(&ev).expect("serialize");
+        // NOTE: `AgentEvent`'s tagged wire form uses PascalCase tags (the
+        // enum has no `rename_all`) — matching every existing event-log
+        // entry. `ChildSessionState` itself is snake_case.
+        assert!(
+            json.contains("\"type\":\"ChildSessionStatusChanged\""),
+            "tagged wire form: {json}"
+        );
+        assert!(
+            json.contains("\"state\":\"running\""),
+            "snake_case state: {json}"
+        );
+        let back: AgentEvent = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            AgentEvent::ChildSessionStatusChanged {
+                parent_session_id,
+                child_session_id,
+                state,
+                generation,
+                alias,
+                result_summary,
+            } => {
+                assert_eq!(parent_session_id, "parent-1");
+                assert_eq!(child_session_id, "child-1");
+                assert_eq!(state, crate::session::ChildSessionState::Running);
+                assert_eq!(generation, 0);
+                assert_eq!(alias, None);
+                assert_eq!(result_summary, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn child_session_status_changed_terminal_fields_roundtrip() {
+        let ev = AgentEvent::ChildSessionStatusChanged {
+            parent_session_id: "p".into(),
+            child_session_id: "c".into(),
+            state: crate::session::ChildSessionState::Failed,
+            generation: 2,
+            alias: Some("fixer".into()),
+            result_summary: Some("provider error".into()),
+        };
+        let json = serde_json::to_string(&ev).expect("serialize");
+        let back: AgentEvent = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            AgentEvent::ChildSessionStatusChanged {
+                state,
+                generation,
+                alias,
+                result_summary,
+                ..
+            } => {
+                assert_eq!(state, crate::session::ChildSessionState::Failed);
+                assert_eq!(generation, 2);
+                assert_eq!(alias.as_deref(), Some("fixer"));
+                assert_eq!(result_summary.as_deref(), Some("provider error"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn child_session_status_changed_torn_tail_still_deserializes() {
+        // A partially-written log tail may drop trailing fields; serde
+        // defaults must tolerate a missing generation/alias/result_summary.
+        let raw = r#"{"type":"ChildSessionStatusChanged","parent_session_id":"p","child_session_id":"c","state":"completed"}"#;
+        let back: AgentEvent = serde_json::from_str(raw).expect("deserialize");
+        match back {
+            AgentEvent::ChildSessionStatusChanged {
+                state,
+                generation,
+                alias,
+                result_summary,
+                ..
+            } => {
+                assert_eq!(state, crate::session::ChildSessionState::Completed);
+                assert_eq!(generation, 0);
+                assert_eq!(alias, None);
+                assert_eq!(result_summary, None);
             }
             _ => panic!("wrong variant"),
         }
