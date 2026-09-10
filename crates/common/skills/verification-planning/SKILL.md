@@ -39,7 +39,16 @@ trustworthy conclusion with proportionate cost, safety, and effort.
 **Complete when:** there is a preferred path, its limitations are understood,
 and a weaker or stronger alternative is available if circumstances change.
 
-## 3. Create a verification affordance when needed
+## 3. Set a verification budget
+
+At the final state, state the distinct claims, assign one owner to establish or
+refute each, and choose the minimum non-duplicative evidence that covers the
+claims and important boundaries. Reuse evidence only while its relevant code,
+inputs, environment, and state remain valid. Required repository and release
+checks still apply; broaden or repeat verification only when a stated condition
+justifies it.
+
+## 4. Create a verification affordance when needed
 
 When the existing system leaves the decisive truth too indirect or ambiguous,
 extend the evidence path with a **verification affordance**: the smallest
@@ -58,7 +67,7 @@ it.
 **Complete when:** the chosen path can establish the claim directly enough for
 its stakes, and any needed affordance has a defined lifecycle.
 
-## 4. Research when the path is unknown
+## 5. Research when the path is unknown
 
 When the right evidence path depends on an unfamiliar dependency, framework,
 external service, or rapidly changing capability, delegate to `librarian` for
@@ -71,7 +80,7 @@ directly when it already resolves the choice.
 **Complete when:** the chosen path rests on known capabilities and real
 constraints rather than assumption.
 
-## 5. Make the path runnable
+## 6. Make the path runnable
 
 Prepare only the support needed to follow the evidence path reliably. Keep the
 support narrow, repeatable, and safe to inspect.
@@ -86,7 +95,7 @@ structural changes whose sole purpose is evidence gathering.
 **Complete when:** the path can be followed without guessing about setup,
 state, or interpretation.
 
-## 6. Close the evidence path
+## 7. Close the evidence path
 
 After implementation, follow the planned path and interpret the resulting
 evidence against the original claim.
