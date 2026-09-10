@@ -100,3 +100,101 @@ fn fold_wake_todos(event: &AgentEvent, wake: Option<&WakeScheduler>) {
         sched.note_todos(incomplete);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nca_common::todo::{AgentTodo, TodoStatus};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    const INTERVAL: Duration = Duration::from_millis(1000);
+
+    fn todo_item(id: &str, status: TodoStatus) -> AgentTodo {
+        AgentTodo {
+            id: id.into(),
+            content: format!("todo {id}"),
+            status,
+            source: None,
+        }
+    }
+
+    /// Same harness as crates/runtime/src/wake_scheduler.rs tests: the
+    /// trigger records delivered wake texts on an unbounded channel, and
+    /// parking on a sleep strictly longer than the debounce deadline lets
+    /// the paused clock auto-advance through it.
+    fn scheduler() -> (WakeScheduler, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let trigger: nca_runtime::wake_scheduler::WakeTrigger = Arc::new(move |text: &str| {
+            let _ = tx.send(text.to_string());
+        });
+        (WakeScheduler::new(true, INTERVAL, trigger), rx)
+    }
+
+    fn drain(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(text) = rx.try_recv() {
+            out.push(text);
+        }
+        out
+    }
+
+    async fn elapse() {
+        tokio::time::sleep(INTERVAL + Duration::from_millis(50)).await;
+    }
+
+    /// The TodosUpdated fold must reach `note_todos(false)` on an
+    /// all-completed list (observable: the pending wake is muted) and
+    /// `note_todos(true)` once any todo is pending/in_progress again
+    /// (observable: the next terminal fires).
+    #[tokio::test(start_paused = true)]
+    async fn todos_updated_fold_drives_the_scheduler_todo_gate() {
+        let (sched, mut rx) = scheduler();
+        let wake = Some(sched.clone());
+
+        // All completed/cancelled ⇒ note_todos(false) ⇒ muted.
+        fold_wake_todos(
+            &AgentEvent::TodosUpdated {
+                todos: vec![
+                    todo_item("1", TodoStatus::Completed),
+                    todo_item("2", TodoStatus::Cancelled),
+                ],
+            },
+            wake.as_ref(),
+        );
+        sched.notify_terminal("c-1", "completed", "done");
+        elapse().await;
+        assert!(
+            drain(&mut rx).is_empty(),
+            "all-completed todos mute the wake"
+        );
+
+        // One in_progress todo ⇒ note_todos(true) ⇒ the gate re-opens.
+        fold_wake_todos(
+            &AgentEvent::TodosUpdated {
+                todos: vec![
+                    todo_item("1", TodoStatus::Completed),
+                    todo_item("2", TodoStatus::InProgress),
+                ],
+            },
+            wake.as_ref(),
+        );
+        sched.notify_terminal("c-2", "completed", "again");
+        elapse().await;
+        let fires = drain(&mut rx);
+        assert_eq!(fires.len(), 1, "re-armed after an incomplete fold");
+        assert!(fires[0].contains("c-2"));
+    }
+
+    /// Sessions without a scheduler (wake disabled, stdio, one-shot) fold
+    /// events without touching anything.
+    #[test]
+    fn todos_fold_is_a_noop_without_a_scheduler() {
+        fold_wake_todos(
+            &AgentEvent::TodosUpdated {
+                todos: vec![todo_item("1", TodoStatus::Pending)],
+            },
+            None,
+        );
+    }
+}

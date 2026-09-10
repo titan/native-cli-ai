@@ -2349,6 +2349,27 @@ fn build_model_picker_entries(
 mod tests {
     use super::*;
 
+    /// P3 wake trigger: delivers the EXACT wake text as an ordinary
+    /// Submit through the cmd queue, and tolerates a gone receiver
+    /// (fire-and-forget — never panics).
+    #[test]
+    fn wake_submit_trigger_delivers_submit_and_survives_gone_receiver() {
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+        let trigger = wake_submit_trigger(cmd_tx);
+
+        let wake_text = "[wake] Background task f-1 reached completed: shipped it. Reconcile (task_status or /jobs) and continue.";
+        trigger(wake_text);
+        match cmd_rx.try_recv() {
+            Ok(Msg::Cmd(TuiCmd::Submit(line))) => assert_eq!(line, wake_text),
+            other => panic!("expected a Submit carrying the exact wake text, got {other:?}"),
+        }
+
+        // Receiver dropped: the closure must swallow the error, not panic,
+        // and enqueue nothing further.
+        drop(cmd_rx);
+        trigger(wake_text);
+    }
+
     #[test]
     fn parses_permission_aliases() {
         assert_eq!(
