@@ -601,14 +601,17 @@ impl Supervisor {
         let session_id = cfg.session_id.unwrap_or_else(generate_session_id);
         let session_store = SessionStore::new(workspace_root.join(&config.session.history_dir));
 
-        // Control consumer answers task_status/task_result against the
-        // registry + a read-only store handle (never saves — single-writer
-        // invariant, `docs/subagent-task-lifecycle.md` §6).
+        // Control consumer answers task_status/task_result/task_message/
+        // task_cancel against the registry + a read-only store handle (never
+        // saves — single-writer invariant, `docs/subagent-task-lifecycle.md`
+        // §6). `ChildMessageQueued` envelopes ride the session's own bounded
+        // event channel.
         if let Some(control_rx) = subagent_control_rx.take() {
             tokio::spawn(subagent_control_consumer(
                 control_rx,
                 Arc::clone(&registry),
                 SessionStore::new(workspace_root.join(&config.session.history_dir)),
+                Some(event_tx.clone()),
             ));
         }
 

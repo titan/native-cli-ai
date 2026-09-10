@@ -363,17 +363,23 @@ fn operation_not_available(session_id: &str) -> SubagentControlResponse {
     )
 }
 
-/// Consume `task_status`/`task_result` control requests against the
-/// registry, with a read-only `SessionStore::load` fallback for ids the
-/// registry never saw (e.g. spawned before this process started). Spawned
-/// by `Supervisor::create`; replies ride per-request oneshot channels.
+/// Consume control requests (`task_status`/`task_result`/`task_message`/
+/// `task_cancel`, and the chunk-C `task_revive` stub) against the registry,
+/// with a read-only `SessionStore::load` fallback for ids the registry
+/// never saw (e.g. spawned before this process started). Spawned by
+/// `Supervisor::create`; replies ride per-request oneshot channels.
+/// `event_tx` (the parent's bounded event channel) receives
+/// `ChildMessageQueued` envelopes for accepted/refused steering attempts.
 ///
-/// **Invariant:** never calls `session_store.save` — introspection is
-/// strictly read-only (single-writer preserved).
+/// **Invariant:** never calls `session_store.save` — introspection and
+/// control signaling are strictly non-persisting (single-writer preserved:
+/// cancel flips the child's own in-memory flag; the child's supervisor
+/// persists its own terminal state).
 pub fn subagent_control_consumer(
     mut control_rx: mpsc::Receiver<SubagentControlRequest>,
     registry: Arc<SubagentRegistry>,
     session_store: SessionStore,
+    event_tx: Option<mpsc::Sender<AgentEvent>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(request) = control_rx.recv().await {
@@ -439,20 +445,35 @@ pub fn subagent_control_consumer(
                     };
                     let _ = reply.send(response);
                 }
-                // P2 chunk A placeholders: the write-side operations are
-                // executed by the control lease + revive path in chunk B/C;
-                // until then every request fails loudly (never silently
-                // succeeds against a live child).
                 SubagentControlRequest::Message {
-                    session_id, reply, ..
+                    session_id,
+                    text,
+                    reply,
                 } => {
-                    let _ = reply.send(operation_not_available(&session_id));
+                    let (response, parent_id, accepted) =
+                        handle_message_request(&registry, &session_id, text).await;
+                    if let (Some(tx), Some(parent)) = (event_tx.as_ref(), parent_id) {
+                        // Bounded channel: try_send only (never block the
+                        // control loop on a slow UI consumer).
+                        let _ = tx.try_send(AgentEvent::ChildMessageQueued {
+                            parent_session_id: parent,
+                            child_session_id: session_id.clone(),
+                            accepted,
+                        });
+                    }
+                    let _ = reply.send(response);
                 }
                 SubagentControlRequest::Cancel {
-                    session_id, reply, ..
+                    session_id,
+                    reason,
+                    reply,
                 } => {
-                    let _ = reply.send(operation_not_available(&session_id));
+                    let response = handle_cancel_request(&registry, &session_id, reason).await;
+                    let _ = reply.send(response);
                 }
+                // P2 chunk A/C placeholder: `task_revive` needs the resume +
+                // worktree-reuse path (chunk C); until then it fails loudly
+                // (never silently succeeds against a live child).
                 SubagentControlRequest::Revive {
                     session_id, reply, ..
                 } => {
@@ -461,6 +482,144 @@ pub fn subagent_control_consumer(
             }
         }
     })
+}
+
+/// Execute a `task_message` steering request against the registry.
+/// Returns `(reply, parent_session_id, accepted)`; the parent id is `None`
+/// when the target could not be attributed to a parent (unknown id), in
+/// which case no `ChildMessageQueued` event is emitted.
+async fn handle_message_request(
+    registry: &SubagentRegistry,
+    session_id: &str,
+    text: String,
+) -> (SubagentControlResponse, Option<String>, bool) {
+    let entry = match registry.resolve(session_id) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => {
+            return (
+                SubagentControlResponse::unknown(session_id, "unknown subagent task id"),
+                None,
+                false,
+            );
+        }
+        Err(message) => {
+            return (
+                SubagentControlResponse::unknown(session_id, message),
+                None,
+                false,
+            );
+        }
+    };
+    let parent = Some(entry.parent_session_id.clone());
+    let base = |state, note: Option<String>, ok: bool| SubagentControlResponse {
+        session_id: entry.session_id.clone(),
+        state,
+        task: None,
+        workspace: None,
+        branch: None,
+        result_summary: None,
+        output: None,
+        note,
+        ok,
+        error_message: None,
+        generation: None,
+    };
+    if entry.state != ChildSessionState::Running {
+        return (
+            base(entry.state, Some("task is not running".into()), false),
+            parent,
+            false,
+        );
+    }
+    let Some(inbox_tx) = entry.inbox_tx else {
+        return (
+            base(entry.state, Some("task is not running".into()), false),
+            parent,
+            false,
+        );
+    };
+    let (response, accepted) = match inbox_tx.try_send(InboxItem::Steering { text }) {
+        Ok(()) => (
+            base(
+                entry.state,
+                Some("queued for delivery at the child's next step boundary".into()),
+                true,
+            ),
+            true,
+        ),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => (
+            base(
+                entry.state,
+                Some("child inbox is full (16) — retry later".into()),
+                false,
+            ),
+            false,
+        ),
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => (
+            base(entry.state, Some("child inbox closed".into()), false),
+            false,
+        ),
+    };
+    (response, parent, accepted)
+}
+
+/// Execute a `task_cancel` request: acquire the control lease, flip the
+/// child's cooperative cancel flag, record the reason, and release the
+/// lease immediately — the abort itself is asynchronous (the child's
+/// stream/tool loops poll the flag every 25–50ms).
+async fn handle_cancel_request(
+    registry: &SubagentRegistry,
+    session_id: &str,
+    reason: Option<String>,
+) -> SubagentControlResponse {
+    let entry = match registry.resolve(session_id) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => {
+            return SubagentControlResponse::unknown(session_id, "unknown subagent task id");
+        }
+        Err(message) => return SubagentControlResponse::unknown(session_id, message),
+    };
+    let base = |state, note: Option<String>, ok: bool| SubagentControlResponse {
+        session_id: entry.session_id.clone(),
+        state,
+        task: None,
+        workspace: None,
+        branch: None,
+        result_summary: None,
+        output: None,
+        note,
+        ok,
+        error_message: None,
+        generation: None,
+    };
+    let Some(_lease) = registry.try_acquire_lease(&entry.session_id) else {
+        return base(
+            entry.state,
+            Some("another control operation is in flight for this task".into()),
+            false,
+        );
+    };
+    let Some(cancel_flag) = entry.cancel_flag else {
+        return base(entry.state, Some("task is not running".into()), false);
+    };
+    if entry.state != ChildSessionState::Running {
+        return base(entry.state, Some("task is not running".into()), false);
+    }
+    cancel_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    registry.record_cancel_requested(&entry.session_id, reason);
+    let response = base(
+        entry.state,
+        Some(
+            "cancel requested; the child aborts cooperatively at its next poll (≤50ms). \
+             Worktree and branch are retained for revive."
+                .into(),
+        ),
+        true,
+    );
+    // The lease guarded only the flag-set; release it now (explicit drop
+    // documents that the abort itself is asynchronous and un-leased).
+    drop(_lease);
+    response
 }
 
 /// `task_result` reply for a registry-known task: running tasks report
@@ -938,7 +1097,7 @@ mod tests {
         // Store with no sessions: unknown ids must fail through it.
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SessionStore::new(dir.path());
-        let _consumer = subagent_control_consumer(rx, registry, store);
+        let _consumer = subagent_control_consumer(rx, registry, store, None);
 
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(SubagentControlRequest::Status {
@@ -980,7 +1139,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel(4);
         let registry = Arc::new(SubagentRegistry::new());
-        let _consumer = subagent_control_consumer(rx, registry, store);
+        let _consumer = subagent_control_consumer(rx, registry, store, None);
 
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(SubagentControlRequest::Status {
@@ -1014,7 +1173,7 @@ mod tests {
         // Terminal entry pointing at the saved json.
         registry.record_spawned("p", "c1", "t", "/ws".into(), None);
         registry.record_terminal("c1", ChildSessionState::Completed, Some("ok".into()));
-        let _consumer = subagent_control_consumer(rx, registry, store);
+        let _consumer = subagent_control_consumer(rx, registry, store, None);
 
         // Running → note, no output.
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -1057,48 +1216,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn control_consumer_write_operations_reply_not_available_yet() {
-        // P2 chunk A: the Message/Cancel/Revive wire types exist, but this
-        // build's consumer cannot execute them (the control lease lands in
-        // chunk B) — every write op must fail loudly instead of pretending
-        // success, even for a registry-known, still-running child.
+    async fn control_consumer_revive_replies_not_available_yet() {
+        // P2 chunk A/B: the Revive wire type exists and Message/Cancel are
+        // executed by the consumer, but revive lands in chunk C — it must
+        // fail loudly instead of pretending success against a live child.
         let (tx, rx) = mpsc::channel(8);
         let registry = Arc::new(SubagentRegistry::new());
         registry.record_spawned("p", "c1", "t", "/ws".into(), None);
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SessionStore::new(dir.path());
-        let _consumer = subagent_control_consumer(rx, registry, store);
-
-        let (reply_tx, reply_rx) = oneshot::channel();
-        tx.send(SubagentControlRequest::Message {
-            session_id: "c1".into(),
-            text: "pivot to tests".into(),
-            reply: reply_tx,
-        })
-        .await
-        .expect("send");
-        let resp = reply_rx.await.expect("reply");
-        assert!(!resp.ok);
-        assert_eq!(resp.session_id, "c1");
-        assert_eq!(
-            resp.error_message.as_deref(),
-            Some("task control operation is not available in this build")
-        );
-
-        let (reply_tx, reply_rx) = oneshot::channel();
-        tx.send(SubagentControlRequest::Cancel {
-            session_id: "c1".into(),
-            reason: Some("wrong branch".into()),
-            reply: reply_tx,
-        })
-        .await
-        .expect("send");
-        let resp = reply_rx.await.expect("reply");
-        assert!(!resp.ok);
-        assert_eq!(
-            resp.error_message.as_deref(),
-            Some("task control operation is not available in this build")
-        );
+        let _consumer = subagent_control_consumer(rx, registry, store, None);
 
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(SubagentControlRequest::Revive {
@@ -1110,9 +1237,264 @@ mod tests {
         .expect("send");
         let resp = reply_rx.await.expect("reply");
         assert!(!resp.ok);
+        assert_eq!(resp.session_id, "c1");
         assert_eq!(
             resp.error_message.as_deref(),
             Some("task control operation is not available in this build")
         );
+    }
+
+    // ------------------------------------------------------------------
+    // P2 chunk B — task_message / task_cancel through the consumer
+    // ------------------------------------------------------------------
+
+    /// Registry with one child in `state`, carrying real live handles bound
+    /// to a fresh bounded inbox channel.
+    fn running_child_with_inbox(
+        registry: &SubagentRegistry,
+        id: &str,
+        cap: usize,
+    ) -> (Arc<AtomicBool>, mpsc::Receiver<InboxItem>) {
+        registry.record_spawned("parent", id, "t", "/ws".into(), None);
+        let flag = Arc::new(AtomicBool::new(false));
+        let (inbox_tx, inbox_rx) = mpsc::channel(cap);
+        registry.record_handles(id, flag.clone(), inbox_tx);
+        (flag, inbox_rx)
+    }
+
+    async fn send_message(
+        tx: &mpsc::Sender<SubagentControlRequest>,
+        id: &str,
+        text: &str,
+    ) -> SubagentControlResponse {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(SubagentControlRequest::Message {
+            session_id: id.into(),
+            text: text.into(),
+            reply: reply_tx,
+        })
+        .await
+        .expect("send");
+        reply_rx.await.expect("reply")
+    }
+
+    async fn send_cancel(
+        tx: &mpsc::Sender<SubagentControlRequest>,
+        id: &str,
+        reason: Option<&str>,
+    ) -> SubagentControlResponse {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(SubagentControlRequest::Cancel {
+            session_id: id.into(),
+            reason: reason.map(String::from),
+            reply: reply_tx,
+        })
+        .await
+        .expect("send");
+        reply_rx.await.expect("reply")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn message_to_running_child_delivers_steering_and_emits_event() {
+        let (tx, rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let registry = Arc::new(SubagentRegistry::new());
+        let (_flag, mut inbox_rx) = running_child_with_inbox(&registry, "c1", 16);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::new(dir.path());
+        let _consumer = subagent_control_consumer(rx, registry.clone(), store, Some(event_tx));
+
+        let resp = send_message(&tx, "c1", "pivot to tests").await;
+        assert!(resp.ok, "steering to a running child must be accepted");
+        assert_eq!(resp.state, ChildSessionState::Running);
+        assert_eq!(
+            resp.note.as_deref(),
+            Some("queued for delivery at the child's next step boundary")
+        );
+
+        match inbox_rx.try_recv() {
+            Ok(InboxItem::Steering { text }) => assert_eq!(text, "pivot to tests"),
+            other => panic!("steering must land on the child inbox: {other:?}"),
+        }
+
+        match event_rx.try_recv() {
+            Ok(AgentEvent::ChildMessageQueued {
+                parent_session_id,
+                child_session_id,
+                accepted,
+            }) => {
+                assert_eq!(parent_session_id, "parent");
+                assert_eq!(child_session_id, "c1");
+                assert!(accepted);
+            }
+            other => panic!("ChildMessageQueued must be emitted on success: {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn message_to_terminal_child_reports_not_running_with_accepted_false() {
+        let (tx, rx) = mpsc::channel(8);
+        let registry = Arc::new(SubagentRegistry::new());
+        registry.record_spawned("parent", "c1", "t", "/ws".into(), None);
+        registry.record_terminal("c1", ChildSessionState::Completed, Some("done".into()));
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::new(dir.path());
+        let _consumer = subagent_control_consumer(rx, registry, store, Some(event_tx));
+
+        let resp = send_message(&tx, "c1", "steer").await;
+        assert!(!resp.ok);
+        assert_eq!(resp.state, ChildSessionState::Completed);
+        assert_eq!(resp.note.as_deref(), Some("task is not running"));
+
+        match event_rx.try_recv() {
+            Ok(AgentEvent::ChildMessageQueued { accepted, .. }) => assert!(!accepted),
+            other => panic!("ChildMessageQueued must be emitted on failure too: {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn message_to_full_inbox_reports_full_and_retry_hint() {
+        let (tx, rx) = mpsc::channel(8);
+        let registry = Arc::new(SubagentRegistry::new());
+        // Capacity-1 inbox, pre-filled: the steering try_send must hit Full.
+        let (_flag, _inbox_rx) = running_child_with_inbox(&registry, "c1", 1);
+        registry
+            .get("c1")
+            .and_then(|e| e.inbox_tx)
+            .expect("handle")
+            .try_send(InboxItem::Steering {
+                text: "occupant".into(),
+            })
+            .expect("pre-fill");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::new(dir.path());
+        let _consumer = subagent_control_consumer(rx, registry, store, None);
+
+        let resp = send_message(&tx, "c1", "overflow").await;
+        assert!(!resp.ok);
+        assert_eq!(
+            resp.note.as_deref(),
+            Some("child inbox is full (16) — retry later")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn message_to_closed_inbox_reports_closed() {
+        let (tx, rx) = mpsc::channel(8);
+        let registry = Arc::new(SubagentRegistry::new());
+        // Running state but the receiving half is already dropped.
+        registry.record_spawned("parent", "c1", "t", "/ws".into(), None);
+        let (inbox_tx, inbox_rx) = mpsc::channel(16);
+        registry.record_handles("c1", Arc::new(AtomicBool::new(false)), inbox_tx);
+        drop(inbox_rx);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::new(dir.path());
+        let _consumer = subagent_control_consumer(rx, registry, store, None);
+
+        let resp = send_message(&tx, "c1", "steer").await;
+        assert!(!resp.ok);
+        assert_eq!(resp.note.as_deref(), Some("child inbox closed"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn message_unknown_id_is_unknown() {
+        let (tx, rx) = mpsc::channel(8);
+        let registry = Arc::new(SubagentRegistry::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::new(dir.path());
+        let _consumer = subagent_control_consumer(rx, registry, store, None);
+
+        let resp = send_message(&tx, "ghost", "steer").await;
+        assert!(!resp.ok);
+        assert_eq!(
+            resp.error_message.as_deref(),
+            Some("unknown subagent task id")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_running_child_sets_flag_records_reason_and_replies() {
+        let (tx, rx) = mpsc::channel(8);
+        let registry = Arc::new(SubagentRegistry::new());
+        let (flag, _inbox_rx) = running_child_with_inbox(&registry, "c1", 16);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::new(dir.path());
+        let _consumer = subagent_control_consumer(rx, registry.clone(), store, None);
+
+        let resp = send_cancel(&tx, "c1", Some("wrong branch")).await;
+        assert!(resp.ok, "cancel of a running child must be accepted");
+        assert_eq!(resp.state, ChildSessionState::Running);
+        let note = resp.note.as_deref().expect("note");
+        assert!(
+            note.contains("cancel requested") && note.contains("revive"),
+            "note must explain the cooperative abort and retention: {note}"
+        );
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            registry.get("c1").and_then(|e| e.cancel_reason).as_deref(),
+            Some("wrong branch")
+        );
+
+        // The lease is released immediately after the flag-set: a second
+        // cancel must NOT report an in-flight conflict.
+        let resp2 = send_cancel(&tx, "c1", None).await;
+        assert!(
+            resp2.ok,
+            "lease must be free for a follow-up cancel: {resp2:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_terminal_child_reports_not_running() {
+        let (tx, rx) = mpsc::channel(8);
+        let registry = Arc::new(SubagentRegistry::new());
+        registry.record_spawned("parent", "c1", "t", "/ws".into(), None);
+        registry.record_terminal("c1", ChildSessionState::Cancelled, Some("cancelled".into()));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::new(dir.path());
+        let _consumer = subagent_control_consumer(rx, registry, store, None);
+
+        let resp = send_cancel(&tx, "c1", None).await;
+        assert!(!resp.ok);
+        assert_eq!(resp.state, ChildSessionState::Cancelled);
+        assert_eq!(resp.note.as_deref(), Some("task is not running"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_unknown_id_is_unknown() {
+        let (tx, rx) = mpsc::channel(8);
+        let registry = Arc::new(SubagentRegistry::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::new(dir.path());
+        let _consumer = subagent_control_consumer(rx, registry, store, None);
+
+        let resp = send_cancel(&tx, "ghost", None).await;
+        assert!(!resp.ok);
+        assert_eq!(
+            resp.error_message.as_deref(),
+            Some("unknown subagent task id")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_while_lease_held_reports_in_flight() {
+        let (tx, rx) = mpsc::channel(8);
+        let registry = Arc::new(SubagentRegistry::new());
+        let (flag, _inbox_rx) = running_child_with_inbox(&registry, "c1", 16);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::new(dir.path());
+        let _consumer = subagent_control_consumer(rx, registry.clone(), store, None);
+
+        // Hold the lease externally (simulating an in-flight control op):
+        // the cancel must be refused, and must NOT touch the flag.
+        let _lease = registry.try_acquire_lease("c1").expect("lease");
+        let resp = send_cancel(&tx, "c1", None).await;
+        assert!(!resp.ok);
+        assert_eq!(
+            resp.note.as_deref(),
+            Some("another control operation is in flight for this task")
+        );
+        assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

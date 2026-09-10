@@ -211,6 +211,16 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result_summary: Option<String>,
     },
+    /// A `task_message` steering request was attempted against a child.
+    /// Informational: replay surfaces and the `SubagentRegistry` fold ignore
+    /// it (delivery itself is through the child's live inbox channel).
+    ChildMessageQueued {
+        parent_session_id: String,
+        child_session_id: String,
+        /// `true` when the steering text was queued on the child's inbox.
+        #[serde(default)]
+        accepted: bool,
+    },
     /// Live activity from a child session (tools, checkpoints, nested spawns), for parent UI.
     ChildSessionActivity {
         child_session_id: String,
@@ -569,6 +579,34 @@ mod interactive_question_serde_tests {
             } => {
                 assert_eq!(tokens_after, 4_000);
                 assert!(kv_prefix_broken);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn child_message_queued_roundtrip() {
+        let ev = AgentEvent::ChildMessageQueued {
+            parent_session_id: "parent-1".into(),
+            child_session_id: "child-1".into(),
+            accepted: true,
+        };
+        let json = serde_json::to_string(&ev).expect("serialize");
+        assert!(
+            json.contains("\"type\":\"ChildMessageQueued\""),
+            "tagged wire form: {json}"
+        );
+        assert!(json.contains("\"accepted\":true"), "accepted flag: {json}");
+        let back: AgentEvent = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            AgentEvent::ChildMessageQueued {
+                parent_session_id,
+                child_session_id,
+                accepted,
+            } => {
+                assert_eq!(parent_session_id, "parent-1");
+                assert_eq!(child_session_id, "child-1");
+                assert!(accepted);
             }
             _ => panic!("wrong variant"),
         }
