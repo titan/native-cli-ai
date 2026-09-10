@@ -11,6 +11,7 @@ use nca_core::workspace_fs::WorkspaceFs;
 use serde_json::json;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -84,6 +85,33 @@ pub(crate) fn build_parent_summary(messages: &[nca_common::message::Message]) ->
     }
 
     summary
+}
+
+/// Whether a failed child turn was a cooperative cancellation: either the
+/// child's cancel flag is set (the registry-visible `task_cancel` handle)
+/// or the agent driver surfaced its canonical "run cancelled" error.
+fn turn_was_cancelled(err: &nca_core::provider::ProviderError, cancel_flag_set: bool) -> bool {
+    cancel_flag_set || err.to_string().contains("run cancelled")
+}
+
+/// Terminal `result_summary` for a child task. A cancelled task folds the
+/// cancel reason recorded by `task_cancel` into `"cancelled: <reason>"`
+/// (plain `"cancelled"` when no reason was recorded); any other status
+/// summarizes (and truncates) the turn output, yielding `None` for
+/// whitespace-only output.
+fn terminal_result_summary(
+    status: &str,
+    output: &str,
+    cancel_reason: Option<&str>,
+) -> Option<String> {
+    if status == "cancelled" {
+        return Some(match cancel_reason {
+            Some(reason) => format!("cancelled: {reason}"),
+            None => "cancelled".to_string(),
+        });
+    }
+    let summary = nca_core::agent::truncate_str(output.trim(), 300);
+    (!summary.is_empty()).then_some(summary)
 }
 
 /// Spawn a child session that inherits parent context and runs to completion.
@@ -195,9 +223,12 @@ pub async fn spawn_child_session(
             .await;
     }
 
-    // P1 read-only introspection: fold the spawn into the parent's registry
-    // and surface the lifecycle transition on the same bounded event channel
-    // (the registry is also re-derivable from these events at resume).
+    // P1 read-only introspection + P2 live control handles: fold the spawn
+    // into the parent's registry, record the child's cancel flag + inbox
+    // sender (driving `task_cancel`/`task_message`), and surface the
+    // lifecycle transition on the same bounded event channel (the registry
+    // is also re-derivable from these events at resume — handles are not,
+    // they are runtime-only state).
     let terminal_tx = event_tx.clone();
     if let Some(ref registry) = cfg.registry {
         registry.record_spawned(
@@ -207,6 +238,7 @@ pub async fn spawn_child_session(
             sup.workspace_root.display().to_string(),
             sup.branch.clone(),
         );
+        registry.record_handles(&child_id, sup.cancel_handle(), sup.inbox_sender());
         if let Some(ref tx) = event_tx {
             let _ = tx
                 .send(AgentEvent::ChildSessionStatusChanged {
@@ -248,10 +280,25 @@ pub async fn spawn_child_session(
         sup.run_turn_with_images(&context_prompt, &images).await
     };
 
+    // Cancellation classification: `task_cancel` flips the child's cancel
+    // flag and the driver aborts cooperatively ("run cancelled") — such a
+    // child ends Cancelled (session json + registry + events), never Error.
+    // The flag check covers aborts whose error text differs (e.g. a provider
+    // error racing the flag); the text check covers a cancelled run whose
+    // flag a fresh generation could have cleared.
+    let child_cancel_flag = sup.cancel_handle();
+    let was_cancelled = match &result {
+        Ok(_) => false,
+        Err(e) => turn_was_cancelled(e, child_cancel_flag.load(Ordering::SeqCst)),
+    };
     let (status, output) = match result {
         Ok(text) => {
             sup.finish(EndReason::Completed).await;
             ("completed".to_string(), text)
+        }
+        Err(e) if was_cancelled => {
+            sup.finish(EndReason::Cancelled).await;
+            ("cancelled".to_string(), e.to_string())
         }
         Err(e) => {
             sup.finish(EndReason::Error).await;
@@ -259,18 +306,19 @@ pub async fn spawn_child_session(
         }
     };
 
-    // P1 read-only introspection: fold the terminal transition into the
-    // parent's registry (bounded summary) and emit the matching
-    // `ChildSessionStatusChanged` before the drain — same event channel the
-    // spawn events used. Foreground reply behavior is unchanged.
+    // P1 read-only introspection + P2 cancel bookkeeping: fold the terminal
+    // transition into the parent's registry (bounded summary — a cancelled
+    // task folds its recorded reason into "cancelled: <reason>"; live
+    // handles + the spent reason are cleared inside `record_terminal`) and
+    // emit the matching `ChildSessionStatusChanged` before the drain — same
+    // event channel the spawn events used. Foreground reply behavior is
+    // unchanged.
     if let Some(ref registry) = cfg.registry {
         let state = nca_common::session::ChildSessionState::from_spawn_status(&status);
-        let result_summary = nca_core::agent::truncate_str(output.trim(), 300);
-        let result_summary = if result_summary.is_empty() {
-            None
-        } else {
-            Some(result_summary)
-        };
+        let cancel_reason = registry
+            .get(&child_id)
+            .and_then(|entry| entry.cancel_reason.clone());
+        let result_summary = terminal_result_summary(&status, &output, cancel_reason.as_deref());
         registry.record_terminal(&child_id, state, result_summary.clone());
         if let Some(ref tx) = terminal_tx {
             let _ = tx
@@ -697,6 +745,53 @@ pub fn spawn_subagent_consumer(
 mod tests {
     use super::*;
     use nca_common::config::AgentProfileConfig;
+    use nca_core::provider::ProviderError;
+
+    #[test]
+    fn turn_was_cancelled_detects_flag_and_driver_error() {
+        let cancelled_err = ProviderError::Other("run cancelled".into());
+        let other_err = ProviderError::Other("provider 502".into());
+        assert!(turn_was_cancelled(&cancelled_err, false));
+        assert!(
+            turn_was_cancelled(&other_err, true),
+            "set flag wins even for a provider error"
+        );
+        assert!(!turn_was_cancelled(&other_err, false));
+    }
+
+    #[test]
+    fn terminal_result_summary_folds_cancel_reason() {
+        assert_eq!(
+            terminal_result_summary("cancelled", "run cancelled", Some("wrong branch")).as_deref(),
+            Some("cancelled: wrong branch")
+        );
+        assert_eq!(
+            terminal_result_summary("cancelled", "run cancelled", None).as_deref(),
+            Some("cancelled")
+        );
+    }
+
+    #[test]
+    fn terminal_result_summary_truncates_output_for_other_statuses() {
+        assert_eq!(
+            terminal_result_summary("completed", "all done", None).as_deref(),
+            Some("all done")
+        );
+        assert_eq!(
+            terminal_result_summary("error", "   ", None),
+            None,
+            "whitespace-only output yields no summary"
+        );
+        let long = "x".repeat(500);
+        let summary = terminal_result_summary("completed", &long, None).expect("truncated summary");
+        assert_eq!(
+            summary.chars().count(),
+            300,
+            "output summaries truncate to 300 chars (299 + ellipsis): {}",
+            summary.chars().rev().take(3).collect::<String>()
+        );
+        assert!(summary.ends_with('…'));
+    }
 
     /// The child's first user message must NOT inline the specialist
     /// persona — it lives only in the system prompt via

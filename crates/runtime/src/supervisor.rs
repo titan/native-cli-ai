@@ -42,7 +42,9 @@ use nca_core::tools::InvokeSkillTool;
 use nca_core::tools::ToolRegistry;
 use nca_core::tools::mcp::load_mcp_tools;
 use nca_core::tools::spawn_subagent::{SpawnRequest, SpawnSubagentTool};
-use nca_core::tools::subagent_control::{SubagentControlRequest, TaskResultTool, TaskStatusTool};
+use nca_core::tools::subagent_control::{
+    SubagentControlRequest, TaskCancelTool, TaskMessageTool, TaskResultTool, TaskStatusTool,
+};
 use nca_core::tools::{TodoStore, UpdateTodosTool};
 use nca_core::workspace_fs::{RealFs, WorkspaceFs};
 use serde_json::json;
@@ -535,11 +537,22 @@ impl Supervisor {
             )));
             let (control_tx, control_rx) = mpsc::channel::<SubagentControlRequest>(100);
             let control_timeout = Duration::from_millis(config.subagent.result_timeout_ms);
+            // Cancel is a flag-flip + reply: bounded tight (§2 wire table —
+            // 10s vs the 30s status/result/message budget).
+            let cancel_timeout = Duration::from_secs(10);
             tools.register(Box::new(TaskStatusTool::new(
                 control_tx.clone(),
                 control_timeout,
             )));
-            tools.register(Box::new(TaskResultTool::new(control_tx, control_timeout)));
+            tools.register(Box::new(TaskResultTool::new(
+                control_tx.clone(),
+                control_timeout,
+            )));
+            tools.register(Box::new(TaskMessageTool::new(
+                control_tx.clone(),
+                control_timeout,
+            )));
+            tools.register(Box::new(TaskCancelTool::new(control_tx, cancel_timeout)));
             subagent_control_rx = Some(control_rx);
         }
 
