@@ -9,6 +9,15 @@
 //!
 //! Rollback gate: constructing with `enabled = false` makes every entry
 //! point a hard no-op (no task is ever spawned, the trigger never fires).
+//!
+//! Pause latch (P4): [`WakeScheduler::pause`] suppresses wake delivery
+//! until the next [`WakeScheduler::note_input`] (the Submit choke point) —
+//! used by the `wait_for_user` tool so background terminals stay quiet
+//! while the orchestrator hands control back to the user. There is
+//! deliberately NO `resume()`: an inverse that only cleared `paused`
+//! would be incomplete (a pending window's debounce task must also be
+//! re-evaluated), and a resume that also reset the window flags would just
+//! duplicate `note_input`. Un-pausing rides `note_input` alone.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -33,6 +42,10 @@ struct Inner {
     /// Todo mute fold: `None` = todos never tracked; `Some(false)` = all
     /// todos complete (mute pending and future wakes).
     todos_incomplete: Mutex<Option<bool>>,
+    /// Pause latch (P4): while set, no wake may commit — terminals neither
+    /// reserve a window nor fire. Cleared by the next `note_input` (there
+    /// is intentionally no `resume()`; see the module docs).
+    paused: AtomicBool,
     /// Window generation, bumped by every `note_input`. A debounce task
     /// commits only while its generation is still current, so a window
     /// canceled by user input can never steal the reservation of a newer
@@ -65,6 +78,7 @@ impl WakeScheduler {
                 in_flight: AtomicBool::new(false),
                 delivered: AtomicBool::new(false),
                 todos_incomplete: Mutex::new(None),
+                paused: AtomicBool::new(false),
                 generation: AtomicU64::new(0),
             }),
         }
@@ -75,11 +89,14 @@ impl WakeScheduler {
     /// Opens (or joins) the debounce window; after `interval` the wake is
     /// delivered unless muted by the todo gate or superseded by user input.
     /// No-op when disabled, when a wake is already awaiting consumption
-    /// (`delivered`), or when a debounce window is already open (rapid
-    /// terminals coalesce into the pending wake).
+    /// (`delivered`), when paused, or when a debounce window is already
+    /// open (rapid terminals coalesce into the pending wake). The pause
+    /// check runs BEFORE the `in_flight` reserve so a paused scheduler
+    /// never holds a window open.
     pub fn notify_terminal(&self, child_ref: &str, state: &str, summary: &str) {
         let inner = &self.inner;
         if !inner.enabled
+            || inner.paused.load(Ordering::SeqCst)
             || inner.delivered.load(Ordering::SeqCst)
             || inner.in_flight.swap(true, Ordering::SeqCst)
         {
@@ -99,6 +116,13 @@ impl WakeScheduler {
             if let Ok(todos) = inner.todos_incomplete.lock()
                 && *todos == Some(false)
             {
+                inner.in_flight.store(false, Ordering::SeqCst);
+                return;
+            }
+            // Pause gate: `pause()` may have landed after this window was
+            // reserved (the reserve-just-before-pause race) — same mute path
+            // as the todo gate: clear the window, never fire.
+            if inner.paused.load(Ordering::SeqCst) {
                 inner.in_flight.store(false, Ordering::SeqCst);
                 return;
             }
@@ -122,6 +146,16 @@ impl WakeScheduler {
         });
     }
 
+    /// Pause wake delivery (P4). The caller is the `wait_for_user` tool's
+    /// injected hook: the orchestrator is handing control back to the user,
+    /// so background-child wakes must stay suppressed. Suppression holds
+    /// until the next [`WakeScheduler::note_input`] — while paused no wake
+    /// can commit, so the next Submit is external (the user's) by
+    /// construction. Harmless on a disabled scheduler.
+    pub fn pause(&self) {
+        self.inner.paused.store(true, Ordering::SeqCst);
+    }
+
     /// Fold of `TodosUpdated`: `incomplete` is `true` when any todo is
     /// pending or in_progress. `Some(false)` (all complete) mutes pending
     /// and future wakes; `Some(true)` or never-called both allow waking.
@@ -133,13 +167,15 @@ impl WakeScheduler {
 
     /// Called on every Submit (user or wake). Clears both gate flags: any
     /// input consumes/obsoletes a queued wake, cancels a pending debounce,
-    /// and re-arms the scheduler for the next terminal. Bumping the window
-    /// generation retires any debounce task still parked in a canceled
-    /// window so it can never deliver its stale wake text later.
+    /// re-arms the scheduler for the next terminal, and releases the P4
+    /// pause latch. Bumping the window generation retires any debounce
+    /// task still parked in a canceled window so it can never deliver its
+    /// stale wake text later.
     pub fn note_input(&self) {
         self.inner.generation.fetch_add(1, Ordering::SeqCst);
         self.inner.in_flight.store(false, Ordering::SeqCst);
         self.inner.delivered.store(false, Ordering::SeqCst);
+        self.inner.paused.store(false, Ordering::SeqCst);
     }
 }
 
@@ -339,5 +375,90 @@ mod tests {
         sched.notify_terminal("b-1", "completed", "next");
         elapse(INTERVAL).await;
         assert_eq!(fired(&mut rx).len(), 1, "re-armed after in-window mute");
+    }
+
+    // ── P4 pause latch ─────────────────────────────────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_while_paused_never_fires_and_reserves_no_window() {
+        let (sched, mut rx) = scheduler(true);
+        sched.pause();
+        sched.notify_terminal("a-1", "completed", "while paused");
+
+        // The pause check runs BEFORE the in_flight reserve — a paused
+        // scheduler holds no window open.
+        assert!(
+            !sched.inner.in_flight.load(Ordering::SeqCst),
+            "paused terminal must not reserve a debounce window"
+        );
+
+        elapse(Duration::from_secs(10)).await;
+        assert!(fired(&mut rx).is_empty(), "paused scheduler never fires");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pause_during_open_window_mutes_pending_wake_then_re_arms() {
+        let (sched, mut rx) = scheduler(true);
+        // The window is open (timer parked at t=0); pause lands INSIDE it,
+        // before the debounce commits — pinned synchronously so the paused
+        // clock cannot race past the window.
+        sched.notify_terminal("a-1", "completed", "pending");
+        sched.pause();
+        elapse(INTERVAL).await;
+        assert!(
+            fired(&mut rx).is_empty(),
+            "pause during the window mutes the pending wake"
+        );
+
+        // The mute path closed the window; still paused, terminals stay
+        // no-ops.
+        sched.notify_terminal("a-2", "completed", "still paused");
+        elapse(INTERVAL).await;
+        assert!(fired(&mut rx).is_empty(), "pause holds until note_input");
+
+        // note_input releases the latch: a new terminal fires normally.
+        sched.note_input();
+        sched.notify_terminal("b-2", "completed", "after the user spoke");
+        elapse(INTERVAL).await;
+        let fires = fired(&mut rx);
+        assert_eq!(fires.len(), 1, "re-armed after note_input: {fires:?}");
+        assert!(fires[0].contains("b-2"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn note_input_un_pauses_the_scheduler() {
+        let (sched, mut rx) = scheduler(true);
+        sched.pause();
+        // Terminal while paused is a no-op (window never reserved).
+        sched.notify_terminal("a-1", "completed", "muted");
+        elapse(INTERVAL).await;
+        assert!(fired(&mut rx).is_empty(), "no wake while paused");
+
+        // note_input releases the latch; the next terminal fires.
+        sched.note_input();
+        sched.notify_terminal("c-1", "completed", "un-paused");
+        elapse(INTERVAL).await;
+        let fires = fired(&mut rx);
+        assert_eq!(fires.len(), 1, "note_input un-pauses: {fires:?}");
+        assert!(fires[0].contains("c-1"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pause_on_disabled_scheduler_is_a_harmless_noop() {
+        let (sched, mut rx) = scheduler(false);
+        sched.pause();
+        sched.notify_terminal("a-1", "completed", "ignored");
+        elapse(Duration::from_secs(30)).await;
+        assert!(fired(&mut rx).is_empty(), "disabled scheduler never fires");
+        assert!(
+            !sched.inner.in_flight.load(Ordering::SeqCst),
+            "no window reserved when disabled"
+        );
+
+        // Even the un-pause path stays inert on a disabled scheduler.
+        sched.note_input();
+        sched.notify_terminal("b-1", "completed", "still disabled");
+        elapse(Duration::from_secs(30)).await;
+        assert!(fired(&mut rx).is_empty(), "disabled + unpaused never fires");
     }
 }
