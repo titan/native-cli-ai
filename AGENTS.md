@@ -175,6 +175,7 @@ Built in `core::harness::build_system_prompt_with_agent` (accepts an optional `A
 | `crates/runtime/src/supervisor.rs` | Session lifecycle supervisor, `apply_agent_profile`, `register_skill_agents` |
 | `crates/runtime/src/context_manager.rs` | Token tracking, auto-summarize, sliding window |
 | `crates/runtime/src/subagent.rs` | Subagent spawning and management |
+| `crates/runtime/src/wake_scheduler.rs` | P3 wake scheduler (debounced parent wake on background-child terminal) |
 | `crates/runtime/src/worktree.rs` | Git worktree creation and cleanup |
 | `crates/runtime/src/memory_store.rs` | Workspace memory persistence |
 | `crates/cli/src/main.rs` | Binary entrypoint |
