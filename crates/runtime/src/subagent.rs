@@ -6,7 +6,6 @@ use nca_common::event::{AgentEvent, EndReason};
 use nca_common::message::ImageAttachment;
 use nca_common::model_caps::model_accepts_native_images;
 use nca_common::session::ChildSessionState;
-use nca_core::agent::AgentLoop;
 use nca_core::approval::ApprovalHandler;
 use nca_core::hooks::{HookEventKind, HookRunner};
 use nca_core::tools::spawn_subagent::{MAX_FORWARD_IMAGES, SpawnRequest};
@@ -177,7 +176,7 @@ pub struct PreparedChild {
 ///
 /// Precedent (ask_question): an unknown-tool error is recoverable; an
 /// invisible hang is not.
-fn strip_child_only_tools(agent: &mut AgentLoop) {
+fn strip_child_only_tools(tools: &mut nca_core::tools::ToolRegistry) {
     const PARENT_ONLY_TOOLS: &[&str] = &[
         "ask_question",
         "wait_for_user",
@@ -189,7 +188,7 @@ fn strip_child_only_tools(agent: &mut AgentLoop) {
         "task_revive",
     ];
     for name in PARENT_ONLY_TOOLS {
-        agent.tools.unregister(name);
+        tools.unregister(name);
     }
 }
 
@@ -272,7 +271,7 @@ pub async fn prepare_child_session(
     // 600s window; the task_* tools would only error against the child's
     // empty registry. The model gets a normal "unknown tool" error it can
     // recover from instead of invisible hangs.
-    strip_child_only_tools(sup.agent_mut());
+    strip_child_only_tools(&mut sup.agent_mut().tools);
 
     let child_id = sup.session_id.clone();
 
@@ -640,7 +639,7 @@ pub async fn handle_revive_request(
     // Parent-only tool strip, same as the spawn path (see
     // [`strip_child_only_tools`]) — a revived child is just as non-
     // interactive and has no spawn consumer as a fresh one.
-    strip_child_only_tools(sup.agent_mut());
+    strip_child_only_tools(&mut sup.agent_mut().tools);
 
     // The retained worktree: `Supervisor::resume` restores the worktree
     // FIELDS from the child's meta but NOT the fs/pty cwd (pinned by
@@ -1202,12 +1201,9 @@ async fn complete_child_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nca_common::config::{AgentProfileConfig, PermissionConfig, PermissionMode};
-    use nca_common::message::Message;
+    use nca_common::config::AgentProfileConfig;
     use nca_common::tool::{ToolCall, ToolDefinition, ToolResult};
-    use nca_core::agent::AgentLoop;
-    use nca_core::approval::ApprovalPolicy;
-    use nca_core::provider::{Provider, ProviderError};
+    use nca_core::provider::ProviderError;
     use nca_core::tools::{ToolExecutor, ToolRegistry};
 
     #[test]
@@ -1352,25 +1348,8 @@ mod tests {
         }
     }
 
-    /// Provider stub — `chat` is never called by the strip test; the
-    /// AgentLoop constructor just needs one.
-    struct NoopProvider;
-
-    #[async_trait::async_trait]
-    impl Provider for NoopProvider {
-        async fn chat(
-            &self,
-            _messages: &[Message],
-            _tools: &[ToolDefinition],
-            _model: &str,
-            _workspace_root: &Path,
-        ) -> Result<mpsc::Receiver<nca_core::provider::StreamChunk>, ProviderError> {
-            Err(ProviderError::Other("noop provider".into()))
-        }
-    }
-
-    /// Cheapest seam for the strip: a minimal `AgentLoop` with a stub
-    /// registry — no `prepare_child_session`, no supervisor, no tokio.
+    /// Cheapest seam for the strip: a bare registry of named stub tools —
+    /// no provider, no AgentLoop, no supervisor, no tokio.
     #[test]
     fn strip_child_only_tools_removes_parent_only_tools_and_keeps_the_rest() {
         let mut tools = ToolRegistry::new();
@@ -1388,30 +1367,10 @@ mod tests {
         ] {
             tools.register(Box::new(NamedStubTool(name)));
         }
-        let (event_tx, _event_rx) = mpsc::channel(16);
-        let mut agent = AgentLoop::new(
-            Arc::new(NoopProvider),
-            tools,
-            ApprovalPolicy::new(PermissionConfig {
-                mode: PermissionMode::BypassPermissions,
-                ..Default::default()
-            }),
-            "test-model".into(),
-            event_tx,
-            10,
-            16,
-            0,
-            None,
-        );
 
-        strip_child_only_tools(&mut agent);
+        strip_child_only_tools(&mut tools);
 
-        let names: Vec<String> = agent
-            .tools
-            .definitions()
-            .iter()
-            .map(|d| d.name.clone())
-            .collect();
+        let names: Vec<String> = tools.definitions().iter().map(|d| d.name.clone()).collect();
         assert_eq!(
             names,
             vec!["read_file".to_string(), "write_file".to_string()],
@@ -1420,8 +1379,8 @@ mod tests {
 
         // Idempotent: a second strip (the revive path over an already-stripped
         // registry) is a no-op.
-        strip_child_only_tools(&mut agent);
-        assert_eq!(agent.tools.definitions().len(), 2);
+        strip_child_only_tools(&mut tools);
+        assert_eq!(tools.definitions().len(), 2);
     }
 
     #[test]
