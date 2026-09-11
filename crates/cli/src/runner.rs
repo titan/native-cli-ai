@@ -176,6 +176,15 @@ impl SessionRuntime {
         self.supervisor.agent_mut().model = model;
     }
 
+    /// Post-hoc tool registration for CLI-owned tools (P4 `wait_for_user`).
+    /// Delegates straight to the supervisor's live agent registry; the
+    /// registration survives agent-profile switches because
+    /// `apply_agent_profile` never touches the tool registry (gating via
+    /// `restrict_to` runs only at `Supervisor::create`).
+    pub fn register_tool(&mut self, tool: Box<dyn nca_core::tools::ToolExecutor>) {
+        self.supervisor.agent_mut().tools.register(tool);
+    }
+
     pub fn permission_mode(&self) -> PermissionMode {
         self.supervisor.agent().approval.mode()
     }
