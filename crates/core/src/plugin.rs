@@ -503,18 +503,16 @@ impl PluginRegistry {
 
     /// Execute a contributed tool by dispatching to the owning plugin.
     pub async fn execute_plugin_tool(&self, call: &ToolCall) -> Option<ToolResult> {
-        for plugin in self
+        // Snapshot the owner first, then drop the read guard BEFORE awaiting
+        // (a std lock guard held across an await can deadlock a writer).
+        let owner = self
             .plugins
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .iter()
-        {
-            let tools = plugin.tools();
-            if tools.iter().any(|t| t.name == call.name) {
-                return Some(plugin.execute_tool(call).await);
-            }
-        }
-        None
+            .find(|plugin| plugin.tools().iter().any(|t| t.name == call.name))
+            .cloned()?;
+        Some(owner.execute_tool(call).await)
     }
 
     /// Iterate over all registered plugins (snapshot).

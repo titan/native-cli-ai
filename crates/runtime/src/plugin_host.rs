@@ -545,6 +545,10 @@ pub(crate) struct RemotePlugin {
 }
 
 impl RemotePlugin {
+    /// Shared handles + capabilities for one live plugin process. Eight
+    /// fields is the honest shape of the bridge; bundling them into a struct
+    /// would just move the ceremony.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: impl Into<String>,
         stdin: Arc<Mutex<ChildStdin>>,
@@ -565,16 +569,6 @@ impl RemotePlugin {
             capabilities,
             config,
         }
-    }
-
-    /// Record the disable reason (G7). Callers set the flag first, then the
-    /// reason; readers tolerate a missing reason.
-    fn disable_with_reason(&self, reason: impl Into<String>) {
-        self.disabled.store(true, Ordering::SeqCst);
-        *self
-            .disable_reason
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = Some(reason.into());
     }
 
     /// Whether this plugin declared the named optional hook in its Hello
