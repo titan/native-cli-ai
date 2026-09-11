@@ -6,6 +6,7 @@ use nca_common::event::{AgentEvent, EndReason};
 use nca_common::message::ImageAttachment;
 use nca_common::model_caps::model_accepts_native_images;
 use nca_common::session::ChildSessionState;
+use nca_core::agent::AgentLoop;
 use nca_core::approval::ApprovalHandler;
 use nca_core::hooks::{HookEventKind, HookRunner};
 use nca_core::tools::spawn_subagent::{MAX_FORWARD_IMAGES, SpawnRequest};
@@ -157,9 +158,45 @@ pub struct PreparedChild {
     pub terminal_tx: Option<mpsc::Sender<AgentEvent>>,
 }
 
+/// Remove every parent-only tool from a child session's registry (both the
+/// spawn and revive paths).
+///
+/// Why each family is parent-only:
+/// - `ask_question` / `wait_for_user`: a child's `QuestionRequested` is not
+///   forwarded to any UI and nobody can answer its oneshot — an invisible
+///   hang. `wait_for_user` is defensive only: it is never registered on
+///   children (registration is the top-level TUI gate).
+/// - `spawn_subagent`: children have no spawn consumer of their own, so a
+///   grandchild spawn would park on the oneshot reply for the full ~600s
+///   tool window — `spawn_rx` alive but undrained is a REAL hang, not an
+///   error.
+/// - `task_status`/`task_result`/`task_message`/`task_cancel`/
+///   `task_revive`: these resolve against the child's own EMPTY registry
+///   and would fail fast with "unknown task id" anyway — stripped as
+///   hygiene so the model gets a plain unknown-tool error instead.
+///
+/// Precedent (ask_question): an unknown-tool error is recoverable; an
+/// invisible hang is not.
+fn strip_child_only_tools(agent: &mut AgentLoop) {
+    const PARENT_ONLY_TOOLS: &[&str] = &[
+        "ask_question",
+        "wait_for_user",
+        "spawn_subagent",
+        "task_status",
+        "task_result",
+        "task_message",
+        "task_cancel",
+        "task_revive",
+    ];
+    for name in PARENT_ONLY_TOOLS {
+        agent.tools.unregister(name);
+    }
+}
+
 /// Phase 1 of a child spawn: everything up to (but not including) the
 /// first `run_turn` — routing config, image resolution,
-/// `Supervisor::create`, `ask_question` strip, parent linkage, worktree
+/// `Supervisor::create`, parent-only tool strip
+/// ([`strip_child_only_tools`]), parent linkage, worktree
 /// create+switch, spawn/running events, registry record (handles + alias +
 /// specialist + worktree path), and the built context prompt. Returns the
 /// live supervisor plus a [`PreparedChild`] for [`run_prepared_child`].
@@ -229,13 +266,13 @@ pub async fn prepare_child_session(
     .await
     .map_err(|e| e.to_string())?;
 
-    // Child sessions are non-interactive: `QuestionRequested` is NOT
-    // forwarded to the parent UI (only activity lines are), so a child that
-    // called `ask_question` would block forever on an oneshot nobody can
-    // answer — freezing both the child and the parent turn awaiting it.
-    // Strip the tool; the model gets a normal "unknown tool" error it can
-    // recover from instead of an invisible hang.
-    sup.agent_mut().tools.unregister("ask_question");
+    // Parent-only tools never exist on a child: a question nobody can
+    // answer would hang the child (and the parent turn awaiting it) forever;
+    // a grandchild spawn would park on an undrained oneshot for the full
+    // 600s window; the task_* tools would only error against the child's
+    // empty registry. The model gets a normal "unknown tool" error it can
+    // recover from instead of invisible hangs.
+    strip_child_only_tools(sup.agent_mut());
 
     let child_id = sup.session_id.clone();
 
@@ -600,10 +637,10 @@ pub async fn handle_revive_request(
         }
     };
 
-    // Child sessions are non-interactive: strip ask_question (same rationale
-    // as the spawn path — a child question nobody can answer would hang the
-    // revive forever).
-    sup.agent_mut().tools.unregister("ask_question");
+    // Parent-only tool strip, same as the spawn path (see
+    // [`strip_child_only_tools`]) — a revived child is just as non-
+    // interactive and has no spawn consumer as a fresh one.
+    strip_child_only_tools(sup.agent_mut());
 
     // The retained worktree: `Supervisor::resume` restores the worktree
     // FIELDS from the child's meta but NOT the fs/pty cwd (pinned by
@@ -1165,8 +1202,13 @@ async fn complete_child_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nca_common::config::AgentProfileConfig;
-    use nca_core::provider::ProviderError;
+    use nca_common::config::{AgentProfileConfig, PermissionConfig, PermissionMode};
+    use nca_common::message::Message;
+    use nca_common::tool::{ToolCall, ToolDefinition, ToolResult};
+    use nca_core::agent::AgentLoop;
+    use nca_core::approval::ApprovalPolicy;
+    use nca_core::provider::{Provider, ProviderError};
+    use nca_core::tools::{ToolExecutor, ToolRegistry};
 
     #[test]
     fn turn_was_cancelled_detects_flag_and_driver_error() {
@@ -1282,6 +1324,104 @@ mod tests {
             },
         );
         cfg
+    }
+
+    // ── M3: strip_child_only_tools ────────────────────────────────
+
+    /// Named no-op tool so a registry can carry arbitrary tool names.
+    struct NamedStubTool(&'static str);
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for NamedStubTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                timeout_ms: None,
+                name: self.0.into(),
+                description: "stub".into(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+        async fn execute(&self, _call: &ToolCall) -> ToolResult {
+            ToolResult {
+                timed_out: false,
+                call_id: String::new(),
+                success: true,
+                output: String::new(),
+                error: None,
+            }
+        }
+    }
+
+    /// Provider stub — `chat` is never called by the strip test; the
+    /// AgentLoop constructor just needs one.
+    struct NoopProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for NoopProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _model: &str,
+            _workspace_root: &Path,
+        ) -> Result<mpsc::Receiver<nca_core::provider::StreamChunk>, ProviderError> {
+            Err(ProviderError::Other("noop provider".into()))
+        }
+    }
+
+    /// Cheapest seam for the strip: a minimal `AgentLoop` with a stub
+    /// registry — no `prepare_child_session`, no supervisor, no tokio.
+    #[test]
+    fn strip_child_only_tools_removes_parent_only_tools_and_keeps_the_rest() {
+        let mut tools = ToolRegistry::new();
+        for name in [
+            "read_file",
+            "ask_question",
+            "wait_for_user",
+            "spawn_subagent",
+            "task_status",
+            "task_result",
+            "task_message",
+            "task_cancel",
+            "task_revive",
+            "write_file",
+        ] {
+            tools.register(Box::new(NamedStubTool(name)));
+        }
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut agent = AgentLoop::new(
+            Arc::new(NoopProvider),
+            tools,
+            ApprovalPolicy::new(PermissionConfig {
+                mode: PermissionMode::BypassPermissions,
+                ..Default::default()
+            }),
+            "test-model".into(),
+            event_tx,
+            10,
+            16,
+            0,
+            None,
+        );
+
+        strip_child_only_tools(&mut agent);
+
+        let names: Vec<String> = agent
+            .tools
+            .definitions()
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["read_file".to_string(), "write_file".to_string()],
+            "only the child-legal tools survive the strip"
+        );
+
+        // Idempotent: a second strip (the revive path over an already-stripped
+        // registry) is a no-op.
+        strip_child_only_tools(&mut agent);
+        assert_eq!(agent.tools.definitions().len(), 2);
     }
 
     #[test]
