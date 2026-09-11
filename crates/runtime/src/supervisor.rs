@@ -108,6 +108,9 @@ pub struct Supervisor {
     plugins: Arc<PluginRegistry>,
     #[allow(dead_code)] // retained for RAII — drop cleans up child plugin processes.
     plugin_host: Option<PluginHost>,
+    /// Plugin names whose disable has already been surfaced to the user
+    /// (G7): each plugin is reported once per disable (reset on refresh).
+    plugin_disable_reported: HashSet<String>,
     context_manager: ContextManager,
     last_summary_at_tokens: usize,
     fs: Arc<dyn WorkspaceFs>,
@@ -778,6 +781,7 @@ impl Supervisor {
             hooks: hook_runner,
             plugins: Arc::new(plugins),
             plugin_host,
+            plugin_disable_reported: HashSet::new(),
             context_manager,
             last_summary_at_tokens: 0,
             fs: fs_for_supervisor,
@@ -1050,6 +1054,9 @@ impl Supervisor {
                 self.model
             )));
         }
+
+        // G7: report plugins disabled since the last turn (once each).
+        self.surface_plugin_disables();
 
         // Check context before running turn
         self.maybe_compact_context().await;
@@ -1898,6 +1905,114 @@ impl Supervisor {
     pub async fn record_plugin_command_echo(&mut self, plugin: &str, text: &str) {
         let note = format!("[plugin:{plugin}] {text}");
         self.agent.record_system_note(&note).await;
+    }
+
+    /// G7: surface plugins that got disabled since the last check as
+    /// system lines in the transcript (a disable without notice looks like
+    /// plugins silently vanishing). Called at turn start — cheap when clean.
+    fn surface_plugin_disables(&mut self) {
+        let Some(host) = self.plugin_host.as_ref() else {
+            return;
+        };
+        for (name, reason) in host.disabled_plugins() {
+            if self.plugin_disable_reported.insert(name.clone()) {
+                let note = format!(
+                    "[plugin] {name} disabled ({reason}) — tools and hooks from this plugin are unavailable; /plugin refresh to restart"
+                );
+                tracing::warn!("{note}");
+                if let Some(tx) = self.agent.event_sender() {
+                    let _ = tx.try_send(AgentEvent::MessageReceived {
+                        role: "system".into(),
+                        content: note,
+                        steering: false,
+                    });
+                }
+            }
+        }
+    }
+
+    /// G7 `/plugin refresh`: restart every plugin process, swap the live
+    /// registry contents in place (spawn consumers keep observing the same
+    /// `Arc<PluginRegistry>`), re-register plugin tools, and rebuild the
+    /// system prompt. Returns a human-readable status line.
+    pub async fn refresh_plugins(&mut self) -> Result<String, String> {
+        let Some(host) = self.plugin_host.as_mut() else {
+            return Err("no plugin host: safe mode or no plugins discovered".into());
+        };
+
+        // Old plugin tool names must leave the ToolRegistry (fresh instances
+        // re-register below; a name that vanished between refreshes would
+        // otherwise stay callable-but-dead).
+        let old_tool_names: Vec<String> = self
+            .plugins
+            .iter()
+            .into_iter()
+            .flat_map(|p| p.tools().into_iter().map(|t| t.name))
+            .collect();
+
+        let perm_mode = serde_json::to_string(&self.config.permissions.mode)
+            .unwrap_or_else(|_| "\"default\"".into());
+        let perm_mode = perm_mode.trim_matches('"');
+        let errors = host
+            .refresh(&self.workspace_root, &self.session_id, perm_mode)
+            .await;
+
+        self.plugins.adopt(host.registry());
+        self.plugin_disable_reported.clear();
+
+        {
+            let plugin_cfg = self.config.plugins.clone();
+            let plugins = Arc::clone(&self.plugins);
+            let tools = &mut self.agent_mut().tools;
+            for name in &old_tool_names {
+                tools.unregister(name);
+            }
+            nca_core::tools::plugin_tool::register_plugin_tools(tools, &plugins, &plugin_cfg);
+        }
+        self.rebuild_system_prompt();
+
+        // Fresh handshake sent a new Config — replay the session-start event.
+        self.plugins.notify_event(&serde_json::json!({
+            "type": "session_start",
+            "session_id": self.session_id,
+        }));
+
+        let count = self.plugins.len();
+        if errors.is_empty() {
+            Ok(format!("refreshed: {count} plugin(s) running"))
+        } else {
+            Ok(format!(
+                "refreshed: {count} plugin(s) running; errors: {}",
+                errors.join("; ")
+            ))
+        }
+    }
+
+    /// G7 `/plugin status`: plugin names, health, and declared surface.
+    pub fn plugin_status(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        let disabled: HashMap<String, String> = self
+            .plugin_host
+            .as_ref()
+            .map(|h| h.disabled_plugins().into_iter().collect())
+            .unwrap_or_default();
+        if self.plugins.is_empty() {
+            lines.push("no plugins loaded".into());
+            return lines;
+        }
+        for plugin in self.plugins.iter() {
+            let name = plugin.name().to_string();
+            let tools = plugin.tools().len();
+            let commands = plugin.commands().len();
+            let health = match disabled.get(&name) {
+                Some(reason) => format!("DISABLED ({reason})"),
+                None => "running".to_string(),
+            };
+            lines.push(format!(
+                "{name}: {health}, {tools} tool(s), {commands} command(s)"
+            ));
+        }
+        lines
     }
 
     pub fn request_cancel(&self) {

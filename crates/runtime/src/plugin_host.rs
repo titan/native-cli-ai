@@ -48,6 +48,8 @@ struct RemotePluginInstance {
     stdout: Option<Arc<Mutex<ChildStdout>>>,
     capabilities: Option<PluginCapabilities>,
     disabled: Arc<AtomicBool>,
+    /// Last disable reason (G7 surfacing). Set alongside `disabled`.
+    disable_reason: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// Parsed capabilities from Hello.
@@ -251,6 +253,13 @@ impl PluginHost {
         let stdin = Arc::new(Mutex::new(stdin));
         let stdout = Arc::new(Mutex::new(stdout));
         let disabled = Arc::new(AtomicBool::new(false));
+        let disable_reason: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
+        let mark_disabled = |reason: String| {
+            disabled.store(true, Ordering::SeqCst);
+            *disable_reason.lock().unwrap_or_else(|p| p.into_inner()) = Some(reason);
+        };
 
         // Read Hello message with timeout.
         let hello_result = tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
@@ -269,7 +278,9 @@ impl PluginHost {
                         protocol_major,
                         PROTOCOL_MAJOR
                     );
-                    disabled.store(true, Ordering::SeqCst);
+                    mark_disabled(format!(
+                        "protocol major {protocol_major} != {PROTOCOL_MAJOR}"
+                    ));
                 }
                 caps
             }
@@ -312,6 +323,7 @@ impl PluginHost {
             stdout: Some(stdout),
             capabilities: Some(capabilities),
             disabled,
+            disable_reason,
         });
 
         Ok(())
@@ -332,6 +344,7 @@ impl PluginHost {
                     stdout.clone(),
                     self.next_id.clone(),
                     instance.disabled.clone(),
+                    instance.disable_reason.clone(),
                     caps,
                     self.config.clone(),
                 );
@@ -339,6 +352,38 @@ impl PluginHost {
             }
         }
         reg
+    }
+
+    /// Currently-disabled plugins with their last disable reason (G7).
+    pub fn disabled_plugins(&self) -> Vec<(String, String)> {
+        self.instances
+            .iter()
+            .filter(|i| i.disabled.load(Ordering::SeqCst))
+            .map(|i| {
+                let reason = i
+                    .disable_reason
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone()
+                    .unwrap_or_else(|| "unknown reason".into());
+                (i.name.clone(), reason)
+            })
+            .collect()
+    }
+
+    /// Restart every plugin process and rebuild the registry from the fresh
+    /// instances (G7 `/plugin refresh`). Returns per-plugin startup errors;
+    /// an empty vec means every discovered plugin came up clean.
+    pub async fn refresh(
+        &mut self,
+        workspace_root: &Path,
+        session_id: &str,
+        permission_mode: &str,
+    ) -> Vec<String> {
+        self.shutdown().await;
+        let descriptors = discover_plugins();
+        self.start_all(&descriptors, workspace_root, session_id, permission_mode)
+            .await
     }
 
     /// Gracefully shut down all plugin processes.
@@ -494,6 +539,7 @@ pub(crate) struct RemotePlugin {
     stdout: Arc<Mutex<ChildStdout>>,
     next_id: Arc<AtomicU64>,
     disabled: Arc<AtomicBool>,
+    disable_reason: Arc<std::sync::Mutex<Option<String>>>,
     capabilities: PluginCapabilities,
     config: PluginConfig,
 }
@@ -505,6 +551,7 @@ impl RemotePlugin {
         stdout: Arc<Mutex<ChildStdout>>,
         next_id: Arc<AtomicU64>,
         disabled: Arc<AtomicBool>,
+        disable_reason: Arc<std::sync::Mutex<Option<String>>>,
         capabilities: PluginCapabilities,
         config: PluginConfig,
     ) -> Self {
@@ -514,9 +561,20 @@ impl RemotePlugin {
             stdout,
             next_id,
             disabled,
+            disable_reason,
             capabilities,
             config,
         }
+    }
+
+    /// Record the disable reason (G7). Callers set the flag first, then the
+    /// reason; readers tolerate a missing reason.
+    fn disable_with_reason(&self, reason: impl Into<String>) {
+        self.disabled.store(true, Ordering::SeqCst);
+        *self
+            .disable_reason
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(reason.into());
     }
 
     /// Whether this plugin declared the named optional hook in its Hello
@@ -565,7 +623,13 @@ impl RemotePlugin {
         let stdin = self.stdin.clone();
         let stdout = self.stdout.clone();
         let disabled = self.disabled.clone();
+        let disable_reason = self.disable_reason.clone();
         let expected_id = expected_id.to_string();
+
+        let mark_disabled = move |reason: String| {
+            disabled.store(true, Ordering::SeqCst);
+            *disable_reason.lock().unwrap_or_else(|p| p.into_inner()) = Some(reason);
+        };
         tokio::task::block_in_place(|| {
             handle.block_on(async move {
                 // Hold the stdout lock across write AND read: this serializes
@@ -593,11 +657,11 @@ impl RemotePlugin {
                     {
                         Ok(Ok(data)) => data,
                         Ok(Err(e)) => {
-                            disabled.store(true, Ordering::SeqCst);
+                            mark_disabled(format!("read: {e}"));
                             return Err(format!("read: {e}"));
                         }
                         Err(_) => {
-                            disabled.store(true, Ordering::SeqCst);
+                            mark_disabled(format!("plugin timed out after {timeout_secs}s"));
                             return Err(format!("plugin timed out after {timeout_secs}s"));
                         }
                     };
@@ -621,7 +685,7 @@ impl RemotePlugin {
                                 plugin_protocol::build_error(&id, "callbacks are not supported");
                             let mut stdin_guard = stdin.lock().await;
                             if let Err(e) = write_capnp_message(&mut stdin_guard, &reply).await {
-                                disabled.store(true, Ordering::SeqCst);
+                                mark_disabled(format!("write callback-error: {e}"));
                                 return Err(format!("write callback-error: {e}"));
                             }
                         }
@@ -638,7 +702,7 @@ impl RemotePlugin {
                     }
 
                     if skipped >= 8 {
-                        disabled.store(true, Ordering::SeqCst);
+                        mark_disabled(format!("stream desynced: {skipped} unmatched frames"));
                         return Err(format!(
                             "plugin {} stream desynced: {skipped} unmatched frames",
                             self.name
@@ -892,12 +956,15 @@ impl NcaPlugin for RemotePlugin {
         });
         let stdin = self.stdin.clone();
         let disabled = self.disabled.clone();
+        let disable_reason = self.disable_reason.clone();
         let name = self.name.clone();
         handle.spawn(async move {
             let mut guard = stdin.lock().await;
             if let Err(e) = write_capnp_message(&mut guard, &wire).await {
                 tracing::warn!("plugin {name} event notify failed: {e}");
                 disabled.store(true, Ordering::SeqCst);
+                *disable_reason.lock().unwrap_or_else(|p| p.into_inner()) =
+                    Some(format!("event notify write: {e}"));
             }
         });
     }

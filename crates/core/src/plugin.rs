@@ -206,41 +206,61 @@ pub trait NcaPlugin: Send + Sync {
 /// A collection of plugins loaded at session startup.
 ///
 /// Plugins are stored as `Arc` so contributed tools can hold a handle to
-/// their owning plugin (see `core::tools::plugin_tool::PluginTool`) while
-/// the registry itself is shared with subagent dispatch.
+/// their owning plugin (see `core::tools::plugin_tool::PluginTool`). The
+/// list lives behind a `RwLock` so a live session can hot-swap the plugin
+/// set (`/plugin refresh`, G7) while the registry `Arc` stays shared with
+/// the subagent spawn consumer (G3).
 #[derive(Default)]
 pub struct PluginRegistry {
-    plugins: Vec<Arc<dyn NcaPlugin>>,
+    plugins: std::sync::RwLock<Vec<Arc<dyn NcaPlugin>>>,
 }
 
 impl PluginRegistry {
     pub fn new() -> Self {
         Self {
-            plugins: Vec::new(),
+            plugins: std::sync::RwLock::new(Vec::new()),
         }
     }
 
     /// Register a plugin. Order matters: plugins are invoked in registration
     /// order for sequential hooks.
     pub fn register(&mut self, plugin: Box<dyn NcaPlugin>) {
-        self.plugins.push(plugin.into());
+        self.register_shared(plugin.into());
     }
 
     /// Register a plugin from a shared handle (keeps existing Arc clones
     /// valid, e.g. when rebuilding a registry from live `RemotePlugin`
     /// instances on refresh).
     pub fn register_shared(&mut self, plugin: Arc<dyn NcaPlugin>) {
-        self.plugins.push(plugin);
+        self.plugins
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(plugin);
+    }
+
+    /// Replace the whole plugin set in place (G7 `/plugin refresh`). Every
+    /// existing share of this registry observes the new set; callers must
+    /// separately rebuild anything derived from it (tool registrations,
+    /// system-prompt sections).
+    pub fn adopt(&self, other: PluginRegistry) {
+        let incoming = other
+            .plugins
+            .into_inner()
+            .unwrap_or_else(|p| p.into_inner());
+        *self.plugins.write().unwrap_or_else(|p| p.into_inner()) = incoming;
     }
 
     /// Number of registered plugins.
     pub fn len(&self) -> usize {
-        self.plugins.len()
+        self.plugins.read().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     /// Whether any plugins are registered.
     pub fn is_empty(&self) -> bool {
-        self.plugins.is_empty()
+        self.plugins
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty()
     }
 
     /// Collect all non-`None` system-prompt contributions from registered plugins.
@@ -250,6 +270,8 @@ impl PluginRegistry {
         workspace_root: &Path,
     ) -> Vec<(String, String)> {
         self.plugins
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
             .iter()
             .filter_map(|plugin| {
                 plugin
@@ -262,6 +284,8 @@ impl PluginRegistry {
     /// Feed a user prompt to all plugins and collect any user-visible messages.
     pub fn collect_user_prompt_hooks(&self, prompt: &str) -> Vec<(String, String)> {
         self.plugins
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
             .iter()
             .filter_map(|plugin| {
                 plugin
@@ -273,21 +297,36 @@ impl PluginRegistry {
 
     /// Apply all `chat.params` transformation hooks sequentially.
     pub fn apply_chat_params(&self, params: &mut ChatParams) {
-        for plugin in &self.plugins {
+        for plugin in self
+            .plugins
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+        {
             plugin.on_chat_params(params);
         }
     }
 
     /// Apply all `shell.env` transformation hooks sequentially.
     pub fn apply_shell_env(&self, env: &mut ShellEnv) {
-        for plugin in &self.plugins {
+        for plugin in self
+            .plugins
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+        {
             plugin.on_shell_env(env);
         }
     }
 
     /// Apply `tool.definition` transformation hooks sequentially.
     pub fn apply_tool_definition(&self, def: &mut ToolDefMod) {
-        for plugin in &self.plugins {
+        for plugin in self
+            .plugins
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+        {
             plugin.on_tool_definition(def);
         }
     }
@@ -301,7 +340,12 @@ impl PluginRegistry {
         input: &serde_json::Value,
         plugin_tool_owners: &std::collections::HashMap<String, String>,
     ) -> PluginPermissionVerdict {
-        for plugin in &self.plugins {
+        for plugin in self
+            .plugins
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+        {
             // Anti-self-dealing: skip the plugin that owns this tool.
             if plugin_tool_owners
                 .get(tool)
@@ -319,14 +363,24 @@ impl PluginRegistry {
 
     /// Apply `tool.execute.before` interception hooks sequentially.
     pub fn apply_tool_exec_before(&self, before: &mut ToolExecBefore) {
-        for plugin in &self.plugins {
+        for plugin in self
+            .plugins
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+        {
             plugin.on_tool_execute_before(before);
         }
     }
 
     /// Apply `tool.execute.after` interception hooks sequentially.
     pub fn apply_tool_exec_after(&self, after: &mut ToolExecAfter) {
-        for plugin in &self.plugins {
+        for plugin in self
+            .plugins
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+        {
             plugin.on_tool_execute_after(after);
         }
     }
@@ -339,7 +393,12 @@ impl PluginRegistry {
         command: &str,
         arguments: &str,
     ) -> Option<(String, CommandIntercept)> {
-        for plugin in &self.plugins {
+        for plugin in self
+            .plugins
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+        {
             if let Some(result) = plugin.on_command_execute_before(command, arguments)
                 && result.handled
             {
@@ -351,7 +410,12 @@ impl PluginRegistry {
 
     /// Notify all plugins of an event (fire-and-forget).
     pub fn notify_event(&self, event: &serde_json::Value) {
-        for plugin in &self.plugins {
+        for plugin in self
+            .plugins
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+        {
             plugin.on_event(event);
         }
     }
@@ -360,6 +424,8 @@ impl PluginRegistry {
     /// Returns `(plugin_name, commands)` pairs for the CLI slash panel.
     pub fn collect_commands(&self) -> Vec<(String, Vec<String>)> {
         self.plugins
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
             .iter()
             .filter_map(|plugin| {
                 let cmds = plugin.commands();
@@ -382,7 +448,12 @@ impl PluginRegistry {
     ) {
         let mut defs = Vec::new();
         let mut owners = std::collections::HashMap::new();
-        for plugin in &self.plugins {
+        for plugin in self
+            .plugins
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+        {
             for tool in plugin.tools() {
                 owners.insert(tool.name.clone(), plugin.name().to_string());
                 defs.push(tool);
@@ -396,7 +467,12 @@ impl PluginRegistry {
     /// [`crate::tools::plugin_tool::PluginTool`].
     pub fn collect_tool_implementations(&self) -> Vec<(ToolDefinition, Arc<dyn NcaPlugin>)> {
         let mut out = Vec::new();
-        for plugin in &self.plugins {
+        for plugin in self
+            .plugins
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+        {
             for def in plugin.tools() {
                 out.push((def, Arc::clone(plugin)));
             }
@@ -414,6 +490,8 @@ impl PluginRegistry {
         worktree: bool,
     ) -> Vec<(String, String)> {
         self.plugins
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
             .iter()
             .filter_map(|plugin| {
                 plugin
@@ -425,7 +503,12 @@ impl PluginRegistry {
 
     /// Execute a contributed tool by dispatching to the owning plugin.
     pub async fn execute_plugin_tool(&self, call: &ToolCall) -> Option<ToolResult> {
-        for plugin in &self.plugins {
+        for plugin in self
+            .plugins
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+        {
             let tools = plugin.tools();
             if tools.iter().any(|t| t.name == call.name) {
                 return Some(plugin.execute_tool(call).await);
@@ -434,9 +517,12 @@ impl PluginRegistry {
         None
     }
 
-    /// Iterate over all registered plugins.
-    pub fn iter(&self) -> impl Iterator<Item = &dyn NcaPlugin> {
-        self.plugins.iter().map(|p| p.as_ref())
+    /// Iterate over all registered plugins (snapshot).
+    pub fn iter(&self) -> Vec<Arc<dyn NcaPlugin>> {
+        self.plugins
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 }
 

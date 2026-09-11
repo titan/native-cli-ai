@@ -1461,6 +1461,17 @@ impl Repl {
                     Err(e) => out.eprintln(&format!("[thinking] {e}")),
                 }
             }
+            "/plugin" => match rest.trim() {
+                "refresh" | "restart" => match self.runtime.refresh_plugins().await {
+                    Ok(status) => out.println(&format!("[plugin] {status}")),
+                    Err(e) => out.eprintln(&format!("[plugin] {e}")),
+                },
+                _ => {
+                    for line in self.runtime.plugin_status() {
+                        out.println(&format!("[plugin] {line}"));
+                    }
+                }
+            },
             "/tool-output" => {
                 if let ReplOutput::Tui(state) = &out {
                     state.toggle_all_tool_output();

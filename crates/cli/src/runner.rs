@@ -419,6 +419,16 @@ impl SessionRuntime {
             .record_plugin_command_echo(plugin, text)
             .await;
     }
+
+    /// G7 `/plugin refresh`.
+    pub async fn refresh_plugins(&mut self) -> Result<String, String> {
+        self.supervisor.refresh_plugins().await
+    }
+
+    /// G7 `/plugin status`.
+    pub fn plugin_status(&self) -> Vec<String> {
+        self.supervisor.plugin_status()
+    }
 }
 
 /// One `/jobs` line: `id [@alias]  state [gN]  task  [branch]`. The alias
