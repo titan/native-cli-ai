@@ -501,20 +501,6 @@ impl PluginRegistry {
             .collect()
     }
 
-    /// Execute a contributed tool by dispatching to the owning plugin.
-    pub async fn execute_plugin_tool(&self, call: &ToolCall) -> Option<ToolResult> {
-        // Snapshot the owner first, then drop the read guard BEFORE awaiting
-        // (a std lock guard held across an await can deadlock a writer).
-        let owner = self
-            .plugins
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .find(|plugin| plugin.tools().iter().any(|t| t.name == call.name))
-            .cloned()?;
-        Some(owner.execute_tool(call).await)
-    }
-
     /// Iterate over all registered plugins (snapshot).
     pub fn iter(&self) -> Vec<Arc<dyn NcaPlugin>> {
         self.plugins
