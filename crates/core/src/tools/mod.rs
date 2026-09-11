@@ -22,6 +22,7 @@ pub mod spawn_subagent;
 pub mod subagent_control;
 pub mod types;
 pub mod update_todos;
+pub mod wait_for_user;
 pub mod web_search;
 pub mod write_file;
 
@@ -32,6 +33,7 @@ pub use subagent_control::{
     TaskResultTool, TaskReviveTool, TaskStatusTool,
 };
 pub use update_todos::{TodoStore, UpdateTodosTool, validate_todos};
+pub use wait_for_user::{PauseHook, WaitForUserTool};
 
 use nca_common::config::WebConfig;
 use nca_common::event::AgentEvent;
@@ -40,13 +42,18 @@ use std::sync::Arc;
 
 use crate::workspace_fs::WorkspaceFs;
 
-/// Tool names that block awaiting a human answer.
+/// Tool names the pipeline must run strictly one at a time (barrier
+/// semantics, see `tool_pipeline`), never concurrently with another call.
 ///
-/// The tool pipeline runs these strictly one at a time (barrier semantics,
-/// see `tool_pipeline`): every UI surface tracks a single active question,
-/// so two simultaneous `QuestionRequested` events would overwrite the first
-/// in the UI, orphan its oneshot, and freeze the turn forever.
-const INTERACTIVE_TOOLS: &[&str] = &["ask_question"];
+/// Two very different shapes share the barrier:
+/// - `ask_question` blocks awaiting a human answer: every UI surface tracks
+///   a single active question, so two simultaneous `QuestionRequested`
+///   events would overwrite the first in the UI, orphan its oneshot, and
+///   freeze the turn forever.
+/// - `wait_for_user` is a non-blocking turn-end signal (no oneshot, no
+///   event): it only pauses wake delivery, but must still land strictly
+///   alone and last so the turn ends without further tool calls racing it.
+const INTERACTIVE_TOOLS: &[&str] = &["ask_question", "wait_for_user"];
 
 /// Registry of available tools the agent can invoke.
 pub struct ToolRegistry {
@@ -105,9 +112,11 @@ impl ToolRegistry {
             .and_then(|t| t.definition().timeout_ms)
     }
 
-    /// True when the named tool blocks awaiting a human answer (e.g.
-    /// `ask_question`). The tool pipeline serializes these so at most one is
-    /// ever pending — every UI surface tracks a single active question.
+    /// True when the named tool must run strictly alone behind the pipeline
+    /// barrier: `ask_question` blocks awaiting a human answer (every UI
+    /// surface tracks a single active question), `wait_for_user` is a
+    /// non-blocking turn-end signal (see `INTERACTIVE_TOOLS`). The tool
+    /// pipeline serializes these so at most one is ever pending.
     pub fn is_interactive(&self, name: &str) -> bool {
         INTERACTIVE_TOOLS.contains(&name)
     }
@@ -374,9 +383,10 @@ mod tests {
     }
 
     #[test]
-    fn is_interactive_marks_ask_question_only() {
-        let reg = stub_registry(&["ask_question", "read_file"]);
+    fn is_interactive_marks_ask_question_and_wait_for_user_only() {
+        let reg = stub_registry(&["ask_question", "wait_for_user", "read_file"]);
         assert!(reg.is_interactive("ask_question"));
+        assert!(reg.is_interactive("wait_for_user"));
         assert!(!reg.is_interactive("read_file"));
         assert!(!reg.is_interactive("not_registered"));
     }
