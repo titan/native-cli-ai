@@ -98,7 +98,9 @@ pub trait NcaPlugin: Send + Sync {
     }
 
     /// React to user input before it's sent to the LLM.
-    /// Return a message to display to the user.
+    /// Returns a context block that the host appends to the outgoing user
+    /// message as a tagged `<plugin-context>` block (G2) — visible to the
+    /// model and the transcript, never the system prompt.
     fn on_user_prompt(&self, _prompt: &str) -> Option<String> {
         None
     }
@@ -422,6 +424,26 @@ impl PluginRegistry {
     }
 }
 
+/// Render per-turn plugin context blocks onto a user prompt (G2).
+///
+/// Each hook contribution becomes a tagged `<plugin-context>` block appended
+/// after the raw prompt (Claude Code `additionalContext` model): the model and
+/// the transcript both see it, while the cache-stable system prompt stays
+/// untouched. An empty hook list returns the prompt unchanged.
+pub fn format_prompt_context_blocks(prompt: &str, hooks: &[(String, String)]) -> String {
+    if hooks.is_empty() {
+        return prompt.to_string();
+    }
+    let mut out = String::with_capacity(prompt.len() + 64);
+    out.push_str(prompt);
+    for (name, text) in hooks {
+        out.push_str(&format!(
+            "\n\n<plugin-context source=\"{name}\">\n{text}\n</plugin-context>"
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,6 +492,50 @@ mod tests {
         let config = NcaConfig::default();
         let dir = tempfile::tempdir().unwrap();
         assert!(reg.collect_prompts(&config, dir.path()).is_empty());
+    }
+
+    #[test]
+    fn format_prompt_context_blocks_appends_tagged_blocks() {
+        let hooks = vec![
+            ("trellis".into(), "active task: T-1".into()),
+            ("other".into(), "note".into()),
+        ];
+        let out = format_prompt_context_blocks("do the work", &hooks);
+        assert!(out.starts_with("do the work"), "raw prompt stays first");
+        assert!(
+            out.contains(
+                "<plugin-context source=\"trellis\">\nactive task: T-1\n</plugin-context>"
+            )
+        );
+        assert!(out.contains("<plugin-context source=\"other\">\nnote\n</plugin-context>"));
+    }
+
+    #[test]
+    fn format_prompt_context_blocks_empty_is_identity() {
+        assert_eq!(format_prompt_context_blocks("plain", &[]), "plain");
+    }
+
+    struct PromptHookPlugin;
+
+    impl NcaPlugin for PromptHookPlugin {
+        fn name(&self) -> &str {
+            "hook-plugin"
+        }
+
+        fn on_user_prompt(&self, prompt: &str) -> Option<String> {
+            (!prompt.is_empty()).then(|| format!("saw: {prompt}"))
+        }
+    }
+
+    #[test]
+    fn collect_user_prompt_hooks_names_owner() {
+        let mut reg = PluginRegistry::new();
+        reg.register(Box::new(PromptHookPlugin));
+        let hooks = reg.collect_user_prompt_hooks("hi");
+        assert_eq!(
+            hooks,
+            vec![("hook-plugin".to_string(), "saw: hi".to_string())]
+        );
     }
 
     struct ToolPlugin;

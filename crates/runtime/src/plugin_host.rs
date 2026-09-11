@@ -817,6 +817,73 @@ impl NcaPlugin for RemotePlugin {
         self.capabilities.commands.clone()
     }
 
+    /// `userPrompt @6` RPC bridge (G2). Per-turn context injection: the
+    /// returned text rides as an ephemeral block on the outgoing user message
+    /// (never the system prompt — that prefix is cache-stable). Budget comes
+    /// from `[plugins] prompt_hook_timeout_ms`.
+    fn on_user_prompt(&self, prompt: &str) -> Option<String> {
+        if self.is_disabled() {
+            return None;
+        }
+
+        let id = self.alloc_id();
+        let wire = plugin_protocol::build_message(&id, |body| {
+            let mut req = body.reborrow().init_user_prompt();
+            req.set_prompt(prompt);
+        });
+
+        let raw = self
+            .rpc_sync(&id, wire, self.config.prompt_hook_timeout_ms.div_ceil(1000))
+            .ok()?;
+
+        let mut reader = std::io::BufReader::new(&raw[..]);
+        let result = plugin_protocol::read_message_then(&mut reader, |msg| {
+            let body = msg.get_body()?;
+            match body.which() {
+                Ok(body::UserPromptResult(r)) => {
+                    let r = r?;
+                    let message = r.get_message()?.to_string()?;
+                    Ok((!message.is_empty()).then_some(message))
+                }
+                _ => Ok(None),
+            }
+        });
+
+        match result {
+            Ok(Some(text)) => Some(text),
+            _ => None,
+        }
+    }
+
+    /// `event @15` fire-and-forget notification (G4). Writes the frame on a
+    /// spawned task and never reads a reply (the schema defines no result arm
+    /// for `event`) — the main loop can never block on a plugin here. A failed
+    /// write means the pipe is broken: the plugin is disabled.
+    fn on_event(&self, event: &serde_json::Value) {
+        if self.is_disabled() {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let id = self.alloc_id();
+        let payload = event.to_string();
+        let wire = plugin_protocol::build_message(&id, |body| {
+            let mut n = body.reborrow().init_event();
+            n.set_event_json(&payload);
+        });
+        let stdin = self.stdin.clone();
+        let disabled = self.disabled.clone();
+        let name = self.name.clone();
+        handle.spawn(async move {
+            let mut guard = stdin.lock().await;
+            if let Err(e) = write_capnp_message(&mut guard, &wire).await {
+                tracing::warn!("plugin {name} event notify failed: {e}");
+                disabled.store(true, Ordering::SeqCst);
+            }
+        });
+    }
+
     fn on_command_execute_before(
         &self,
         command: &str,

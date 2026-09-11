@@ -695,6 +695,14 @@ impl Supervisor {
         // identical to built-ins; execution via the plugin's execute_tool).
         nca_core::tools::plugin_tool::register_plugin_tools(&mut tools, &plugins, &config.plugins);
 
+        // G4: lifecycle notification — plugins received Config during
+        // `start_all`; `session_start` tells them the session is live
+        // (upstream SessionStart parity; fire-and-forget, never blocks).
+        plugins.notify_event(&serde_json::json!({
+            "type": "session_start",
+            "session_id": session_id,
+        }));
+
         let mut agent = AgentLoop::new(
             provider,
             tools,
@@ -1009,6 +1017,21 @@ impl Supervisor {
         self.run_turn_with_images(prompt, &[]).await
     }
 
+    /// G2: collect per-turn plugin context injections (`userPrompt @6`) and
+    /// append them to the outgoing user prompt as tagged blocks. The blocks
+    /// ride the user message (Claude Code `additionalContext` model): they
+    /// reach the model and the transcript without touching the cache-stable
+    /// system prompt. Timeouts are per-plugin RPC budgets
+    /// (`[plugins] prompt_hook_timeout_ms`), so a slow plugin can never stall
+    /// a turn by more than its budget.
+    fn apply_user_prompt_hooks(&self, prompt: &str) -> String {
+        if self.plugins.is_empty() {
+            return prompt.to_string();
+        }
+        let hooks = self.plugins.collect_user_prompt_hooks(prompt);
+        nca_core::plugin::format_prompt_context_blocks(prompt, &hooks)
+    }
+
     /// Like [`run_turn`], but attaches on-disk images (paths relative to workspace) for vision models.
     pub async fn run_turn_with_images(
         &mut self,
@@ -1031,6 +1054,12 @@ impl Supervisor {
         // Check context before running turn
         self.maybe_compact_context().await;
 
+        // G2: per-turn plugin prompt hooks (`userPrompt @6`). Returned text
+        // is appended to the outgoing user message as tagged context blocks —
+        // visible to the model and the transcript, never the system prompt
+        // (that prefix is cache-stable). The title below keeps the raw prompt.
+        let augmented = self.apply_user_prompt_hooks(prompt);
+
         // Refresh the spawn-history mirror so `spawn_subagent` calls made
         // during this turn collect images and context from exactly the
         // history the model sees (post-compaction), plus this turn's opening
@@ -1038,7 +1067,7 @@ impl Supervisor {
         // must reach the child.
         if let Ok(mut mirror) = self.spawn_history.lock() {
             *mirror = self.agent.messages.clone();
-            mirror.push(nca_core::agent::turn_user_message(prompt, attachments));
+            mirror.push(nca_core::agent::turn_user_message(&augmented, attachments));
         }
 
         // Durability barrier (P2 Phase B): capture the last committed turn
@@ -1051,7 +1080,7 @@ impl Supervisor {
             .unwrap_or(0);
         let result = self
             .agent
-            .run_turn(prompt, self.workspace_root.as_path(), attachments)
+            .run_turn(&augmented, self.workspace_root.as_path(), attachments)
             .await;
         // Durability ordering (P3 §5): ALWAYS wait for the first turn's
         // commit before any further canonical-history mutation (the overflow
@@ -1082,7 +1111,7 @@ impl Supervisor {
                     .unwrap_or(0);
                 let second = self
                     .agent
-                    .run_turn(prompt, self.workspace_root.as_path(), attachments)
+                    .run_turn(&augmented, self.workspace_root.as_path(), attachments)
                     .await;
                 self.await_turn_commit(retry_before).await;
                 second?
@@ -1296,6 +1325,21 @@ impl Supervisor {
     /// method emits `ContextCompactionEnd` on BOTH exit paths (AI summary and
     /// sliding-window fallback, including the early empty-messages path).
     async fn perform_auto_summarize(&mut self, reason: &str) -> Result<(), String> {
+        let result = self.perform_auto_summarize_inner(reason).await;
+        if result.is_ok() {
+            // G4: compact notification on every successful compaction path
+            // (upstream re-fires SessionStart on compact — plugins use this
+            // to re-inject fresh state on the next turn).
+            self.plugins.notify_event(&serde_json::json!({
+                "type": "context_compact",
+                "session_id": self.session_id,
+                "reason": reason,
+            }));
+        }
+        result
+    }
+
+    async fn perform_auto_summarize_inner(&mut self, reason: &str) -> Result<(), String> {
         let messages_to_summarize = self
             .context_manager
             .get_messages_to_summarize(&self.agent.messages);
@@ -1413,6 +1457,12 @@ impl Supervisor {
             EndReason::Error => SessionStatus::Error,
             EndReason::Cancelled => SessionStatus::Cancelled,
         };
+        // G4: lifecycle notification before anything tears down (fire-and-forget).
+        self.plugins.notify_event(&serde_json::json!({
+            "type": "session_end",
+            "session_id": self.session_id,
+            "reason": format!("{reason:?}"),
+        }));
         if let Some(tx) = self.agent.event_sender() {
             let _ = tx.send(AgentEvent::SessionEnded { reason }).await;
         }

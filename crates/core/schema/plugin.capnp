@@ -225,6 +225,13 @@ struct CommandExecuteBeforeResult {
 # ═══════════════════════════════════════════════════════════════════════════
 
 struct EventNotification {
+    # JSON-encoded event payload. Host-fired types (G4, fire-and-forget —
+    # no result arm; plugins must not answer):
+    #   {"type": "session_start", "session_id": ...}
+    #   {"type": "context_compact", "session_id": ..., "reason": "auto_summarize"|"overflow_summarize"}
+    #   {"type": "session_end", "session_id": ..., "reason": "Completed"|...}
+    # Mid-turn middleware compaction inside the agent loop does NOT notify
+    # (no plugin access there) — only supervisor-observable compactions do.
     eventJson @0 :Text;
 }
 
