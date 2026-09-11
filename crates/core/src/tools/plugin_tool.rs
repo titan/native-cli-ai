@@ -24,8 +24,6 @@ use super::ToolExecutor;
 pub struct PluginTool {
     definition: ToolDefinition,
     plugin: Arc<dyn crate::plugin::NcaPlugin>,
-    plugin_name: String,
-    timeout_ms: u64,
 }
 
 impl PluginTool {
@@ -38,17 +36,13 @@ impl PluginTool {
     pub fn new(
         mut definition: ToolDefinition,
         plugin: Arc<dyn crate::plugin::NcaPlugin>,
-        plugin_name: String,
         default_timeout_ms: u64,
     ) -> Self {
-        let timeout_ms = definition.timeout_ms.unwrap_or(default_timeout_ms);
-        definition.timeout_ms = Some(timeout_ms);
-        Self {
-            definition,
-            plugin,
-            plugin_name,
-            timeout_ms,
-        }
+        // Surface the resolved timeout (declaration override, else the
+        // `[plugins]` default) so the tool pipeline wraps execution in a
+        // cooperative timeout like any built-in.
+        definition.timeout_ms = Some(definition.timeout_ms.unwrap_or(default_timeout_ms));
+        Self { definition, plugin }
     }
 }
 
@@ -59,35 +53,14 @@ impl ToolExecutor for PluginTool {
     }
 
     async fn execute(&self, call: &ToolCall) -> ToolResult {
-        let call_id = call.id.clone();
-        // The plugin hook is sync-in-async (remote RPC via block_in_place);
-        // enforce the timeout here so a hung plugin process can never pin a
-        // turn, independent of the pipeline's cooperative wrap.
-        let fut = self.plugin.execute_tool(call);
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(self.timeout_ms.saturating_add(1_000)),
-            fut,
-        )
-        .await
-        {
-            Ok(result) => ToolResult {
-                call_id,
-                timed_out: result.timed_out,
-                success: result.success,
-                output: result.output,
-                error: result.error,
-            },
-            Err(_) => ToolResult {
-                timed_out: true,
-                call_id,
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "plugin tool `{}` timed out after {}ms (plugin `{}` did not answer)",
-                    self.definition.name, self.timeout_ms, self.plugin_name
-                )),
-            },
-        }
+        // Timeout budgeting is two-layered: the tool pipeline wraps this call
+        // at `definition.timeout_ms` (cooperative), and the plugin RPC itself
+        // enforces the same budget internally (`rpc_sync` deadline) so a hung
+        // plugin process fails with a precise error rather than a bare
+        // timeout. Disabled plugins return a clear error — never a hang.
+        let mut result = self.plugin.execute_tool(call).await;
+        result.call_id = call.id.clone();
+        result
     }
 }
 
@@ -104,13 +77,7 @@ pub fn register_plugin_tools(
     let impls = plugins.collect_tool_implementations();
     let count = impls.len();
     for (def, plugin) in impls {
-        let owner = plugin.name().to_string();
-        tools.register(Box::new(PluginTool::new(
-            def,
-            plugin,
-            owner,
-            cfg.tool_timeout_ms,
-        )));
+        tools.register(Box::new(PluginTool::new(def, plugin, cfg.tool_timeout_ms)));
     }
     if count > 0 {
         tracing::info!("registered {count} plugin tool(s)");
