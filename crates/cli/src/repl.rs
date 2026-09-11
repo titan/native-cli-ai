@@ -14,6 +14,7 @@ use crate::tui::{
 use nca_common::config::{PermissionMode, ProviderKind};
 use nca_common::event::{EndReason, QuestionSelection};
 use nca_core::skills::SkillCatalog;
+use nca_core::tools::WaitForUserTool;
 use nca_runtime::memory_store::MemoryStore;
 use nca_runtime::wake_scheduler::{WakeScheduler, WakeTrigger};
 use reedline::{
@@ -1645,6 +1646,20 @@ impl Repl {
             let interval = Duration::from_millis(self.runtime.config().subagent.wake.interval_ms);
             WakeScheduler::new(true, interval, wake_submit_trigger(cmd_tx.clone()))
         });
+
+        // P4 `wait_for_user`: registration IS the top-level gate — child
+        // sessions (runtime path) strip it via `strip_child_only_tools` and
+        // stdio/one-shot modes never register it, so only this TUI session
+        // exposes it. The pause hook (a cloned scheduler handle) suppresses
+        // background wakes until the user's next Submit; with wake disabled
+        // the hook is None — the end-turn signal stays meaningful, the
+        // suppression is vacuous.
+        let pause_hook = wake_scheduler.as_ref().map(|sched| {
+            let sched = sched.clone();
+            Arc::new(move || sched.pause()) as Arc<dyn Fn() + Send + Sync>
+        });
+        self.runtime
+            .register_tool(Box::new(WaitForUserTool::new(pause_hook)));
 
         let commit_tx = self.runtime.take_turn_commit_tx().map(|(tx, _flag)| tx);
         let _bridge = spawn_tui_bridge(

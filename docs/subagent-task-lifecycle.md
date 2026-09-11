@@ -2,7 +2,8 @@
 
 Status: P3 implemented (background default-on for top-level TUI sessions +
 wake scheduler with cmd-queue delivery; stdio/one-shot keep P2 foreground
-defaults). P4 pending. Researched against
+defaults). P4 implemented (`wait_for_user` tool + wake pause latch +
+child parent-only tool strip). Researched against
 oh-my-opencode-slim 2.2.18 (`task`/`task_result`/`task_status`/`task_message`/
 `task_cancel`/`task_revive`, Background Job Board, orchestrator wake
 scheduler, `wait_for_user`).
@@ -53,9 +54,9 @@ is the wake channel; `cancel_flag` is the abort mechanism.
   `mpsc::Sender<SubagentControlRequest>` with a `oneshot` reply. This mirrors
   the existing `SpawnRequest` pattern exactly.
 - `crates/core/src/tools/wait_for_user.rs`: `wait_for_user` tool (see §3).
-- `ToolRegistry::is_interactive` must continue to gate `ask_question` only;
-  `wait_for_user` is non-interactive (no oneshot) but must still run as a
-  turn-ending barrier — mark it interactive for serialization safety.
+- `INTERACTIVE_TOOLS` gates `ask_question` AND `wait_for_user`: the first
+  blocks awaiting a human answer, the second is a non-blocking turn-end
+  signal — both must run strictly alone behind the pipeline barrier.
 
 ### runtime
 - `crates/runtime/src/subagent.rs`: split `spawn_child_session` (blocking,
@@ -219,13 +220,34 @@ is the wake channel; `cancel_flag` is the abort mechanism.
 - **Rollback:** highest — gate behind `SubagentConfig.background`/
   `wake.enabled`; ship foreground fallback.
 
-### P4 — wait_for_user (S)
-- `core`: `wait_for_user` tool + `wake_scheduler.pause()`.
-- `runtime`/`cli`: register + prompt guidance (orchestrator system prompt
-  update).
-- **Tests:** tool emits no `QuestionRequested`; wake suppressed until next
-  external user message.
-- **Rollback:** trivial; can fold into P3 if cheap.
+### P4 — wait_for_user (S) — IMPLEMENTED
+- `core`: `wait_for_user` tool (`tools/wait_for_user.rs`) carrying an
+  injected `PauseHook` closure (no event channel, no oneshot);
+  `wake_scheduler.pause()` latch (a paused terminal reserves no window;
+  the debounce task re-checks `paused` before committing, closing the
+  reserve-just-before-pause race; `note_input` releases the latch).
+- `runtime`/`cli`: registered in `run_with_tui` right after the wake
+  scheduler is built (`SessionRuntime::register_tool` is the narrow
+  passthrough); guidance lives in the tool description, not a prompt line.
+- **Tests:** tool emits no `QuestionRequested` — pinned by construction
+  (the struct holds no event channel) plus a first-poll completion test;
+  wake suppressed until the next external user message — paused-clock
+  scheduler unit tests + the wiring-chain integration test
+  (`tests/wake_integration.rs::wait_for_user_pauses_wakes_until_next_user_input`).
+- **Oracle-arbitrated deviations from the original sketch:**
+  1. Guidance lives in the tool description + registration-as-gate, NOT a
+     system-prompt line: `OrchestrationContext` is external-orchestrator
+     metadata (not a child marker), and a system-prompt-builder change
+     would ripple into every persona.
+  2. Pause-only — no `resume()`: the un-pause IS `note_input` at the TUI
+     Submit choke point, so "until the next external user message" is
+     strictly "until the next TUI Submit".
+  3. Child strip via `strip_child_only_tools` (spawn + revive paths):
+     `spawn_subagent` is the real fix — a child has no spawn consumer, so
+     a grandchild spawn would park on the undrained oneshot for the full
+     600s window; the `task_*` strips are hygiene (they would only fail
+     fast against the child's empty registry).
+- **Rollback:** trivial — unregister the tool (or construct with no hook).
 
 ## 6. Risks & Invariants
 
@@ -236,10 +258,15 @@ is the wake channel; `cancel_flag` is the abort mechanism.
 - **fsync-at-TurnCompleted:** background children run their own
   `spawn_event_fanout` + commit barrier (`session_utils.rs`); the parent's
   turn commit is unaffected. Preserved.
-- **One active question:** `wait_for_user` never opens a `QuestionRequested`;
-  wake prompts are ordinary Submits through the cmd queue (never
-  questions); `is_interactive` barrier still serializes `ask_question`.
-  Preserved.
+- **One active question:** `wait_for_user` never opens a `QuestionRequested`
+  (pinned by construction — the tool holds no event channel); wake prompts
+  are ordinary Submits through the cmd queue (never questions);
+  `INTERACTIVE_TOOLS` serializes BOTH `ask_question` and `wait_for_user`
+  behind the pipeline barrier so each runs strictly alone. Preserved.
+  Known (pre-existing, now more visible) limitation: `restrict_to` gating
+  runs only at `Supervisor::create`, so a post-hoc `register_tool`
+  (wait_for_user) is NOT re-gated if `allowed_tools` is later set by an
+  agent-profile switch.
 - **Bounded channels:** control `mpsc(100)`; inbox stays at 16; status
   events use `try_send`. Preserved.
 - **Worktree cleanup on cancel:** cancel never calls `remove_worktree`;

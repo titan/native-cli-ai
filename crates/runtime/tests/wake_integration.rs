@@ -14,7 +14,11 @@
 //!   NO additional wake (the reviving parent is mid-turn holding the
 //!   reply);
 //! - two background children terminating inside the debounce window
-//!   produce exactly ONE wake.
+//!   produce exactly ONE wake;
+//! - P4 wiring chain: `WaitForUserTool` built with the scheduler's `pause`
+//!   closure (exactly how `run_with_tui` wires it) suppresses wakes until
+//!   the next `note_input` (the TUI Submit choke point), then exactly one
+//!   wake fires for a later terminal.
 //!
 //! Hermetic, same scaffolding as `background_spawn.rs`/`task_control.rs`:
 //! gated scripted providers injected through the `child_provider` seam of
@@ -33,10 +37,11 @@ use nca_common::config::{NcaConfig, PermissionMode};
 use nca_common::event::AgentEvent;
 use nca_common::message::Message;
 use nca_common::session::ChildSessionState;
-use nca_common::tool::ToolDefinition;
+use nca_common::tool::{ToolCall, ToolDefinition};
 use nca_core::provider::{Provider, ProviderError, StreamChunk};
 use nca_core::tools::spawn_subagent::{SpawnRequest, SpawnResponse};
 use nca_core::tools::subagent_control::SubagentControlRequest;
+use nca_core::tools::{ToolExecutor, WaitForUserTool};
 use nca_core::workspace_fs::{RealFs, WorkspaceFs};
 use nca_runtime::session_store::SessionStore;
 use nca_runtime::subagent::{handle_revive_request, spawn_subagent_consumer};
@@ -655,4 +660,49 @@ async fn two_background_terminals_in_window_coalesce_into_one_wake() {
         "two in-window terminals coalesce into exactly one wake",
     )
     .await;
+}
+
+/// P4 wiring chain, without a full TUI: build the tool with the scheduler's
+/// `pause` closure exactly as `run_with_tui` does, execute it, and prove
+/// the suppression + re-arm lifecycle end to end on real tokio time.
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_for_user_pauses_wakes_until_next_user_input() {
+    let (sched, mut wake_rx) = wake_channel(WAKE_INTERVAL);
+    let pause_sched = sched.clone();
+    let pause_hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || pause_sched.pause());
+    let tool = WaitForUserTool::new(Some(pause_hook));
+
+    // The tool executes immediately with success and its end-turn guidance.
+    let call = ToolCall {
+        id: "c1".into(),
+        name: "wait_for_user".into(),
+        input: serde_json::json!({}),
+    };
+    let res = tool.execute(&call).await;
+    assert!(res.success, "error: {:?}", res.error);
+    assert!(res.output.contains("Standing by for the user."));
+
+    // A background terminal while paused: NO wake fires, even far past the
+    // debounce window.
+    sched.notify_terminal("fixer-x", "completed", "while standing by");
+    assert_silent(
+        &mut wake_rx,
+        WAKE_INTERVAL * 6,
+        "wait_for_user suppresses background wakes",
+    )
+    .await;
+
+    // The user's next Submit (note_input at the choke point) releases the
+    // latch and re-arms; a new terminal fires exactly one wake.
+    sched.note_input();
+    sched.notify_terminal("fixer-y", "completed", "after the user spoke");
+    let text = tokio::time::timeout(Duration::from_secs(10), wake_rx.recv())
+        .await
+        .expect("wake must fire after note_input re-arms")
+        .expect("wake channel must not be dropped");
+    assert!(text.contains("fixer-y"), "re-armed wake: {text}");
+    assert!(
+        wake_rx.try_recv().is_err(),
+        "exactly one wake after the re-arm"
+    );
 }
