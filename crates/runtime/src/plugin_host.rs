@@ -18,11 +18,11 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use nca_common::config::NcaConfig;
+use nca_common::config::{NcaConfig, PluginConfig};
 use nca_common::tool::ToolDefinition;
 use nca_core::plugin::NcaPlugin;
 use nca_core::plugin_capnp::{ParamType, body, hello};
-use nca_core::plugin_protocol::{self, PROTOCOL_MAJOR, WireError};
+use nca_core::plugin_protocol::{self, FrameKind, PROTOCOL_MAJOR, WireError};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
@@ -38,6 +38,7 @@ pub struct PluginDescriptor {
 pub struct PluginHost {
     instances: Vec<RemotePluginInstance>,
     next_id: Arc<AtomicU64>,
+    config: PluginConfig,
 }
 
 struct RemotePluginInstance {
@@ -186,9 +187,15 @@ impl Default for PluginHost {
 
 impl PluginHost {
     pub fn new() -> Self {
+        Self::with_config(PluginConfig::default())
+    }
+
+    /// Build with explicit `[plugins]` tuning (timeouts, dispatch cap).
+    pub fn with_config(config: PluginConfig) -> Self {
         Self {
             instances: Vec::new(),
             next_id: Arc::new(AtomicU64::new(1)),
+            config,
         }
     }
 
@@ -322,6 +329,7 @@ impl PluginHost {
                     self.next_id.clone(),
                     instance.disabled.clone(),
                     caps,
+                    self.config.clone(),
                 );
                 reg.register(Box::new(remote));
             }
@@ -475,6 +483,7 @@ pub(crate) struct RemotePlugin {
     next_id: Arc<AtomicU64>,
     disabled: Arc<AtomicBool>,
     capabilities: PluginCapabilities,
+    config: PluginConfig,
 }
 
 impl RemotePlugin {
@@ -485,6 +494,7 @@ impl RemotePlugin {
         next_id: Arc<AtomicU64>,
         disabled: Arc<AtomicBool>,
         capabilities: PluginCapabilities,
+        config: PluginConfig,
     ) -> Self {
         Self {
             name: name.into(),
@@ -493,6 +503,7 @@ impl RemotePlugin {
             next_id,
             disabled,
             capabilities,
+            config,
         }
     }
 
@@ -511,7 +522,21 @@ impl RemotePlugin {
     /// pool so the inner `handle.block_on` runs on a non-driver thread — without
     /// it, `block_on` would panic ("Cannot start a runtime from within a
     /// runtime"). Requires a multi_thread runtime.
-    fn rpc_sync(&self, wire: Vec<u8>, timeout_secs: u64) -> Result<Vec<u8>, String> {
+    ///
+    /// Frame demultiplexing (G5): the plugin's stdout may interleave frames
+    /// the host did not ask for — plugin→host callback arms (`readFile`,
+    /// `log`, …) or out-of-order responses. Those are NOT supported; instead
+    /// of silently consuming one and desyncing the stream, we skip them
+    /// (answering callbacks with an error frame) until the frame whose
+    /// envelope `id` matches the request. The whole write→read cycle holds
+    /// the stdout lock, so concurrent RPCs on the same plugin serialize
+    /// instead of interleaving each other's responses.
+    fn rpc_sync(
+        &self,
+        expected_id: &str,
+        wire: Vec<u8>,
+        timeout_secs: u64,
+    ) -> Result<Vec<u8>, String> {
         if self.is_disabled() {
             return Err(format!("plugin {} is disabled", self.name));
         }
@@ -522,34 +547,84 @@ impl RemotePlugin {
         let stdin = self.stdin.clone();
         let stdout = self.stdout.clone();
         let disabled = self.disabled.clone();
-
+        let expected_id = expected_id.to_string();
         tokio::task::block_in_place(|| {
             handle.block_on(async move {
-                // Write request.
+                // Hold the stdout lock across write AND read: this serializes
+                // whole RPCs per plugin (write→response pairing stays atomic
+                // even if two hooks race). Lock order is always stdout→stdin.
+                let mut stdout_guard = stdout.lock().await;
+
                 {
-                    let mut stdin = stdin.lock().await;
-                    write_capnp_message(&mut stdin, &wire)
+                    let mut stdin_guard = stdin.lock().await;
+                    write_capnp_message(&mut stdin_guard, &wire)
                         .await
                         .map_err(|e| format!("write: {e}"))?;
                 }
 
-                // Read response with timeout.
-                let result =
-                    tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
-                        let mut stdout = stdout.lock().await;
-                        read_capnp_message(&mut *stdout).await
-                    })
-                    .await;
+                let deadline = tokio::time::Instant::now()
+                    + std::time::Duration::from_secs(timeout_secs);
+                let mut skipped = 0usize;
+                loop {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let frame = match tokio::time::timeout(
+                        remaining,
+                        read_capnp_message(&mut *stdout_guard),
+                    )
+                    .await
+                    {
+                        Ok(Ok(data)) => data,
+                        Ok(Err(e)) => {
+                            disabled.store(true, Ordering::SeqCst);
+                            return Err(format!("read: {e}"));
+                        }
+                        Err(_) => {
+                            disabled.store(true, Ordering::SeqCst);
+                            return Err(format!("plugin timed out after {timeout_secs}s"));
+                        }
+                    };
 
-                match result {
-                    Ok(Ok(data)) => Ok(data),
-                    Ok(Err(e)) => {
-                        disabled.store(true, Ordering::SeqCst);
-                        Err(format!("read: {e}"))
+                    match plugin_protocol::classify_frame(&frame) {
+                        FrameKind::Response(id) if id == expected_id => return Ok(frame),
+                        FrameKind::Response(other) => {
+                            skipped += 1;
+                            tracing::warn!(
+                                "plugin {} sent out-of-order response id={other} (expected {expected_id}); skipping",
+                                self.name,
+                            );
+                        }
+                        FrameKind::Callback(id, cb) => {
+                            skipped += 1;
+                            tracing::warn!(
+                                "plugin {} sent unsupported callback {cb}; answering with error",
+                                self.name,
+                            );
+                            let reply =
+                                plugin_protocol::build_error(&id, "callbacks are not supported");
+                            let mut stdin_guard = stdin.lock().await;
+                            if let Err(e) = write_capnp_message(&mut stdin_guard, &reply).await {
+                                disabled.store(true, Ordering::SeqCst);
+                                return Err(format!("write callback-error: {e}"));
+                            }
+                        }
+                        FrameKind::Error(message) => {
+                            return Err(message);
+                        }
+                        FrameKind::Opaque => {
+                            skipped += 1;
+                            tracing::warn!(
+                                "plugin {} sent unclassifiable frame; skipping",
+                                self.name,
+                            );
+                        }
                     }
-                    Err(_) => {
+
+                    if skipped >= 8 {
                         disabled.store(true, Ordering::SeqCst);
-                        Err(format!("plugin timed out after {timeout_secs}s"))
+                        return Err(format!(
+                            "plugin {} stream desynced: {skipped} unmatched frames",
+                            self.name
+                        ));
                     }
                 }
             })
@@ -573,7 +648,9 @@ impl NcaPlugin for RemotePlugin {
             req.set_workspace_root(workspace_root.to_str().unwrap_or("."));
         });
 
-        let raw = self.rpc_sync(wire, 5).ok()?;
+        let raw = self
+            .rpc_sync(&id, wire, self.config.prompt_hook_timeout_ms.div_ceil(1000))
+            .ok()?;
 
         // Parse the response.
         let mut reader = std::io::BufReader::new(&raw[..]);
@@ -606,6 +683,133 @@ impl NcaPlugin for RemotePlugin {
         self.capabilities.tools.clone()
     }
 
+    /// `executeTool @4` RPC bridge (G1). Model-initiated tool calls on a
+    /// plugin-owned tool arrive here through `PluginTool` → this method.
+    ///
+    /// Arguments are converted from the tool call's JSON object into the
+    /// schema's typed KV list; non-scalar values ride as `json` text. The
+    /// timeout comes from `[plugins] tool_timeout_ms` (default 30s — file IO
+    /// can be slow, unlike prompt hooks).
+    fn execute_tool(
+        &self,
+        call: &nca_common::tool::ToolCall,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = nca_common::tool::ToolResult> + Send + '_>,
+    > {
+        let call = call.clone();
+        Box::pin(async move {
+            let id = self.alloc_id();
+            let args: Vec<(String, serde_json::Value)> = call
+                .input
+                .as_object()
+                .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                .unwrap_or_default();
+
+            let wire = plugin_protocol::build_message(&id, |body| {
+                let mut req = body.reborrow().init_execute_tool();
+                req.set_tool_id(&call.name);
+                let mut kv_list = req.reborrow().init_args(args.len() as u32);
+                for (i, (key, value)) in args.iter().enumerate() {
+                    let mut kv = kv_list.reborrow().get(i as u32);
+                    kv.set_key(key);
+                    match value {
+                        serde_json::Value::String(s) => {
+                            kv.set_type(nca_core::plugin_capnp::ValueType::String);
+                            kv.set_str(s);
+                        }
+                        serde_json::Value::Bool(b) => {
+                            kv.set_type(nca_core::plugin_capnp::ValueType::Boolean);
+                            kv.set_bool(*b);
+                        }
+                        serde_json::Value::Number(n) => {
+                            if let Some(i64_val) = n.as_i64() {
+                                kv.set_type(nca_core::plugin_capnp::ValueType::Integer);
+                                kv.set_int(i64_val);
+                            } else {
+                                kv.set_type(nca_core::plugin_capnp::ValueType::Number);
+                                kv.set_num(n.as_f64().unwrap_or(0.0));
+                            }
+                        }
+                        other => {
+                            kv.set_type(nca_core::plugin_capnp::ValueType::Json);
+                            kv.set_str(
+                                serde_json::to_string(other).unwrap_or_else(|_| "null".into()),
+                            );
+                        }
+                    }
+                }
+            });
+
+            let timeout_secs = self.config.tool_timeout_ms.div_ceil(1000);
+            let result = self.rpc_sync(&id, wire, timeout_secs);
+            match result {
+                Ok(raw) => {
+                    let mut reader = std::io::BufReader::new(&raw[..]);
+                    let parsed = plugin_protocol::read_message_then(&mut reader, |msg| {
+                        let body = msg.get_body()?;
+                        match body.which() {
+                            Ok(body::ExecuteToolResult(r)) => {
+                                let r = r?;
+                                let error = r.get_error()?.to_string()?;
+                                Ok(Some(nca_common::tool::ToolResult {
+                                    timed_out: false,
+                                    call_id: call.id.clone(),
+                                    success: r.get_success(),
+                                    output: r.get_output()?.to_string()?,
+                                    error: (!error.is_empty()).then_some(error),
+                                }))
+                            }
+                            Ok(body::Error(e)) => {
+                                let e = e?;
+                                Ok(Some(nca_common::tool::ToolResult {
+                                    timed_out: false,
+                                    call_id: call.id.clone(),
+                                    success: false,
+                                    output: String::new(),
+                                    error: Some(e.get_message()?.to_string()?),
+                                }))
+                            }
+                            _ => Ok(None),
+                        }
+                    });
+                    match parsed {
+                        Ok(Some(result)) => result,
+                        Ok(None) => nca_common::tool::ToolResult {
+                            timed_out: false,
+                            call_id: call.id.clone(),
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!(
+                                "plugin {} returned an unexpected frame for tool `{}`",
+                                self.name, call.name
+                            )),
+                        },
+                        Err(e) => nca_common::tool::ToolResult {
+                            timed_out: false,
+                            call_id: call.id.clone(),
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!(
+                                "plugin {} tool `{}` response undecodable: {e}",
+                                self.name, call.name
+                            )),
+                        },
+                    }
+                }
+                Err(e) => nca_common::tool::ToolResult {
+                    timed_out: e.contains("timed out"),
+                    call_id: call.id.clone(),
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "plugin {} tool `{}` failed: {e}",
+                        self.name, call.name
+                    )),
+                },
+            }
+        })
+    }
+
     fn commands(&self) -> Vec<String> {
         if self.is_disabled() {
             return Vec::new();
@@ -630,7 +834,7 @@ impl NcaPlugin for RemotePlugin {
             req.set_arguments(arguments);
         });
 
-        let raw = self.rpc_sync(wire, 10).ok()?;
+        let raw = self.rpc_sync(&id, wire, 10).ok()?;
 
         let mut reader = std::io::BufReader::new(&raw[..]);
         let result = plugin_protocol::read_message_then(&mut reader, |msg| {
@@ -777,8 +981,9 @@ mod tests {
         let _ = process.start_kill();
     }
 
-    // Verify ponytail returns handled=false for commands it doesn't own,
-    // which causes check_command_before to short-circuit before trellis.
+    // Verify ponytail returns handled=false for commands it doesn't own.
+    // handled=false does NOT stop the poll — the registry continues to later
+    // plugins (see `check_command_before`), so trellis still gets its chance.
     #[tokio::test]
     async fn ponytail_returns_not_handled_for_foreign_command() {
         let binary = std::path::Path::new("/home/titan/.config/nca/plugins/ponytail");
@@ -842,9 +1047,109 @@ mod tests {
         });
         let (handled, text) = result.expect("parse response");
         eprintln!("ponytail response: handled={handled} text={text:?}");
-        // THIS is the root cause: ponytail returns handled=false (not None),
-        // so check_command_before returns it and never asks trellis.
         assert!(!handled, "ponytail should NOT handle trellis:init");
+
+        let _ = process.start_kill();
+    }
+
+    // Integration test: exercise the executeTool RPC against the REAL trellis
+    // binary (G1). Trellis declares task-lifecycle tools in Hello; calling the
+    // read-only `trellis_get_context` must produce an `executeToolResult` frame
+    // (success may be false when the workspace has no `.trellis/` — the wire
+    // arm and shape are what this pins).
+    #[tokio::test]
+    async fn trellis_plugin_execute_tool_round_trip() {
+        let binary = std::path::Path::new("/home/titan/.config/nca/plugins/trellis");
+        if !binary.exists() {
+            eprintln!("skipping: trellis plugin not installed");
+            return;
+        }
+
+        let mut cmd = Command::new(binary);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
+        let mut process = cmd.spawn().expect("spawn trellis");
+        let mut stdin = process.stdin.take().unwrap();
+        let mut stdout = process.stdout.take().unwrap();
+
+        // 1. Hello → tools must include trellis_get_context.
+        let hello_raw = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            read_capnp_message(&mut stdout),
+        )
+        .await
+        .expect("plugin did not send Hello in time")
+        .expect("read hello");
+        let (caps, _) = parse_hello(&hello_raw).expect("parse hello");
+        assert!(
+            caps.tools.iter().any(|t| t.name == "trellis_get_context"),
+            "trellis_get_context not declared: {:?}",
+            caps.tools
+                .iter()
+                .map(|t| t.name.clone())
+                .collect::<Vec<_>>()
+        );
+
+        // 2. Config.
+        let cfg_wire = plugin_protocol::build_config("1", ".", "test-session", "accept-edits", "");
+        write_capnp_message(&mut stdin, &cfg_wire)
+            .await
+            .expect("write config");
+
+        // 3. executeTool with a string arg (KV conversion path).
+        let cmd_wire = plugin_protocol::build_message("7", |b| {
+            let mut req = b.reborrow().init_execute_tool();
+            req.set_tool_id("trellis_get_context");
+            let mut kvs = req.reborrow().init_args(1);
+            let mut kv = kvs.reborrow().get(0);
+            kv.set_key("section");
+            kv.set_type(nca_core::plugin_capnp::ValueType::String);
+            kv.set_str("tasks");
+        });
+        write_capnp_message(&mut stdin, &cmd_wire)
+            .await
+            .expect("write executeTool");
+
+        // 4. Response must classify as a Response frame with our id.
+        let resp_raw = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            read_capnp_message(&mut stdout),
+        )
+        .await
+        .expect("plugin did not respond in time")
+        .expect("read response");
+
+        assert_eq!(
+            plugin_protocol::classify_frame(&resp_raw),
+            plugin_protocol::FrameKind::Response("7".to_string()),
+            "executeTool must answer with an executeToolResult frame carrying our id"
+        );
+
+        let mut buf = std::io::BufReader::new(&resp_raw[..]);
+        let result = plugin_protocol::read_message_then(&mut buf, |msg| {
+            let body = msg.get_body()?;
+            match body.which() {
+                Ok(body::ExecuteToolResult(r)) => {
+                    let r = r?;
+                    Ok((
+                        r.get_success(),
+                        r.get_output()?.to_string()?,
+                        r.get_error()?.to_string()?,
+                    ))
+                }
+                _ => Err(WireError::Capnp("unexpected body".into())),
+            }
+        });
+        let (success, output, error) = result.expect("parse executeToolResult");
+        eprintln!("executeTool: success={success} output={output:?} error={error:?}");
+        if !success {
+            assert!(
+                !error.is_empty(),
+                "failed tool call must carry an error text"
+            );
+        }
 
         let _ = process.start_kill();
     }

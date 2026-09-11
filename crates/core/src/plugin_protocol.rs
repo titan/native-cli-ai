@@ -166,6 +166,57 @@ pub fn build_error(id: &str, message: &str) -> Vec<u8> {
     })
 }
 
+/// Coarse classification of an inbound frame for RPC demultiplexing (G5).
+///
+/// `rpc_sync` needs to know whether a frame is the response it is waiting
+/// for, an unsupported plugin→host callback, an error, or something
+/// unexpected — see `plugin_host::RemotePlugin::rpc_sync`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrameKind {
+    /// A result arm (`@16..=@27`) carrying the given envelope id.
+    Response(String),
+    /// A plugin→host callback arm (`@28..=@32`): (envelope id, arm name).
+    Callback(String, &'static str),
+    /// An `error @38` arm with its message.
+    Error(String),
+    /// Anything else (requests, handshake arms, undecodable).
+    Opaque,
+}
+
+/// Classify a raw frame by its body arm and envelope id.
+pub fn classify_frame(raw: &[u8]) -> FrameKind {
+    let mut reader = io::BufReader::new(raw);
+    read_message_then(&mut reader, |msg| {
+        let id = msg.get_id()?.to_string()?;
+        let body = msg.get_body()?;
+        Ok(match body.which() {
+            Ok(body::ExecuteToolResult(_))
+            | Ok(body::SystemPromptResult(_))
+            | Ok(body::UserPromptResult(_))
+            | Ok(body::ChatParamsResult(_))
+            | Ok(body::ChatMessagesTransformResult(_))
+            | Ok(body::ShellEnvResult(_))
+            | Ok(body::ToolDefinitionResult(_))
+            | Ok(body::PermissionAskResult(_))
+            | Ok(body::ToolExecuteBeforeResult(_))
+            | Ok(body::ToolExecuteAfterResult(_))
+            | Ok(body::CommandExecuteBeforeResult(_))
+            | Ok(body::CapabilitiesResult(_)) => FrameKind::Response(id),
+            Ok(body::ReadFile(_)) => FrameKind::Callback(id, "readFile"),
+            Ok(body::ListDirectory(_)) => FrameKind::Callback(id, "listDirectory"),
+            Ok(body::SearchCode(_)) => FrameKind::Callback(id, "searchCode"),
+            Ok(body::GetWorkspaceRoot(_)) => FrameKind::Callback(id, "getWorkspaceRoot"),
+            Ok(body::Log(_)) => FrameKind::Callback(id, "log"),
+            Ok(body::Error(e)) => {
+                let e = e?;
+                FrameKind::Error(e.get_message()?.to_string()?)
+            }
+            _ => FrameKind::Opaque,
+        })
+    })
+    .unwrap_or(FrameKind::Opaque)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

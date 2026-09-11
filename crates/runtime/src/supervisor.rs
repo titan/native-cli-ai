@@ -674,7 +674,7 @@ impl Supervisor {
             if descriptors.is_empty() {
                 PluginRegistry::new()
             } else {
-                let mut host = PluginHost::new();
+                let mut host = PluginHost::with_config(config.plugins.clone());
                 let perm_mode = serde_json::to_string(&config.permissions.mode)
                     .unwrap_or_else(|_| "\"default\"".into());
                 let perm_mode = perm_mode.trim_matches('"');
@@ -689,6 +689,11 @@ impl Supervisor {
                 reg
             }
         };
+
+        // G1: every tool the plugins declared in Hello becomes a callable
+        // `PluginTool` in the registry (routing, approval tiers, and timeouts
+        // identical to built-ins; execution via the plugin's execute_tool).
+        nca_core::tools::plugin_tool::register_plugin_tools(&mut tools, &plugins, &config.plugins);
 
         let mut agent = AgentLoop::new(
             provider,

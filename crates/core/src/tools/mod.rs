@@ -14,6 +14,7 @@ pub mod invoke_skill;
 pub mod list_directory;
 pub mod mcp;
 pub mod move_path;
+pub mod plugin_tool;
 pub mod rename_path;
 pub mod replace_match;
 pub mod run_validation;

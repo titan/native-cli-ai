@@ -34,6 +34,9 @@ pub struct NcaConfig {
     /// (P1: read-only introspection).
     #[serde(default)]
     pub subagent: SubagentConfig,
+    /// `[plugins]` — out-of-process plugin RPC tuning.
+    #[serde(default)]
+    pub plugins: PluginConfig,
 }
 
 impl NcaConfig {
@@ -208,6 +211,9 @@ impl NcaConfig {
         }
         if let Some(subagent) = partial.subagent {
             self.subagent.merge(subagent);
+        }
+        if let Some(plugins) = partial.plugins {
+            self.plugins.merge(plugins);
         }
 
         if let Some(extra_paths) = partial.extra_paths {
@@ -643,6 +649,76 @@ impl Default for SubagentConfig {
             wake: WakeConfig::default(),
         }
     }
+}
+
+/// `[plugins]` — tuning for the out-of-process plugin RPC surface.
+/// Timeouts are per-RPC; the host never blocks a turn longer than the
+/// relevant timeout waiting on a plugin.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PluginConfig {
+    /// RPC budget for per-turn prompt hooks (`userPrompt`), milliseconds.
+    #[serde(default = "default_plugin_prompt_hook_timeout_ms")]
+    pub prompt_hook_timeout_ms: u64,
+    /// RPC budget for `executeTool` calls, milliseconds. Plugin tools may
+    /// do file IO, so this defaults well above the prompt-hook budget.
+    #[serde(default = "default_plugin_tool_timeout_ms")]
+    pub tool_timeout_ms: u64,
+    /// RPC budget for the subagent dispatch hook, milliseconds.
+    #[serde(default = "default_plugin_subagent_dispatch_timeout_ms")]
+    pub subagent_dispatch_timeout_ms: u64,
+    /// Host-enforced cap on total plugin-appended context per subagent
+    /// dispatch, in bytes. Overflow is truncated with a marker.
+    #[serde(default = "default_plugin_subagent_context_max_bytes")]
+    pub subagent_context_max_bytes: usize,
+}
+
+fn default_plugin_prompt_hook_timeout_ms() -> u64 {
+    5_000
+}
+fn default_plugin_tool_timeout_ms() -> u64 {
+    30_000
+}
+fn default_plugin_subagent_dispatch_timeout_ms() -> u64 {
+    5_000
+}
+fn default_plugin_subagent_context_max_bytes() -> usize {
+    65_536
+}
+
+impl Default for PluginConfig {
+    fn default() -> Self {
+        Self {
+            prompt_hook_timeout_ms: default_plugin_prompt_hook_timeout_ms(),
+            tool_timeout_ms: default_plugin_tool_timeout_ms(),
+            subagent_dispatch_timeout_ms: default_plugin_subagent_dispatch_timeout_ms(),
+            subagent_context_max_bytes: default_plugin_subagent_context_max_bytes(),
+        }
+    }
+}
+
+impl PluginConfig {
+    fn merge(&mut self, partial: PartialPluginConfig) {
+        if let Some(v) = partial.prompt_hook_timeout_ms {
+            self.prompt_hook_timeout_ms = v;
+        }
+        if let Some(v) = partial.tool_timeout_ms {
+            self.tool_timeout_ms = v;
+        }
+        if let Some(v) = partial.subagent_dispatch_timeout_ms {
+            self.subagent_dispatch_timeout_ms = v;
+        }
+        if let Some(v) = partial.subagent_context_max_bytes {
+            self.subagent_context_max_bytes = v;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PartialPluginConfig {
+    prompt_hook_timeout_ms: Option<u64>,
+    tool_timeout_ms: Option<u64>,
+    subagent_dispatch_timeout_ms: Option<u64>,
+    subagent_context_max_bytes: Option<usize>,
 }
 
 impl SubagentConfig {
@@ -2325,6 +2401,7 @@ struct PartialNcaConfig {
     agents: Option<BTreeMap<String, PartialAgentProfileConfig>>,
     extra_paths: Option<Vec<PathBuf>>,
     subagent: Option<PartialSubagentConfig>,
+    plugins: Option<PartialPluginConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

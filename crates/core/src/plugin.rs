@@ -13,6 +13,7 @@
 //! - **Tool execution**: exclusive — one plugin handles one tool.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use nca_common::config::NcaConfig;
 use nca_common::tool::{ToolCall, ToolDefinition, ToolResult};
@@ -143,6 +144,18 @@ pub trait NcaPlugin: Send + Sync {
         None
     }
 
+    /// Augment a sub-agent dispatch with curated context (G3).
+    ///
+    /// Called in the PARENT process just before the child session is
+    /// created, so workspace-root binding stays the parent's root (children
+    /// may run in separate worktrees). Receives the specialist name and the
+    /// raw task text; returns an optional context block to append to the
+    /// child's task prompt. The host enforces a size cap on the total
+    /// appended context and a per-call RPC timeout.
+    fn on_subagent_dispatch(&self, _specialist: &str, _task: &str) -> Option<String> {
+        None
+    }
+
     // ── Infrastructure ─────────────────────────────────────────────────────
 
     /// Observe an event from the AgentEvent stream (read-only, fire-and-forget).
@@ -178,9 +191,13 @@ pub trait NcaPlugin: Send + Sync {
 }
 
 /// A collection of plugins loaded at session startup.
+///
+/// Plugins are stored as `Arc` so contributed tools can hold a handle to
+/// their owning plugin (see `core::tools::plugin_tool::PluginTool`) while
+/// the registry itself is shared with subagent dispatch.
 #[derive(Default)]
 pub struct PluginRegistry {
-    plugins: Vec<Box<dyn NcaPlugin>>,
+    plugins: Vec<Arc<dyn NcaPlugin>>,
 }
 
 impl PluginRegistry {
@@ -193,6 +210,13 @@ impl PluginRegistry {
     /// Register a plugin. Order matters: plugins are invoked in registration
     /// order for sequential hooks.
     pub fn register(&mut self, plugin: Box<dyn NcaPlugin>) {
+        self.plugins.push(plugin.into());
+    }
+
+    /// Register a plugin from a shared handle (keeps existing Arc clones
+    /// valid, e.g. when rebuilding a registry from live `RemotePlugin`
+    /// instances on refresh).
+    pub fn register_shared(&mut self, plugin: Arc<dyn NcaPlugin>) {
         self.plugins.push(plugin);
     }
 
@@ -352,6 +376,33 @@ impl PluginRegistry {
             }
         }
         (defs, owners)
+    }
+
+    /// Collect plugin tool declarations paired with a shared handle to the
+    /// owning plugin — the registration source for
+    /// [`crate::tools::plugin_tool::PluginTool`].
+    pub fn collect_tool_implementations(&self) -> Vec<(ToolDefinition, Arc<dyn NcaPlugin>)> {
+        let mut out = Vec::new();
+        for plugin in &self.plugins {
+            for def in plugin.tools() {
+                out.push((def, Arc::clone(plugin)));
+            }
+        }
+        out
+    }
+
+    /// Collect sub-agent dispatch augmentation blocks (G3). Plugins that
+    /// return `None` contribute nothing. No filtering by specialist here —
+    /// the plugin decides from `(specialist, task)` whether to augment.
+    pub fn collect_subagent_dispatch(&self, specialist: &str, task: &str) -> Vec<(String, String)> {
+        self.plugins
+            .iter()
+            .filter_map(|plugin| {
+                plugin
+                    .on_subagent_dispatch(specialist, task)
+                    .map(|text| (plugin.name().to_string(), text))
+            })
+            .collect()
     }
 
     /// Execute a contributed tool by dispatching to the owning plugin.
