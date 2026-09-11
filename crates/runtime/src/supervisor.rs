@@ -105,7 +105,7 @@ pub struct Supervisor {
     /// warns and falls back to the default harness prompt).
     active_agent_name: Option<String>,
     hooks: Option<HookRunner>,
-    plugins: PluginRegistry,
+    plugins: Arc<PluginRegistry>,
     #[allow(dead_code)] // retained for RAII — drop cleans up child plugin processes.
     plugin_host: Option<PluginHost>,
     context_manager: ContextManager,
@@ -776,7 +776,7 @@ impl Supervisor {
             agent_profile,
             active_agent_name: requested_agent_name,
             hooks: hook_runner,
-            plugins,
+            plugins: Arc::new(plugins),
             plugin_host,
             context_manager,
             last_summary_at_tokens: 0,
@@ -1870,6 +1870,12 @@ impl Supervisor {
         self.fs.clone()
     }
 
+    /// Shared handle to the plugin registry (G3): lets the spawn consumer
+    /// fire `subagentDispatch` hooks with the parent-rooted plugin instances.
+    pub fn plugin_registry(&self) -> Arc<PluginRegistry> {
+        Arc::clone(&self.plugins)
+    }
+
     /// Collect slash commands contributed by plugins (for CLI slash panel).
     pub fn plugin_commands(&self) -> Vec<(String, Vec<String>)> {
         self.plugins.collect_commands()
@@ -1883,6 +1889,15 @@ impl Supervisor {
         arguments: &str,
     ) -> Option<(String, nca_core::plugin::CommandIntercept)> {
         self.plugins.check_command_before(command, arguments)
+    }
+
+    /// G6: echo an intercepted plugin command's output into the LLM
+    /// conversation as a system-role note (opt-in per interception via
+    /// `CommandIntercept.echo`). Pure history append — no turn is triggered,
+    /// so the model observes the state change on the user's next submit.
+    pub async fn record_plugin_command_echo(&mut self, plugin: &str, text: &str) {
+        let note = format!("[plugin:{plugin}] {text}");
+        self.agent.record_system_note(&note).await;
     }
 
     pub fn request_cancel(&self) {

@@ -49,6 +49,12 @@ struct ToolDeclaration {
 struct Capabilities {
     tools    @0 :List(ToolDeclaration);
     commands @1 :List(Text);
+    # Optional hook support declarations (protocol minor 1). Plugins list
+    # the OPTIONAL host hooks they implement so the host never sends an arm
+    # the plugin cannot decode. Currently meaningful entries:
+    #   "subagentDispatch" — plugin answers subagentDispatch @39 requests.
+    # Unknown entries must be ignored by both sides (forward compatibility).
+    hooks    @2 :List(Text);
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -218,6 +224,24 @@ struct CommandExecuteBeforeRequest {
 struct CommandExecuteBeforeResult {
     handled @0 :Bool;
     text    @1 :Text;
+    # Opt-in (protocol minor 1): echo the intercepted command output into
+    # the LLM conversation as a system-role message so the model learns the
+    # workflow state changed (G6). Default false keeps terminal-only output.
+    echoToConversation @2 :Bool = false;
+}
+
+# ── Sub-agent dispatch augmentation (G3, protocol minor 1) ─────────────
+
+struct SubagentDispatchRequest {
+    specialist @0 :Text;   # specialist/agent profile name, empty when plain
+    task       @1 :Text;   # the raw task prompt the parent is dispatching
+    worktree   @2 :Bool;   # child will run in a separate worktree
+}
+struct SubagentDispatchResult {
+    # Context block appended to the child's task prompt. Empty = no
+    # augmentation. The host enforces a size cap (see [plugins]
+    # subagent_context_max_bytes) and truncates with a marker on overflow.
+    contextAppend @0 :Text;
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -351,5 +375,9 @@ struct Body {
 
         # ── Error ───────────────────────────────────────────────────────
         error                 @38 :ErrorResponse;
+
+        # ── Sub-agent dispatch (G3, protocol minor 1) ──────────────────
+        subagentDispatch        @39 :SubagentDispatchRequest;
+        subagentDispatchResult  @40 :SubagentDispatchResult;
     }
 }

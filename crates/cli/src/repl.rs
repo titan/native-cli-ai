@@ -164,6 +164,7 @@ impl Repl {
                     // defaults per the spec amendment (docs §3).
                     false,
                     None,
+                    self.runtime.plugin_registry(),
                 ))
             } else {
                 None
@@ -1476,6 +1477,14 @@ impl Repl {
                         && intercept.handled
                     {
                         out.println(&format!("[{plugin_name}] {}", intercept.text));
+                        // G6 opt-in echo: also surface the intercepted output
+                        // to the model as a system-role note so it observes
+                        // the workflow state change without a re-explanation.
+                        if intercept.echo {
+                            self.runtime
+                                .record_plugin_command_echo(&plugin_name, &intercept.text)
+                                .await;
+                        }
                         return Ok(true);
                     }
                 }
@@ -1695,6 +1704,7 @@ impl Repl {
                     // scheduler above.
                     self.runtime.config().subagent.background,
                     wake_scheduler.clone(),
+                    self.runtime.plugin_registry(),
                 ))
             } else {
                 None

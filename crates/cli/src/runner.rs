@@ -170,6 +170,12 @@ impl SessionRuntime {
         self.supervisor.subagent_registry()
     }
 
+    /// Shared plugin registry handle (G3: `subagentDispatch` hooks fire
+    /// against the parent-rooted plugin instances).
+    pub fn plugin_registry(&self) -> Option<Arc<nca_core::plugin::PluginRegistry>> {
+        Some(self.supervisor.plugin_registry())
+    }
+
     pub fn set_model(&mut self, model: impl Into<String>) {
         let model = model.into();
         self.supervisor.model = model.clone();
@@ -404,6 +410,14 @@ impl SessionRuntime {
         arguments: &str,
     ) -> Option<(String, nca_core::plugin::CommandIntercept)> {
         self.supervisor.check_command_before(command, arguments)
+    }
+
+    /// G6: echo an intercepted plugin command's output into the conversation
+    /// (opt-in per interception; see `CommandIntercept.echo`).
+    pub async fn record_plugin_command_echo(&mut self, plugin: &str, text: &str) {
+        self.supervisor
+            .record_plugin_command_echo(plugin, text)
+            .await;
     }
 }
 

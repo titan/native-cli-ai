@@ -55,6 +55,10 @@ struct RemotePluginInstance {
 pub struct PluginCapabilities {
     pub tools: Vec<ToolDefinition>,
     pub commands: Vec<String>,
+    /// Optional hooks the plugin declares support for (protocol minor 1).
+    /// Host-side gating: an arm is only ever sent to plugins that listed it
+    /// here, so minor-0 plugins never receive a frame they cannot decode.
+    pub hooks: Vec<String>,
 }
 
 // ─── Discovery ───────────────────────────────────────────────────────────────
@@ -409,7 +413,15 @@ fn parse_capabilities(hello: &hello::Reader<'_>) -> Result<PluginCapabilities, W
     for cmd in caps.get_commands()?.iter() {
         commands.push(cmd?.to_string()?);
     }
-    Ok(PluginCapabilities { tools, commands })
+    let mut hooks = Vec::new();
+    for hook in caps.get_hooks()?.iter() {
+        hooks.push(hook?.to_string()?);
+    }
+    Ok(PluginCapabilities {
+        tools,
+        commands,
+        hooks,
+    })
 }
 
 /// Convert Cap'n Proto `ToolParameter` list to JSON Schema for LLM consumption.
@@ -505,6 +517,12 @@ impl RemotePlugin {
             capabilities,
             config,
         }
+    }
+
+    /// Whether this plugin declared the named optional hook in its Hello
+    /// capabilities (protocol minor 1 gating).
+    fn supports_hook(&self, hook: &str) -> bool {
+        self.capabilities.hooks.iter().any(|h| h == hook)
     }
 
     fn alloc_id(&self) -> String {
@@ -884,6 +902,53 @@ impl NcaPlugin for RemotePlugin {
         });
     }
 
+    /// G3 — `subagentDispatch @39` RPC bridge. Capability-gated: only
+    /// plugins that declared the `subagentDispatch` hook in Hello are asked
+    /// (minor-0 plugins never receive a frame they cannot decode). Runs in
+    /// the PARENT process, so the plugin's workspace-root binding stays the
+    /// parent's root even when the child will live in a worktree.
+    fn on_subagent_dispatch(&self, specialist: &str, task: &str, worktree: bool) -> Option<String> {
+        if self.is_disabled() || !self.supports_hook("subagentDispatch") {
+            return None;
+        }
+
+        let id = self.alloc_id();
+        let specialist = specialist.to_string();
+        let task = task.to_string();
+        let wire = plugin_protocol::build_message(&id, |body| {
+            let mut req = body.reborrow().init_subagent_dispatch();
+            req.set_specialist(&specialist);
+            req.set_task(&task);
+            req.set_worktree(worktree);
+        });
+
+        let raw = self
+            .rpc_sync(
+                &id,
+                wire,
+                self.config.subagent_dispatch_timeout_ms.div_ceil(1000),
+            )
+            .ok()?;
+
+        let mut reader = std::io::BufReader::new(&raw[..]);
+        let result = plugin_protocol::read_message_then(&mut reader, |msg| {
+            let body = msg.get_body()?;
+            match body.which() {
+                Ok(body::SubagentDispatchResult(r)) => {
+                    let r = r?;
+                    let text = r.get_context_append()?.to_string()?;
+                    Ok((!text.is_empty()).then_some(text))
+                }
+                _ => Ok(None),
+            }
+        });
+
+        match result {
+            Ok(Some(text)) => Some(text),
+            _ => None,
+        }
+    }
+
     fn on_command_execute_before(
         &self,
         command: &str,
@@ -912,6 +977,8 @@ impl NcaPlugin for RemotePlugin {
                     Ok(Some(nca_core::plugin::CommandIntercept {
                         handled: r.get_handled(),
                         text: r.get_text()?.to_string()?,
+                        // Optional field (minor 1): absent in minor-0 frames → false.
+                        echo: r.get_echo_to_conversation(),
                     }))
                 }
                 _ => Ok(None),

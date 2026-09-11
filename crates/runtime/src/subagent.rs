@@ -51,6 +51,11 @@ pub struct ChildSessionConfig {
     /// [`crate::supervisor::SupervisorConfig::provider`]. Production
     /// callers pass `None`.
     pub provider: Option<Arc<dyn nca_core::provider::Provider>>,
+    /// Parent's plugin registry (G3). When set, `prepare_child_session`
+    /// fires the `subagentDispatch` hook against the PARENT-rooted plugin
+    /// instances and appends returned context blocks to the child's task
+    /// prompt (host-enforced size cap from `[plugins]`).
+    pub plugins: Option<Arc<nca_core::plugin::PluginRegistry>>,
 }
 
 /// Result of a spawned child session.
@@ -361,6 +366,59 @@ pub async fn prepare_child_session(
     if let Some(note) = image_note {
         context_prompt.push_str("\n\n");
         context_prompt.push_str(&note);
+    }
+
+    // G3: dispatch-time plugin augmentation. The hook runs HERE — in the
+    // parent's process, against parent-rooted plugin instances — so the
+    // plugin sees the real workspace root even when the child will live in
+    // a worktree. Returned blocks are appended to the task prompt under a
+    // host-enforced byte cap (overflow truncates with a marker).
+    if let Some(plugins) = cfg.plugins.as_ref()
+        && !plugins.is_empty()
+    {
+        let blocks = plugins.collect_subagent_dispatch(
+            cfg.specialist.as_deref().unwrap_or(""),
+            &cfg.task,
+            cfg.use_worktree,
+        );
+        if !blocks.is_empty() {
+            let cap = cfg.config.plugins.subagent_context_max_bytes;
+            let mut used = 0usize;
+            let mut appended = String::new();
+            for (name, text) in &blocks {
+                let block =
+                    format!("\n\n<plugin-context source=\"{name}\">\n{text}\n</plugin-context>");
+                let budget = cap.saturating_sub(used);
+                if block.len() <= budget {
+                    used += block.len();
+                    appended.push_str(&block);
+                } else {
+                    // Byte-safe truncation: accumulate chars while the byte
+                    // budget holds (chars can be multi-byte).
+                    let mut bytes = 0usize;
+                    let truncated: String = block
+                        .chars()
+                        .take_while(|c| {
+                            bytes += c.len_utf8();
+                            bytes <= budget
+                        })
+                        .collect();
+                    used = cap;
+                    appended.push_str(&truncated);
+                    appended.push_str("\n<!-- plugin context truncated at host cap -->");
+                    tracing::warn!(
+                        "subagent dispatch context from {name} truncated at {cap}-byte host cap"
+                    );
+                    break;
+                }
+            }
+            tracing::info!(
+                "subagent dispatch augmented by {} plugin block(s), {used}/{} bytes",
+                blocks.len(),
+                cap
+            );
+            context_prompt.push_str(&appended);
+        }
     }
 
     Ok((
@@ -971,6 +1029,7 @@ pub fn spawn_subagent_consumer(
     child_provider: Option<Arc<dyn nca_core::provider::Provider>>,
     background_default: bool,
     wake: Option<WakeScheduler>,
+    plugins: Option<Arc<nca_core::plugin::PluginRegistry>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(req) = spawn_rx.recv().await {
@@ -989,6 +1048,7 @@ pub fn spawn_subagent_consumer(
             let registry = registry.clone();
             let child_provider = child_provider.clone();
             let wake = wake.clone();
+            let plugins = plugins.clone();
 
             // Summary of the parent conversation as of THIS spawn (the
             // supervisor refreshes the mirror at each turn start), so a child
@@ -1014,6 +1074,7 @@ pub fn spawn_subagent_consumer(
                 alias: req.alias.clone(),
                 registry: Some(registry.clone()),
                 provider: child_provider,
+                plugins,
             };
 
             tokio::spawn(async move {

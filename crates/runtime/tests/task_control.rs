@@ -173,6 +173,7 @@ async fn cancel_mid_turn_ends_child_cancelled_and_retains_worktree() {
             alias: None,
             registry: Some(registry.clone()),
             provider: Some(provider),
+            plugins: None,
         },
         Some(parent_tx.clone()),
     ));

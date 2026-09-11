@@ -964,6 +964,7 @@ async fn run_one_shot(
                 // (docs/subagent-task-lifecycle.md §3).
                 false,
                 None,
+                runtime.plugin_registry(),
             )
         });
 

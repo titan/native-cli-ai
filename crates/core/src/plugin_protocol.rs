@@ -12,7 +12,10 @@ use crate::plugin_capnp::{body, plugin_message};
 
 /// Current plugin protocol version.
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 0;
+/// Minor 1: `Capabilities.hooks`, `subagentDispatch @39/@40`, and
+/// `CommandExecuteBeforeResult.echoToConversation @2` (all additive,
+/// default-preserving — minor-0 peers interoperate unchanged).
+pub const PROTOCOL_MINOR: u16 = 1;
 
 /// Error type for plugin wire operations.
 #[derive(Debug, thiserror::Error)]
@@ -129,6 +132,8 @@ pub fn body_method_name(body: &body::Reader<'_>) -> &'static str {
         Ok(body::GetWorkspaceRootResponse(_)) => "getWorkspaceRootResponse",
         Ok(body::LogResponse(_)) => "logResponse",
         Ok(body::Error(_)) => "error",
+        Ok(body::SubagentDispatch(_)) => "subagentDispatch",
+        Ok(body::SubagentDispatchResult(_)) => "subagentDispatchResult",
         Err(_) => "unknown",
     }
 }
@@ -201,7 +206,8 @@ pub fn classify_frame(raw: &[u8]) -> FrameKind {
             | Ok(body::ToolExecuteBeforeResult(_))
             | Ok(body::ToolExecuteAfterResult(_))
             | Ok(body::CommandExecuteBeforeResult(_))
-            | Ok(body::CapabilitiesResult(_)) => FrameKind::Response(id),
+            | Ok(body::CapabilitiesResult(_))
+            | Ok(body::SubagentDispatchResult(_)) => FrameKind::Response(id),
             Ok(body::ReadFile(_)) => FrameKind::Callback(id, "readFile"),
             Ok(body::ListDirectory(_)) => FrameKind::Callback(id, "listDirectory"),
             Ok(body::SearchCode(_)) => FrameKind::Callback(id, "searchCode"),

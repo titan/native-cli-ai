@@ -162,6 +162,7 @@ async fn spawn_gated_child(
             alias: alias.map(String::from),
             registry: Some(registry.clone()),
             provider: Some(provider),
+            plugins: None,
         },
         Some(event_tx),
     ));

@@ -80,6 +80,10 @@ pub struct CommandIntercept {
     pub handled: bool,
     /// User-facing text to display.
     pub text: String,
+    /// Opt-in (G6): also echo `text` into the LLM conversation as a
+    /// system-role message so the model observes the state change. Default
+    /// `false` keeps interception terminal-only.
+    pub echo: bool,
 }
 
 /// A Rust-native plugin that extends nca's behavior.
@@ -150,11 +154,18 @@ pub trait NcaPlugin: Send + Sync {
     ///
     /// Called in the PARENT process just before the child session is
     /// created, so workspace-root binding stays the parent's root (children
-    /// may run in separate worktrees). Receives the specialist name and the
-    /// raw task text; returns an optional context block to append to the
-    /// child's task prompt. The host enforces a size cap on the total
-    /// appended context and a per-call RPC timeout.
-    fn on_subagent_dispatch(&self, _specialist: &str, _task: &str) -> Option<String> {
+    /// may run in separate worktrees). Receives the specialist name, the
+    /// raw task text, and whether the child will run in a worktree;
+    /// returns an optional context block to append to the child's task
+    /// prompt. The host enforces a size cap on the total appended context
+    /// and a per-call RPC timeout. Plugins decide per-specialist whether to
+    /// augment — returning `None` for irrelevant dispatches is the norm.
+    fn on_subagent_dispatch(
+        &self,
+        _specialist: &str,
+        _task: &str,
+        _worktree: bool,
+    ) -> Option<String> {
         None
     }
 
@@ -396,12 +407,17 @@ impl PluginRegistry {
     /// Collect sub-agent dispatch augmentation blocks (G3). Plugins that
     /// return `None` contribute nothing. No filtering by specialist here —
     /// the plugin decides from `(specialist, task)` whether to augment.
-    pub fn collect_subagent_dispatch(&self, specialist: &str, task: &str) -> Vec<(String, String)> {
+    pub fn collect_subagent_dispatch(
+        &self,
+        specialist: &str,
+        task: &str,
+        worktree: bool,
+    ) -> Vec<(String, String)> {
         self.plugins
             .iter()
             .filter_map(|plugin| {
                 plugin
-                    .on_subagent_dispatch(specialist, task)
+                    .on_subagent_dispatch(specialist, task, worktree)
                     .map(|text| (plugin.name().to_string(), text))
             })
             .collect()
@@ -564,6 +580,38 @@ mod tests {
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "search-web");
         assert_eq!(owners.get("search-web").unwrap(), "tool-plugin");
+    }
+
+    struct DispatchPlugin;
+
+    impl NcaPlugin for DispatchPlugin {
+        fn name(&self) -> &str {
+            "dispatch-plugin"
+        }
+
+        fn on_subagent_dispatch(
+            &self,
+            specialist: &str,
+            task: &str,
+            worktree: bool,
+        ) -> Option<String> {
+            Some(format!(
+                "curated for {specialist} on `{task}` (worktree={worktree})"
+            ))
+        }
+    }
+
+    #[test]
+    fn collect_subagent_dispatch_carries_specialist_and_task() {
+        let mut reg = PluginRegistry::new();
+        reg.register(Box::new(DispatchPlugin));
+        reg.register(Box::new(SilentPlugin));
+
+        let blocks = reg.collect_subagent_dispatch("implement", "fix the bug", true);
+        assert_eq!(blocks.len(), 1, "silent plugin contributes nothing");
+        assert_eq!(blocks[0].0, "dispatch-plugin");
+        assert!(blocks[0].1.contains("curated for implement"));
+        assert!(blocks[0].1.contains("worktree=true"));
     }
 
     struct DenyPlugin;

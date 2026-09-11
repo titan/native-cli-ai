@@ -175,6 +175,7 @@ async fn run_service_session_with_startup(
             // path — foreground default (P2 semantics, spec §3).
             false,
             None,
+            Some(supervisor.plugin_registry()),
         ))
     } else {
         None

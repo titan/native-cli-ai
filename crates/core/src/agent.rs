@@ -250,6 +250,15 @@ impl AgentLoop {
         .await;
     }
 
+    /// Append a system-role note to the live history AND the replay
+    /// projection (G6 plugin command echo): the model observes the state
+    /// change on its next turn and the transcript shows it inline. No turn
+    /// is triggered — this is a pure history append between turns.
+    pub async fn record_system_note(&mut self, text: &str) {
+        self.record(&Message::system(text)).await;
+        self.messages.push(Message::system(text));
+    }
+
     pub fn event_sender(&self) -> Option<tokio::sync::mpsc::Sender<AgentEvent>> {
         Some(self.event_tx.clone())
     }
