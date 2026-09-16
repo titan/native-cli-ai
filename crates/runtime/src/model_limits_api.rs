@@ -467,9 +467,12 @@ pub async fn fetch_provider_model_ids(config: &NcaConfig) -> Vec<String> {
             "glm-5-turbo".into(),
         ],
         ProviderKind::DeepSeek => vec![
+            // Only currently-served ids: V4.1 Flash (`deepseek-flash`) replaced
+            // V4 Flash, and V4 Pro is being retired (its requests route to
+            // V4.1 Flash until V4.1 Pro ships). `deepseek-v4-flash` stays as
+            // the compatibility id DeepSeek still routes.
             "deepseek-flash".into(),
             "deepseek-v4-flash".into(),
-            "deepseek-v4-pro".into(),
             "deepseek-chat".into(),
             "deepseek-reasoner".into(),
         ],
