@@ -467,6 +467,7 @@ pub async fn fetch_provider_model_ids(config: &NcaConfig) -> Vec<String> {
             "glm-5-turbo".into(),
         ],
         ProviderKind::DeepSeek => vec![
+            "deepseek-flash".into(),
             "deepseek-v4-flash".into(),
             "deepseek-v4-pro".into(),
             "deepseek-chat".into(),

@@ -367,8 +367,20 @@ impl NcaConfig {
             "zhipuai" | "glm" | "glm5" | "glm-5.2" | "glm-5.3" | "glm-5.3-flash" => {
                 Some(ProviderKind::ZhipuAI)
             }
-            "default" | "deepseek" | "ds" | "deepseek-v4" | "dsv4" | "dsv4p" | "deepseek-v3"
-            | "dsv3" | "deepseek-r1" | "dsr1" => Some(ProviderKind::DeepSeek),
+            "default"
+            | "deepseek"
+            | "ds"
+            | "deepseek-v4"
+            | "dsv4"
+            | "dsv4p"
+            | "deepseek-v3"
+            | "dsv3"
+            | "deepseek-r1"
+            | "dsr1"
+            | "deepseek-flash"
+            | "flash"
+            | "deepseek-v4.1-flash"
+            | "deepseek-v4-1-flash" => Some(ProviderKind::DeepSeek),
             _ => None,
         }
     }
@@ -1473,7 +1485,7 @@ impl Default for DeepSeekConfig {
             api_key_env: "DEEPSEEK_API_KEY".into(),
             api_key: None,
             base_url: "https://api.deepseek.com".into(),
-            model: "deepseek-v4-flash".into(),
+            model: "deepseek-flash".into(),
             temperature: 0.7,
         }
     }
@@ -1702,7 +1714,7 @@ pub struct ModelConfig {
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
-            default_model: "deepseek-v4-flash".into(),
+            default_model: "deepseek-flash".into(),
             max_tokens: 8192,
             enable_thinking: false,
             thinking_budget: 5120,
@@ -2661,12 +2673,18 @@ fn default_max_memory_notes() -> usize {
 
 fn default_model_aliases() -> BTreeMap<String, String> {
     BTreeMap::from([
-        // DeepSeek (default provider)
-        ("default".into(), "deepseek-v4-flash".into()),
-        ("deepseek".into(), "deepseek-v4-flash".into()),
-        ("ds".into(), "deepseek-v4-flash".into()),
-        ("deepseek-v4".into(), "deepseek-v4-flash".into()),
-        ("dsv4".into(), "deepseek-v4-flash".into()),
+        // DeepSeek (default provider). `deepseek-flash` is the V4.1 Flash API
+        // id; the retired `deepseek-v4-flash` id only temporarily routes to it,
+        // so the convenience aliases below point at the current model.
+        ("default".into(), "deepseek-flash".into()),
+        ("deepseek".into(), "deepseek-flash".into()),
+        ("ds".into(), "deepseek-flash".into()),
+        ("deepseek-v4".into(), "deepseek-flash".into()),
+        ("dsv4".into(), "deepseek-flash".into()),
+        ("deepseek-flash".into(), "deepseek-flash".into()),
+        ("flash".into(), "deepseek-flash".into()),
+        ("deepseek-v4.1-flash".into(), "deepseek-flash".into()),
+        ("deepseek-v4-1-flash".into(), "deepseek-flash".into()),
         ("dsv4p".into(), "deepseek-v4-pro".into()),
         ("deepseek-v3".into(), "deepseek-chat".into()),
         ("dsv3".into(), "deepseek-chat".into()),
@@ -2878,7 +2896,7 @@ interval_ms = 500
         let mut config = NcaConfig::default();
         config.provider.default = ProviderKind::DeepSeek;
         config.sync_default_model_from_provider();
-        assert_eq!(config.provider.deepseek.model, "deepseek-v4-flash");
+        assert_eq!(config.provider.deepseek.model, "deepseek-flash");
 
         config.apply_model_override("glm");
 
@@ -2886,7 +2904,7 @@ interval_ms = 500
         assert_eq!(config.provider.zhipuai.model, "glm-5.3");
         assert_eq!(config.model.default_model, "glm-5.3");
         // DeepSeek model must NOT have been polluted
-        assert_eq!(config.provider.deepseek.model, "deepseek-v4-flash");
+        assert_eq!(config.provider.deepseek.model, "deepseek-flash");
     }
 
     #[test]
@@ -2915,7 +2933,7 @@ interval_ms = 500
         assert_eq!(config.provider.default, ProviderKind::OpenAi);
         assert_eq!(config.provider.openai.model, "gpt-4o");
         assert_eq!(config.model.default_model, "gpt-4o");
-        assert_eq!(config.provider.deepseek.model, "deepseek-v4-flash");
+        assert_eq!(config.provider.deepseek.model, "deepseek-flash");
     }
 
     #[test]
@@ -2964,6 +2982,36 @@ interval_ms = 500
             Some(ProviderKind::OpenRouter)
         );
         assert_eq!(NcaConfig::provider_hint_for_alias("unknown-model"), None);
+    }
+
+    #[test]
+    fn deepseek_v41_flash_aliases_resolve_to_canonical_id() {
+        // `deepseek-flash` is the V4.1 Flash API id. The convenience aliases and
+        // the dotted/dashed spellings third-party catalogs publish must all
+        // resolve to it and switch the provider to DeepSeek.
+        let config = NcaConfig::default();
+        for alias in [
+            "default",
+            "deepseek",
+            "ds",
+            "deepseek-v4",
+            "dsv4",
+            "deepseek-flash",
+            "flash",
+            "deepseek-v4.1-flash",
+            "deepseek-v4-1-flash",
+        ] {
+            assert_eq!(
+                config.model.resolve_alias(alias),
+                "deepseek-flash",
+                "resolved model for alias {alias:?}"
+            );
+            assert_eq!(
+                NcaConfig::provider_hint_for_alias(alias),
+                Some(ProviderKind::DeepSeek),
+                "provider hint for alias {alias:?}"
+            );
+        }
     }
 
     #[test]
@@ -3443,11 +3491,11 @@ default_model = "glm-5.2"
         // Provider must be deepseek (explicit in config)
         assert_eq!(config.provider.default, ProviderKind::DeepSeek);
         // DeepSeek model must remain the deepseek default — NOT polluted by glm-5.2
-        assert_eq!(config.provider.deepseek.model, "deepseek-v4-flash");
+        assert_eq!(config.provider.deepseek.model, "deepseek-flash");
         // ZhipuAI model must remain the zhipuai default
         assert_eq!(config.provider.zhipuai.model, "glm-5.3");
         // In-memory default_model is derived from the active provider
-        assert_eq!(config.model.default_model, "deepseek-v4-flash");
+        assert_eq!(config.model.default_model, "deepseek-flash");
     }
 
     #[test]

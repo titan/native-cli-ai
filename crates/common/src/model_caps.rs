@@ -43,14 +43,16 @@ pub fn model_accepts_native_images(kind: ProviderKind, model: &str) -> bool {
         }
         // DeepSeek V4 and later accept native image inputs (OpenAI-style
         // `image_url` blocks on /chat/completions); v3.x and r1 generations
-        // are text-only. The rolling aliases `deepseek-chat` and
-        // `deepseek-reasoner` track the current generation, so they count as
-        // multimodal; unknown explicit names stay conservative (the
-        // run_turn_with_images gate names the model when it rejects).
+        // are text-only. The rolling aliases `deepseek-chat`,
+        // `deepseek-reasoner`, and `deepseek-flash` (the V4.1 Flash API id)
+        // track the current generation, so they count as multimodal; unknown
+        // explicit names stay conservative (the run_turn_with_images gate
+        // names the model when it rejects).
         ProviderKind::DeepSeek => {
             m.contains("chat")
                 || m.contains("reasoner")
                 || m.contains("vl")
+                || m.contains("flash")
                 || deepseek_generation(&m).is_some_and(|v| v >= 4)
         }
         // Kimi for Coding serves k3 on the Anthropic-compatible endpoint, which
@@ -137,6 +139,11 @@ mod tests {
         assert!(model_accepts_native_images(
             ProviderKind::DeepSeek,
             "deepseek-v4-flash"
+        ));
+        // API id for V4.1 Flash — the multimodal successor to V4 Flash.
+        assert!(model_accepts_native_images(
+            ProviderKind::DeepSeek,
+            "deepseek-flash"
         ));
         // Rolling aliases track the current (multimodal) generation.
         assert!(model_accepts_native_images(

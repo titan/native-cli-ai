@@ -179,6 +179,15 @@ pub const MODEL_CONTEXT_LIMITS: &[ModelContextLimits] = &[
         context_window: 1_000_000,
         max_output_tokens: 393_216,
     },
+    // DeepSeek V4.1 Flash — API model id is `deepseek-flash` (the multimodal
+    // successor to V4 Flash; the retired `deepseek-v4-flash` id temporarily
+    // routes here). 1M context, 384K output. Kept in lockstep with the
+    // `deepseek-v4` family entries (same underlying model).
+    ModelContextLimits {
+        pattern: "deepseek-flash",
+        context_window: 1_000_000,
+        max_output_tokens: 393_216,
+    },
     // DeepSeek V3
     ModelContextLimits {
         pattern: "deepseek-v3",
@@ -384,6 +393,16 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_deepseek_v41_flash() {
+        // API id `deepseek-flash` (V4.1 Flash). The dotted and dashed spellings
+        // that third-party catalogs publish resolve to the same specs.
+        assert_eq!(detect_context_window("deepseek-flash"), 1_000_000);
+        assert_eq!(detect_max_output_tokens("deepseek-flash"), 393_216);
+        assert_eq!(detect_context_window("deepseek-v4.1-flash"), 1_000_000);
+        assert_eq!(detect_context_window("deepseek-v4-1-flash"), 1_000_000);
+    }
+
+    #[test]
     fn test_detect_deepseek_legacy() {
         assert_eq!(detect_context_window("deepseek-v3"), 64_000);
         assert_eq!(detect_context_window("deepseek-r1"), 64_000);
@@ -421,6 +440,7 @@ mod tests {
         // (model, configured) -> expected effective value.
         let cases: &[(&str, u32, u32)] = &[
             // 128K-class floor: configured below the floor is raised to it.
+            ("deepseek-flash", 8_192, 131_072),
             ("deepseek-v4-flash", 8_192, 131_072),
             ("MiniMax-M2.7", 8_192, 131_072),
             ("glm-5.2", 8_192, 131_072),

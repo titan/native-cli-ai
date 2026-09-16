@@ -202,7 +202,7 @@ Valid `provider` values and their required config sections:
 | Anthropic | `"anthropic"` | `[provider.anthropic]` | `claude-3-7-sonnet-latest` |
 | OpenRouter | `"openrouter"` | `[provider.openrouter]` | `openai/gpt-4o` |
 | ZhipuAI | `"zhipuai"` | `[provider.zhipuai]` | `glm-5.3` |
-| DeepSeek | `"deepseek"` | `[provider.deepseek]` | `deepseek-v4-flash` |
+| DeepSeek | `"deepseek"` | `[provider.deepseek]` | `deepseek-flash` |
 
 You must have the corresponding API key configured (via `[provider.<name>].api_key` or
 environment variable). If the target provider has no credentials, the switch will fail
