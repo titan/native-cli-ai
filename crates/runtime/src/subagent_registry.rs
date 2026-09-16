@@ -515,8 +515,8 @@ pub fn subagent_control_consumer(
         while let Some(request) = control_rx.recv().await {
             match request {
                 SubagentControlRequest::Status { session_id, reply } => {
-                    let response = match registry.get(&session_id) {
-                        Some(entry) => SubagentControlResponse {
+                    let response = match registry.resolve(&session_id) {
+                        Ok(Some(entry)) => SubagentControlResponse {
                             session_id: entry.session_id,
                             state: entry.state,
                             task: Some(entry.task),
@@ -529,28 +529,36 @@ pub fn subagent_control_consumer(
                             error_message: None,
                             generation: None,
                         },
-                        None => match session_store.load(&session_id).await {
+                        // Registry miss → read-only disk fallback on the RAW
+                        // original string: an alias never names a json on disk.
+                        Ok(None) => match session_store.load(&session_id).await {
                             Ok(state) => response_from_state(&session_id, &state),
                             Err(_) => SubagentControlResponse::unknown(
                                 &session_id,
                                 unknown_task_error(&registry, &session_id),
                             ),
                         },
+                        Err(message) => SubagentControlResponse::unknown(
+                            &session_id,
+                            ambiguous_task_error(&registry, message),
+                        ),
                     };
                     let _ = reply.send(response);
                 }
                 SubagentControlRequest::Result { session_id, reply } => {
-                    let response = match registry.get(&session_id) {
-                        Some(entry) => {
+                    let response = match registry.resolve(&session_id) {
+                        Ok(Some(entry)) => {
                             build_result_response(
-                                &session_id,
+                                &entry.session_id,
                                 entry.state,
                                 entry.result_summary,
                                 &session_store,
                             )
                             .await
                         }
-                        None => match session_store.load(&session_id).await {
+                        // Registry miss → read-only disk fallback on the RAW
+                        // original string: an alias never names a json on disk.
+                        Ok(None) => match session_store.load(&session_id).await {
                             Ok(state) => {
                                 let state = &state;
                                 let mut response = response_from_state(&session_id, state);
@@ -572,6 +580,10 @@ pub fn subagent_control_consumer(
                                 unknown_task_error(&registry, &session_id),
                             ),
                         },
+                        Err(message) => SubagentControlResponse::unknown(
+                            &session_id,
+                            ambiguous_task_error(&registry, message),
+                        ),
                     };
                     let _ = reply.send(response);
                 }
