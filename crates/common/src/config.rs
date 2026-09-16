@@ -2685,7 +2685,11 @@ fn default_model_aliases() -> BTreeMap<String, String> {
         ("flash".into(), "deepseek-flash".into()),
         ("deepseek-v4.1-flash".into(), "deepseek-flash".into()),
         ("deepseek-v4-1-flash".into(), "deepseek-flash".into()),
-        ("dsv4p".into(), "deepseek-v4-pro".into()),
+        // `dsv4p` historically meant "DeepSeek V4 Pro". V4 Pro is being
+        // retired — its requests route to V4.1 Flash until V4.1 Pro ships —
+        // so point the alias at the model that actually serves it rather than
+        // a going-away id.
+        ("dsv4p".into(), "deepseek-flash".into()),
         ("deepseek-v3".into(), "deepseek-chat".into()),
         ("dsv3".into(), "deepseek-chat".into()),
         ("deepseek-r1".into(), "deepseek-reasoner".into()),
@@ -3000,6 +3004,9 @@ interval_ms = 500
             "flash",
             "deepseek-v4.1-flash",
             "deepseek-v4-1-flash",
+            // `dsv4p` no longer points at the retiring `deepseek-v4-pro` id;
+            // V4 Pro requests are served by V4.1 Flash today.
+            "dsv4p",
         ] {
             assert_eq!(
                 config.model.resolve_alias(alias),
