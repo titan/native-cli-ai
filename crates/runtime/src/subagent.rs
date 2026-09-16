@@ -603,9 +603,17 @@ pub async fn handle_revive_request(
     let entry = match registry.resolve(&session_id) {
         Ok(Some(entry)) => entry,
         Ok(None) => {
-            return SubagentControlResponse::unknown(&session_id, "unknown subagent task id");
+            return SubagentControlResponse::unknown(
+                &session_id,
+                crate::subagent_registry::unknown_task_error(&registry, &session_id),
+            );
         }
-        Err(message) => return SubagentControlResponse::unknown(&session_id, message),
+        Err(message) => {
+            return SubagentControlResponse::unknown(
+                &session_id,
+                crate::subagent_registry::ambiguous_task_error(&registry, message),
+            );
+        }
     };
     let child_id = entry.session_id.clone();
     let base =
@@ -711,7 +719,10 @@ pub async fn handle_revive_request(
     }
 
     let Some(generation) = registry.record_revive(&child_id) else {
-        return SubagentControlResponse::unknown(&child_id, "unknown subagent task id");
+        return SubagentControlResponse::unknown(
+            &child_id,
+            crate::subagent_registry::unknown_task_error(&registry, &child_id),
+        );
     };
     registry.record_handles(&child_id, sup.cancel_handle(), sup.inbox_sender());
     if let Some(ref tx) = event_tx {
