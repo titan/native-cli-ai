@@ -126,7 +126,12 @@ impl ToolExecutor for SpawnSubagentTool {
                     },
                     "alias": {
                         "type": "string",
-                        "description": "Parent-scoped name usable in place of the session id for task_* tools."
+                        "description": "Short parent-scoped name usable in place of the long session id for ALL \
+                            task_* tools (task_status/task_result/task_message/task_cancel/task_revive). \
+                            Strongly recommended for every spawn: the returned session id is a long opaque \
+                            string that is easy to mis-copy, while a short alias (e.g. 'fixer-1') is the \
+                            reliable handle. Must be unique among this session's live tasks; duplicates \
+                            make later alias-addressed calls ambiguous."
                     },
                     "provider": {
                         "type": "string",
@@ -189,6 +194,8 @@ impl ToolExecutor for SpawnSubagentTool {
             .as_str()
             .filter(|s| !s.trim().is_empty())
             .map(String::from);
+        // Kept for the output hint below (the request consumes `alias`).
+        let alias_hint = alias.clone();
 
         let (reply_tx, reply_rx) = oneshot::channel();
 
@@ -222,7 +229,17 @@ impl ToolExecutor for SpawnSubagentTool {
 
         match tokio::time::timeout(std::time::Duration::from_secs(600), reply_rx).await {
             Ok(Ok(response)) => {
-                let output = serde_json::to_string_pretty(&response).unwrap_or_default();
+                let mut output = serde_json::to_string_pretty(&response).unwrap_or_default();
+                // When the caller set an alias, remind it that the alias is
+                // the reliable handle for later task_* calls — the session id
+                // is a long opaque string that is easy to mis-copy. Kept as a
+                // single trailing line after the JSON so string-based
+                // consumers of the JSON body keep working.
+                if let Some(alias) = alias_hint.as_deref() {
+                    output.push_str(&format!(
+                        "\nAddress this task as alias \"{alias}\" (or exact session id) in task_* tools."
+                    ));
+                }
                 let success = response.status == "completed";
                 ToolResult {
                     timed_out: false,
@@ -434,6 +451,19 @@ mod tests {
             })
             .await;
         assert!(result.success);
+        // JSON body survives and the alias hint rides as a trailing line.
+        assert!(
+            result.output.contains("child_session_id"),
+            "output must still contain the JSON body: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains(
+                "Address this task as alias \"fixer-2\" (or exact session id) in task_* tools."
+            ),
+            "alias hint must appear in output: {}",
+            result.output
+        );
         let (background, alias) = capture.await.expect("capture");
         assert_eq!(background, Some(true));
         assert_eq!(alias.as_deref(), Some("fixer-2"));
@@ -459,6 +489,11 @@ mod tests {
             })
             .await;
         assert!(result.success);
+        assert!(
+            !result.output.contains("Address this task as alias"),
+            "no alias hint without an alias: {}",
+            result.output
+        );
         let (background, alias) = capture.await.expect("capture");
         assert_eq!(
             background, None,
