@@ -971,6 +971,19 @@ impl Supervisor {
             sup.subagent_registry.apply_envelope(envelope);
         }
 
+        // Second registry recovery channel: meta lineage (persisted by the
+        // parent's own saves) recovers children the envelope fold missed
+        // (old-format logs, torn tails). Seeded entries are terminal-only
+        // projections read from each child's json — never live handles,
+        // never written back (single-writer invariant preserved).
+        crate::subagent_registry::seed_registry_from_lineage(
+            &sup.subagent_registry,
+            &sup.session_store,
+            &sup.session_id,
+            &sup.child_session_ids,
+        )
+        .await;
+
         // Re-save immediately after restore: closes the create()-saves-empty-
         // state window so a crash right after resume no longer wipes the json.
         sup.save().await.map_err(ProviderError::Other)?;

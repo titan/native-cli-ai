@@ -24,7 +24,6 @@ use nca_common::session::{ChildSessionState, SessionStatus};
 use nca_common::tool::ToolDefinition;
 use nca_core::provider::{Provider, ProviderError, StreamChunk};
 use nca_core::tools::subagent_control::SubagentControlRequest;
-use nca_core::workspace_fs::RealFs;
 use nca_runtime::session_store::SessionStore;
 use nca_runtime::subagent::{ChildSessionConfig, handle_revive_request, spawn_child_session};
 use nca_runtime::subagent_registry::{SubagentRegistry, subagent_control_consumer};
@@ -134,13 +133,22 @@ fn wire_control_consumer(
 }
 
 /// Spawn a gated child (mid-turn on provider call #1) and return
-/// (child task, child session id) once the registry carries its live
-/// handles — the deterministic mid-turn anchor from task_control.rs.
+/// (child task, child session id) once the child is provably mid-turn:
+/// live handles recorded AND the first provider call has landed.
+///
+/// The call-count anchor is REQUIRED, not an optimization:
+/// `AgentLoop::run_turn` resets the cancel flag at turn start
+/// (`agent.rs`: `self.cancel_flag.store(false)`), so a cancel/revive that
+/// lands between handle-record and the child's turn-start would have its
+/// flag flip silently wiped and the gated child would park forever. Waiting
+/// for call #1 proves the child is past the reset, parked inside the stream
+/// select where the 25ms cancel poll will observe the flip.
 async fn spawn_gated_child(
     ws: &Path,
     registry: Arc<SubagentRegistry>,
     event_tx: mpsc::Sender<AgentEvent>,
     provider: Arc<dyn Provider>,
+    scripted: &ScriptedProvider,
     alias: Option<&str>,
 ) -> (
     tokio::task::JoinHandle<Result<nca_runtime::subagent::ChildSessionResult, String>>,
@@ -172,6 +180,7 @@ async fn spawn_gated_child(
             .list()
             .into_iter()
             .find(|e| e.cancel_flag.is_some())
+            && scripted.call_count() >= 1
         {
             return (task, entry.session_id);
         }
@@ -197,6 +206,7 @@ async fn revive_cancelled_child_runs_new_prompt_in_retained_session() {
         registry.clone(),
         event_tx.clone(),
         provider.clone(),
+        &provider,
         Some("fixer-x"),
     )
     .await;
@@ -311,6 +321,7 @@ async fn revive_running_child_cancels_first_then_revives() {
         registry.clone(),
         event_tx.clone(),
         provider.clone(),
+        &provider,
         None,
     )
     .await;
@@ -365,9 +376,14 @@ async fn revive_unknown_id_through_consumer_is_unknown() {
         .expect("control channel live");
     let resp = reply_rx.await.expect("revive reply");
     assert!(!resp.ok);
-    assert_eq!(
-        resp.error_message.as_deref(),
-        Some("unknown subagent task id")
+    let error = resp.error_message.expect("error");
+    assert!(
+        error.starts_with("unknown subagent task id 'ghost';"),
+        "error must name the offending id: {error}"
+    );
+    assert!(
+        error.contains("no subagent tasks are registered"),
+        "empty-registry hint must say so plainly: {error}"
     );
 }
 

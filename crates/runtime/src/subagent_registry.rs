@@ -339,6 +339,40 @@ impl SubagentRegistry {
         entries.clone()
     }
 
+    /// One-line hint of the tasks this registry tracks, appended to
+    /// unknown-id errors so the model can self-correct without another
+    /// round-trip. Empty registry says so plainly; otherwise entries are
+    /// rendered in [`Self::list`] order (spawn order, oldest-first) as
+    /// `<session_id> (alias <alias>) [state]` with lowercase state words,
+    /// capped at the 6 most recent (`… +N earlier` when older entries are
+    /// elided) and hard-truncated to ~400 chars.
+    pub(crate) fn known_tasks_hint(&self) -> String {
+        let entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        if entries.is_empty() {
+            return "no subagent tasks are registered in this session".to_string();
+        }
+        let skip = entries.len().saturating_sub(6);
+        let mut parts: Vec<String> = entries[skip..]
+            .iter()
+            .map(|entry| {
+                let mut rendered = entry.session_id.clone();
+                if let Some(alias) = &entry.alias {
+                    rendered.push_str(" (alias ");
+                    rendered.push_str(alias);
+                    rendered.push(')');
+                }
+                rendered.push_str(" [");
+                rendered.push_str(state_tag(entry.state));
+                rendered.push(']');
+                rendered
+            })
+            .collect();
+        if skip > 0 {
+            parts.push(format!("… +{skip} earlier"));
+        }
+        nca_core::agent::truncate_str(&format!("known tasks: {}", parts.join(", ")), 400)
+    }
+
     /// Try to acquire the single in-flight mutating control lease for a
     /// task (cancel/revive). Returns `None` when another control operation
     /// is already in flight; the lease is released when the guard drops.
@@ -426,6 +460,37 @@ fn response_from_state(session_id: &str, state: &SessionState) -> SubagentContro
     }
 }
 
+/// Lowercase state word for the known-tasks hint (model-facing prose —
+/// never `Debug` formatting).
+fn state_tag(state: ChildSessionState) -> &'static str {
+    match state {
+        ChildSessionState::Pending => "pending",
+        ChildSessionState::Running => "running",
+        ChildSessionState::Completed => "completed",
+        ChildSessionState::Cancelled => "cancelled",
+        ChildSessionState::Failed => "failed",
+    }
+}
+
+/// Unknown-id control error: the offending id plus the registry's
+/// known-tasks hint, so the model can self-correct. Every control path
+/// (`task_status`/`task_result`/`task_message`/`task_cancel`/
+/// `task_revive`) reports resolution misses through this one helper for a
+/// consistent contract.
+pub(crate) fn unknown_task_error(registry: &SubagentRegistry, id: &str) -> String {
+    format!(
+        "unknown subagent task id '{id}'; {}",
+        registry.known_tasks_hint()
+    )
+}
+
+/// Ambiguous-alias control error: the original resolve message as the
+/// prefix plus the known-tasks hint, so the model can disambiguate by
+/// exact session id.
+pub(crate) fn ambiguous_task_error(registry: &SubagentRegistry, message: String) -> String {
+    format!("{message}; {}", registry.known_tasks_hint())
+}
+
 /// Consume control requests (`task_status`/`task_result`/`task_message`/
 /// `task_cancel`/`task_revive`) against the registry,
 /// with a read-only `SessionStore::load` fallback for ids the registry
@@ -468,7 +533,7 @@ pub fn subagent_control_consumer(
                             Ok(state) => response_from_state(&session_id, &state),
                             Err(_) => SubagentControlResponse::unknown(
                                 &session_id,
-                                "unknown subagent task id",
+                                unknown_task_error(&registry, &session_id),
                             ),
                         },
                     };
@@ -504,7 +569,7 @@ pub fn subagent_control_consumer(
                             }
                             Err(_) => SubagentControlResponse::unknown(
                                 &session_id,
-                                "unknown subagent task id",
+                                unknown_task_error(&registry, &session_id),
                             ),
                         },
                     };
@@ -583,14 +648,20 @@ async fn handle_message_request(
         Ok(Some(entry)) => entry,
         Ok(None) => {
             return (
-                SubagentControlResponse::unknown(session_id, "unknown subagent task id"),
+                SubagentControlResponse::unknown(
+                    session_id,
+                    unknown_task_error(registry, session_id),
+                ),
                 None,
                 false,
             );
         }
         Err(message) => {
             return (
-                SubagentControlResponse::unknown(session_id, message),
+                SubagentControlResponse::unknown(
+                    session_id,
+                    ambiguous_task_error(registry, message),
+                ),
                 None,
                 false,
             );
@@ -661,9 +732,17 @@ async fn handle_cancel_request(
     let entry = match registry.resolve(session_id) {
         Ok(Some(entry)) => entry,
         Ok(None) => {
-            return SubagentControlResponse::unknown(session_id, "unknown subagent task id");
+            return SubagentControlResponse::unknown(
+                session_id,
+                unknown_task_error(registry, session_id),
+            );
         }
-        Err(message) => return SubagentControlResponse::unknown(session_id, message),
+        Err(message) => {
+            return SubagentControlResponse::unknown(
+                session_id,
+                ambiguous_task_error(registry, message),
+            );
+        }
     };
     let base = |state, note: Option<String>, ok: bool| SubagentControlResponse {
         session_id: entry.session_id.clone(),
@@ -748,6 +827,53 @@ async fn build_result_response(
         }
     }
     response
+}
+
+/// Seed registry entries from persisted session lineage
+/// (`SessionMeta::child_session_ids`) — the resume path's second recovery
+/// channel after the event-log envelope fold. For each lineage id the
+/// registry does not already track, the child's json is loaded read-only
+/// and recorded as a projection: identity fields from the child meta,
+/// state mapped from its persisted `SessionStatus` (folded straight to a
+/// terminal-truthful entry — handles are `None` by construction, no live
+/// child supervisor exists at resume, so a seeded `Running` entry can
+/// still be inspected but never signalled). Nothing is written back — the
+/// child json stays owned by whichever supervisor spawned it
+/// (single-writer invariant).
+///
+/// Ids with no json on disk (or an unreadable one) are skipped silently:
+/// there is nothing truthful to seed, and the unknown-id hint from
+/// [`unknown_task_error`] explains the gap to the model.
+pub(crate) async fn seed_registry_from_lineage(
+    registry: &SubagentRegistry,
+    session_store: &SessionStore,
+    parent_session_id: &str,
+    child_session_ids: &[String],
+) {
+    for id in child_session_ids {
+        if registry.get(id).is_some() {
+            continue;
+        }
+        let Ok(state) = session_store.load(id).await else {
+            continue;
+        };
+        registry.record_spawned(
+            state
+                .meta
+                .parent_session_id
+                .as_deref()
+                .unwrap_or(parent_session_id),
+            id,
+            state.meta.spawn_reason.as_deref().unwrap_or(""),
+            state.meta.workspace.display().to_string(),
+            state.meta.branch.clone(),
+        );
+        registry.record_terminal(
+            id,
+            ChildSessionState::from_session_status(state.meta.status.clone()),
+            state.meta.session_summary.clone(),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -904,6 +1030,112 @@ mod tests {
         registry.record_terminal("a", ChildSessionState::Completed, Some("done".into()));
         let ids: Vec<String> = registry.list().into_iter().map(|e| e.session_id).collect();
         assert_eq!(ids, vec!["a".to_string(), "b".into(), "c".into()]);
+    }
+
+    #[test]
+    fn known_tasks_hint_empty_registry_says_so() {
+        assert_eq!(
+            SubagentRegistry::new().known_tasks_hint(),
+            "no subagent tasks are registered in this session"
+        );
+    }
+
+    #[test]
+    fn known_tasks_hint_lists_ids_aliases_and_state_words() {
+        let registry = SubagentRegistry::new();
+        registry.record_spawned("p", "c1", "t", "/ws".into(), None);
+        registry.record_spawned("p", "c2", "t", "/ws".into(), None);
+        registry.set_alias("c2", Some("fixer"));
+        registry.record_terminal("c1", ChildSessionState::Completed, None);
+        assert_eq!(
+            registry.known_tasks_hint(),
+            "known tasks: c1 [completed], c2 (alias fixer) [running]"
+        );
+    }
+
+    #[test]
+    fn known_tasks_hint_caps_at_six_most_recent() {
+        let registry = SubagentRegistry::new();
+        for n in 1..=8 {
+            registry.record_spawned("p", &format!("child-{n:02}"), "t", "/ws".into(), None);
+        }
+        let hint = registry.known_tasks_hint();
+        assert!(hint.starts_with("known tasks: child-03"), "got: {hint}");
+        assert!(hint.contains("child-08"), "latest entry must show: {hint}");
+        assert!(hint.ends_with("… +2 earlier"), "got: {hint}");
+        assert!(!hint.contains("child-01") && !hint.contains("child-02"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn seed_registry_from_lineage_projects_persisted_children() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::new(dir.path());
+
+        // A completed child json on disk with lineage + summary fields set.
+        let mut child = session_state(vec![Message::user("hi")], SessionStatus::Completed);
+        child.meta.id = "child-1".into();
+        child.meta.parent_session_id = Some("parent-1".into());
+        child.meta.spawn_reason = Some("write the tests".into());
+        child.meta.session_summary = Some("all good".into());
+        store.save(&child).await.expect("save child");
+
+        let registry = SubagentRegistry::new();
+        // An id the registry already tracks must be left untouched.
+        registry.record_spawned("parent-1", "tracked-1", "live task", "/ws".into(), None);
+
+        seed_registry_from_lineage(
+            &registry,
+            &store,
+            "parent-1",
+            &[
+                "child-1".to_string(),
+                "no-json-child".to_string(),
+                "tracked-1".to_string(),
+            ],
+        )
+        .await;
+
+        // child-1: seeded as a terminal-only projection from the json.
+        let entry = registry.get("child-1").expect("seeded from lineage");
+        assert_eq!(entry.state, ChildSessionState::Completed);
+        assert_eq!(entry.task, "write the tests", "task text from spawn_reason");
+        assert_eq!(entry.parent_session_id, "parent-1");
+        assert_eq!(entry.workspace, "/tmp/ws");
+        assert_eq!(entry.result_summary.as_deref(), Some("all good"));
+        assert!(
+            entry.cancel_flag.is_none(),
+            "seeded entries never carry live handles"
+        );
+        assert!(
+            entry.inbox_tx.is_none(),
+            "seeded entries never carry an inbox"
+        );
+
+        // No json on disk → nothing truthful to seed → stays unknown.
+        assert!(registry.get("no-json-child").is_none());
+
+        // Already-tracked id → not overwritten by the seeding.
+        let tracked = registry.get("tracked-1").expect("still tracked");
+        assert_eq!(tracked.task, "live task");
+        assert_eq!(tracked.state, ChildSessionState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn seed_registry_from_lineage_falls_back_to_passed_parent_id() {
+        // Child json without parent_session_id (legacy): the passed parent
+        // id is used so the entry stays attributable.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::new(dir.path());
+        let child = session_state(Vec::new(), SessionStatus::Cancelled);
+        store.save(&child).await.expect("save child");
+
+        let registry = SubagentRegistry::new();
+        seed_registry_from_lineage(&registry, &store, "fallback-parent", &["c1".to_string()]).await;
+
+        let entry = registry.get("c1").expect("seeded");
+        assert_eq!(entry.parent_session_id, "fallback-parent");
+        assert_eq!(entry.state, ChildSessionState::Cancelled);
+        assert_eq!(entry.task, "", "missing spawn_reason seeds empty task text");
     }
 
     // ------------------------------------------------------------------
@@ -1270,9 +1502,14 @@ mod tests {
         .expect("send");
         let resp = reply_rx.await.expect("reply");
         assert!(!resp.ok);
-        assert_eq!(
-            resp.error_message.as_deref(),
-            Some("unknown subagent task id")
+        let error = resp.error_message.expect("error");
+        assert!(
+            error.starts_with("unknown subagent task id 'ghost';"),
+            "error must name the offending id: {error}"
+        );
+        assert!(
+            error.contains("c1"),
+            "hint must list the registered task: {error}"
         );
     }
 
@@ -1405,9 +1642,14 @@ mod tests {
         .expect("send");
         let resp = reply_rx.await.expect("reply");
         assert!(!resp.ok);
-        assert_eq!(
-            resp.error_message.as_deref(),
-            Some("unknown subagent task id")
+        let error = resp.error_message.expect("error");
+        assert!(
+            error.starts_with("unknown subagent task id 'ghost';"),
+            "error must name the offending id: {error}"
+        );
+        assert!(
+            error.contains("no subagent tasks are registered"),
+            "empty-registry hint must say so plainly: {error}"
         );
     }
 
@@ -1609,9 +1851,14 @@ mod tests {
 
         let resp = send_message(&tx, "ghost", "steer").await;
         assert!(!resp.ok);
-        assert_eq!(
-            resp.error_message.as_deref(),
-            Some("unknown subagent task id")
+        let error = resp.error_message.expect("error");
+        assert!(
+            error.starts_with("unknown subagent task id 'ghost';"),
+            "error must name the offending id: {error}"
+        );
+        assert!(
+            error.contains("no subagent tasks are registered"),
+            "empty-registry hint must say so plainly: {error}"
         );
     }
 
@@ -1694,9 +1941,14 @@ mod tests {
 
         let resp = send_cancel(&tx, "ghost", None).await;
         assert!(!resp.ok);
-        assert_eq!(
-            resp.error_message.as_deref(),
-            Some("unknown subagent task id")
+        let error = resp.error_message.expect("error");
+        assert!(
+            error.starts_with("unknown subagent task id 'ghost';"),
+            "error must name the offending id: {error}"
+        );
+        assert!(
+            error.contains("no subagent tasks are registered"),
+            "empty-registry hint must say so plainly: {error}"
         );
     }
 
