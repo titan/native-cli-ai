@@ -16,9 +16,10 @@
 //! - two background children terminating inside the debounce window
 //!   produce exactly ONE wake;
 //! - P4 wiring chain: `WaitForUserTool` built with the scheduler's `pause`
-//!   closure (exactly how `run_with_tui` wires it) suppresses wakes until
-//!   the next `note_input` (the TUI Submit choke point), then exactly one
-//!   wake fires for a later terminal.
+//!   closure (exactly how `run_with_tui` wires it) holds/defers wakes;
+//!   `note_input` (the TUI Submit choke point) flushes the deferred
+//!   terminal immediately, then exactly one wake fires for a later
+//!   terminal.
 //!
 //! Hermetic, same scaffolding as `background_spawn.rs`/`task_control.rs`:
 //! gated scripted providers injected through the `child_provider` seam of
@@ -665,9 +666,11 @@ async fn two_background_terminals_in_window_coalesce_into_one_wake() {
 
 /// P4 wiring chain, without a full TUI: build the tool with the scheduler's
 /// `pause` closure exactly as `run_with_tui` does, execute it, and prove
-/// the suppression + re-arm lifecycle end to end on real tokio time.
+/// the defer + flush lifecycle end to end on real tokio time — the paused
+/// terminal is held in the deferred-wake slot (not dropped) and flushed
+/// immediately by the next `note_input`.
 #[tokio::test(flavor = "multi_thread")]
-async fn wait_for_user_pauses_wakes_until_next_user_input() {
+async fn wait_for_user_defers_wakes_until_next_user_input() {
     let (sched, mut wake_rx) = wake_channel(WAKE_INTERVAL);
     let pause_sched = sched.clone();
     let pause_hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || pause_sched.pause());
@@ -683,19 +686,32 @@ async fn wait_for_user_pauses_wakes_until_next_user_input() {
     assert!(res.success, "error: {:?}", res.error);
     assert!(res.output.contains("Standing by for the user."));
 
-    // A background terminal while paused: NO wake fires, even far past the
-    // debounce window.
+    // A background terminal while paused: held in the deferred-wake slot —
+    // NO wake fires, even far past the debounce window.
     sched.notify_terminal("fixer-x", "completed", "while standing by");
     assert_silent(
         &mut wake_rx,
         WAKE_INTERVAL * 6,
-        "wait_for_user suppresses background wakes",
+        "wait_for_user holds the deferred wake while paused",
     )
     .await;
 
     // The user's next Submit (note_input at the choke point) releases the
-    // latch and re-arms; a new terminal fires exactly one wake.
+    // latch and flushes the DEFERRED wake first — the model learns about
+    // the terminal right after the user's turn.
     sched.note_input();
+    let text = tokio::time::timeout(Duration::from_secs(10), wake_rx.recv())
+        .await
+        .expect("deferred wake must flush on note_input")
+        .expect("wake channel must not be dropped");
+    assert!(text.contains("fixer-x"), "flushed deferred wake: {text}");
+
+    // The flushed wake enqueues as a Submit behind the user's input; its
+    // consumption is another note_input (the Submit choke point), which
+    // re-arms the delivered cap.
+    sched.note_input();
+
+    // Re-armed: a new terminal fires exactly one more wake.
     sched.notify_terminal("fixer-y", "completed", "after the user spoke");
     let text = tokio::time::timeout(Duration::from_secs(10), wake_rx.recv())
         .await
@@ -704,6 +720,6 @@ async fn wait_for_user_pauses_wakes_until_next_user_input() {
     assert!(text.contains("fixer-y"), "re-armed wake: {text}");
     assert!(
         wake_rx.try_recv().is_err(),
-        "exactly one wake after the re-arm"
+        "exactly two wakes total (deferred + re-armed)"
     );
 }

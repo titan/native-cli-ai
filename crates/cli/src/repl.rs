@@ -1660,9 +1660,9 @@ impl Repl {
 
         // P3 wake scheduler for background children, held by this session
         // wiring: cloned into the spawn consumer (terminal hook) and the
-        // bridge (TodosUpdated fold). Constructed only when
-        // `[subagent.wake] enabled` — `None` is the wake rollback gate
-        // (`[subagent] background` still applies to spawn defaults).
+        // pause hook. Constructed only when `[subagent.wake] enabled` —
+        // `None` is the wake rollback gate (`[subagent] background` still
+        // applies to spawn defaults).
         let wake_scheduler = self.runtime.config().subagent.wake.enabled.then(|| {
             let interval = Duration::from_millis(self.runtime.config().subagent.wake.interval_ms);
             WakeScheduler::new(true, interval, wake_submit_trigger(cmd_tx.clone()))
@@ -1691,7 +1691,6 @@ impl Repl {
             question.clone(),
             feedback_tx.clone(),
             commit_tx,
-            wake_scheduler.clone(),
         );
 
         let _spawn_task = {
