@@ -3,7 +3,11 @@
 //! never held for the foreground 600s window) while the child runs detached;
 //! `alias` lands in the registry entry and the running
 //! `ChildSessionStatusChanged` event. Foreground (background:false) keeps the
-//! synchronous contract and returns the child's terminal output.
+//! synchronous contract and returns the child's terminal output. A consumer
+//! with NO wake scheduler (stdio/one-shot sessions) forces the foreground
+//! contract even for an explicit `background: true` — a detached child there
+//! could never wake the idle parent and would orphan behind an undeliverable
+//! wake, so the spawn keeps the synchronous reply instead.
 //!
 //! Same hermetic scaffolding as `task_control.rs`: the child's provider is a
 //! gated scripted provider (round 1 parks on a `Notify` gate), injected
@@ -25,6 +29,7 @@ use nca_core::tools::spawn_subagent::{SpawnRequest, SpawnResponse};
 use nca_core::workspace_fs::{RealFs, WorkspaceFs};
 use nca_runtime::subagent_registry::SubagentRegistry;
 use nca_runtime::supervisor::spawn_subagent_consumer;
+use nca_runtime::wake_scheduler::{WakeScheduler, WakeTrigger};
 use tokio::sync::{mpsc, oneshot};
 
 fn offline_config() -> NcaConfig {
@@ -135,6 +140,21 @@ fn spawn_request(
     }
 }
 
+/// Enabled wake scheduler recording delivered texts on an unbounded channel
+/// (same seam as `wake_integration.rs`) — the background test needs a wake
+/// path for the spawn consumer to honor `background: true`; the channel is
+/// simply ignored (the detached mechanics are the assertion target).
+fn wake_channel() -> (WakeScheduler, mpsc::UnboundedReceiver<String>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let trigger: WakeTrigger = Arc::new(move |text: &str| {
+        let _ = tx.send(text.to_string());
+    });
+    (
+        WakeScheduler::new(true, Duration::from_millis(50), trigger),
+        rx,
+    )
+}
+
 /// Wire the real spawn consumer with a provider seam + event tap.
 struct ConsumerHarness {
     spawn_tx: mpsc::Sender<SpawnRequest>,
@@ -143,7 +163,11 @@ struct ConsumerHarness {
     _events: tokio::task::JoinHandle<()>,
 }
 
-fn wire_consumer(ws: &Path, provider: Arc<dyn Provider>) -> ConsumerHarness {
+fn wire_consumer(
+    ws: &Path,
+    provider: Arc<dyn Provider>,
+    wake: Option<WakeScheduler>,
+) -> ConsumerHarness {
     let registry = Arc::new(SubagentRegistry::new());
     let (spawn_tx, spawn_rx) = mpsc::channel(4);
     let (event_tx, event_rx) = mpsc::channel(256);
@@ -158,10 +182,11 @@ fn wire_consumer(ws: &Path, provider: Arc<dyn Provider>) -> ConsumerHarness {
         registry.clone(),
         parent_fs,
         Some(provider),
-        // P2 semantics preserved for these tests: every request passes an
-        // explicit `background` flag, and no wake scheduler is wired.
+        // No wake scheduler wired here: these tests pass explicit flags, so
+        // the default is irrelevant; the forced-foreground semantics under a
+        // missing wake path are pinned by their own test below.
         false,
-        None,
+        wake,
         None,
     );
     // Collect events on a side task so the tap receiver never blocks the
@@ -187,7 +212,10 @@ async fn background_spawn_replies_immediately_and_child_completes_detached() {
     let ws = git_workspace();
     let gated = GatedScriptedProvider::new("detached answer");
     let provider: Arc<dyn Provider> = gated.clone();
-    let mut harness = wire_consumer(ws.path(), provider);
+    // A wake path is the precondition for honoring `background: true` — wire
+    // the scheduler exactly like a TUI session does.
+    let (sched, _wake_rx) = wake_channel();
+    let mut harness = wire_consumer(ws.path(), provider, Some(sched));
 
     // Background spawn with an alias.
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -285,7 +313,7 @@ async fn foreground_spawn_still_returns_terminal_child_output() {
     // after sending the request.
     let gated = GatedScriptedProvider::new("foreground answer");
     let provider: Arc<dyn Provider> = gated.clone();
-    let harness = wire_consumer(ws.path(), provider);
+    let harness = wire_consumer(ws.path(), provider, None);
 
     let (reply_tx, reply_rx) = oneshot::channel();
     harness
@@ -313,5 +341,54 @@ async fn foreground_spawn_still_returns_terminal_child_output() {
     assert_eq!(
         reply.output, "foreground answer",
         "foreground reply carries the child's terminal output verbatim"
+    );
+}
+
+/// No wake scheduler (stdio/one-shot sessions): an EXPLICIT `background:
+/// true` must NOT detach — the child could never wake the idle parent and
+/// the process may exit before it finishes. The spawn keeps the synchronous
+/// foreground contract instead (reply = terminal status + output).
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_background_without_wake_path_forces_foreground() {
+    let ws = git_workspace();
+    let gated = GatedScriptedProvider::new("forced fg answer");
+    let provider: Arc<dyn Provider> = gated.clone();
+    // No scheduler wired — the stdio/one-shot wiring shape.
+    let harness = wire_consumer(ws.path(), provider.clone(), None);
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    harness
+        .spawn_tx
+        .send(spawn_request(
+            "orphaned without a wake path",
+            true,
+            None,
+            reply_tx,
+        ))
+        .await
+        .expect("spawn request accepted");
+    // The child parks mid-turn; release once provably started so the
+    // synchronous await finishes (mirrors the foreground test's releaser).
+    let releaser = gated.clone();
+    tokio::spawn(async move {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while releaser.call_count() == 0 {
+            assert!(Instant::now() < deadline, "child must start");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        releaser.release_gate();
+    });
+
+    let reply = tokio::time::timeout(Duration::from_secs(30), reply_rx)
+        .await
+        .expect("forced-foreground reply must arrive (never a detached 'running')")
+        .expect("reply channel must not be dropped");
+    assert_eq!(
+        reply.status, "completed",
+        "explicit background=true without a wake path stays foreground: {reply:?}"
+    );
+    assert_eq!(
+        reply.output, "forced fg answer",
+        "forced-foreground reply carries the terminal output verbatim"
     );
 }

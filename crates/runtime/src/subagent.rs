@@ -1023,7 +1023,10 @@ fn apply_child_routing(
 ///
 /// `background_default` is the P3 policy default applied to spawns that
 /// OMIT the `background` flag (`req.background.unwrap_or(background_default)`);
-/// an explicit flag always wins. `wake`, when set, is notified when a
+/// an explicit flag always wins — except that a consumer with `wake: None`
+/// (no wake delivery path: stdio REPL, one-shot, service sessions) forces
+/// the foreground contract regardless, so no child is ever orphaned behind
+/// a wake that cannot be delivered. `wake`, when set, is notified when a
 /// DETACHED (background) child reaches a terminal state so an idle parent
 /// can be woken — foreground spawns and `task_revive` never notify (their
 /// callers already hold the reply).
@@ -1141,8 +1144,17 @@ pub fn spawn_subagent_consumer(
                     }
                     Ok((sup, prepared)) => {
                         // P3: absent flag inherits the caller's policy
-                        // default; an explicit flag always wins.
-                        if req.background.unwrap_or(background_default) {
+                        // default; an explicit flag always wins — EXCEPT that
+                        // a consumer with no wake scheduler (stdio REPL,
+                        // one-shot, service sessions) never detaches: a
+                        // detached child there could never wake the idle
+                        // parent and the process may exit before it finishes,
+                        // so the spawn keeps the synchronous foreground
+                        // contract (reply = final output) instead of
+                        // orphaning the task behind an undeliverable wake.
+                        let background =
+                            req.background.unwrap_or(background_default) && wake.is_some();
+                        if background {
                             // §6 invariant ("600s timeout interplay"): answer
                             // the oneshot IMMEDIATELY after prepare — the
                             // reply channel is consumed HERE and the

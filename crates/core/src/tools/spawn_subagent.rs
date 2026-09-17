@@ -25,9 +25,14 @@ pub struct SpawnRequest {
     /// Detached execution: `Some(true)` runs the child detached — the spawn
     /// reply returns immediately with the child session id and the final
     /// output is fetched later via `task_result`; completion auto-wakes the
-    /// parent. `None` (flag absent) means inherit the session default,
-    /// resolved by the runtime consumer (top-level TUI sessions default to
-    /// background; P3). An explicit value always wins.
+    /// parent in sessions with a wake path (interactive TUI), including a
+    /// wake that lands while the parent stands by — it is held and delivered
+    /// right after the user's next message. Consumers without a wake path
+    /// (stdio/one-shot/service) force the foreground contract regardless of
+    /// this flag, so an explicit `true` there still blocks for the result.
+    /// `None` (flag absent) means inherit the session default, resolved by
+    /// the runtime consumer (top-level TUI sessions default to background;
+    /// P3).
     pub background: Option<bool>,
     /// Parent-scoped name usable in place of the session id for the
     /// `task_*` control tools (P2).
@@ -122,7 +127,7 @@ impl ToolExecutor for SpawnSubagentTool {
                     },
                     "background": {
                         "type": "boolean",
-                        "description": "Detached execution: the reply returns immediately with status \"running\" and the final output is fetched later via task_result; completion auto-wakes the parent (else poll task_status/task_result). Absent = inherit the session default (top-level TUI sessions default to background); an explicit true/false always wins."
+                        "description": "Detached execution: the reply returns immediately with status \"running\" and the final output is fetched later via task_result; completion auto-wakes the parent in interactive TUI sessions (a wake landing while you stand by is held and delivered right after the user's next message). Sessions without a wake path (stdio/one-shot) run spawns in the foreground regardless. Absent = inherit the session default (top-level TUI sessions default to background)."
                     },
                     "alias": {
                         "type": "string",

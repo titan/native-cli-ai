@@ -4,9 +4,11 @@
 //! Distinct from `ask_question` by construction: no options, no oneshot, no
 //! `QuestionRequested` event, no event channel at all. Its only side effect
 //! is the injected `pause_hook` (the CLI wires it to
-//! `WakeScheduler::pause`), which suppresses background-subagent wakes
-//! until the user's next Submit. Registered `is_interactive` so the tool
-//! pipeline runs it strictly alone, last in a batch.
+//! `WakeScheduler::pause`), which defers background-subagent wakes until
+//! the user's next Submit (a terminal landing while paused is held and
+//! delivered right after that Submit, never dropped). Registered
+//! `is_interactive` so the tool pipeline runs it strictly alone, last in a
+//! batch.
 
 use std::sync::Arc;
 
@@ -45,8 +47,8 @@ impl ToolExecutor for WaitForUserTool {
                 when you are waiting on the USER — a decision, input, review, or approval \
                 you need to continue. Do NOT call it when waiting on background subagent \
                 tasks: for those, simply end your turn; you will be woken automatically \
-                when they complete. While you stand by, background task wakes stay \
-                suppressed until the user's next message. Call it last, alone — never \
+                when they complete. While you stand by, background task wakes are held \
+                and delivered right after the user's next message. Call it last, alone — never \
                 alongside other tool calls in the same batch. It returns immediately, \
                 never prompts, and never blocks."
                 .into(),
@@ -66,7 +68,7 @@ impl ToolExecutor for WaitForUserTool {
             call_id: call.id.clone(),
             success: true,
             output: "Standing by for the user. End your turn now; background task wakes \
-                stay suppressed until the user's next message."
+                are held and will be delivered right after the user's next message."
                 .into(),
             error: None,
         }
@@ -104,8 +106,8 @@ mod tests {
         );
         assert!(
             res.output
-                .contains("suppressed until the user's next message"),
-            "output must state the suppression policy: {}",
+                .contains("delivered right after the user's next message"),
+            "output must state the deferral policy: {}",
             res.output
         );
         assert!(

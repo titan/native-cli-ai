@@ -1,9 +1,13 @@
 # Async Task Lifecycle for nca Subagents
 
 Status: P3 implemented (background default-on for top-level TUI sessions +
-wake scheduler with cmd-queue delivery; stdio/one-shot keep P2 foreground
-defaults). P4 implemented (`wait_for_user` tool + wake pause latch +
-child parent-only tool strip). Researched against
+wake scheduler with cmd-queue delivery; stdio/one-shot force the foreground
+contract — no wake delivery path there). P4 implemented (`wait_for_user`
+tool + wake pause latch + child parent-only tool strip). Post-P4 amendment:
+the pause latch now DEFERS wakes (held as pending, flushed right after the
+user's next Submit) instead of dropping them, and the todo mute gate was
+removed (notify implies a live child — the gate could only suppress real
+unreconciled terminals). Researched against
 oh-my-opencode-slim 2.2.18 (`task`/`task_result`/`task_status`/`task_message`/
 `task_cancel`/`task_revive`, Background Job Board, orchestrator wake
 scheduler, `wait_for_user`).
@@ -73,11 +77,14 @@ is the wake channel; `cancel_flag` is the abort mechanism.
   Port a **simplified** lease concept from upstream `background-job-board.ts`
   (single `ControlLease` per session_id/generation for cancel/revive/message)
   — no `statusUncertain`/liveness-reconciliation machinery.
-- New `crates/runtime/src/wake_scheduler.rs`: on `ChildSessionStatusChanged`
-  to terminal, if `wake.enabled` and parent has incomplete todos,
-  `tokio::time::sleep(interval)` then
-  `inbox_sender().try_send(InboxItem::UserPrompt { static wake text })`. One
-  in-flight wake per parent (reserve/commit gate).
+- New `crates/runtime/src/wake_scheduler.rs`: on a background child reaching
+  terminal, if `wake.enabled`, `tokio::time::sleep(interval)` then deliver
+  the wake through the CLI submit path. One in-flight wake per parent
+  (reserve/commit gate); a terminal landing while the pause latch is set is
+  HELD as pending (first terminal wins) and flushed at the next
+  `note_input`. No todo gate — `notify_terminal` implies a live child, so an
+  all-completed todo fold can only ever suppress real unreconciled
+  terminals (removed; the `delivered` flag alone bounds wake frequency).
 - `crates/runtime/src/supervisor.rs`: own an `Arc<SubagentRegistry>`; expose
   it + `wake_scheduler` to the CLI; wire a `SubagentControlConsumer`
   (analogous to `spawn_subagent_consumer`) that resolves control requests
@@ -136,15 +143,20 @@ is the wake channel; `cancel_flag` is the abort mechanism.
   next `run_turn`'s prompt, preserving "the next `run_turn` claims it at
   turn start"). Wakes land BETWEEN turns, never mid-turn (steering during
   a busy turn already has its own `InboxItem::Steering` path). stdio REPL
-  and one-shot modes have no cmd queue and run foreground defaults
-  (documented limitation: no wake delivery path). No `wait_for_user` is
-  used for background completion.
+  and one-shot modes have no cmd queue and no wake delivery path — the
+  spawn consumer there FORCES the foreground contract for every spawn
+  (explicit `background: true` included): a detached child could never
+  wake the idle parent and the process may exit before it finishes. No
+  `wait_for_user` is used for background completion.
 - **`wait_for_user`:** a **new** tool, not `ask_question` reuse — it has no
   options/oneshot and must not emit `QuestionRequested`. It returns
   `state: waiting_for_user` + guidance, and calls `wake_scheduler.pause()`.
-  It is registered `is_interactive` (barrier) so it runs last in a batch; it
-  preserves the one-active-question invariant trivially because it never
-  opens a question channel.
+  While paused, terminals are neither delivered nor dropped: they are HELD
+  in the scheduler's pending slot and flushed at the next `note_input` —
+  the model learns about the completion right after the user's next
+  message. It is registered `is_interactive` (barrier) so it runs last in a
+  batch; it preserves the one-active-question invariant trivially because
+  it never opens a question channel.
 
 ## 4. What NOT to Port (YAGNI)
 
@@ -223,9 +235,10 @@ is the wake channel; `cancel_flag` is the abort mechanism.
 ### P4 — wait_for_user (S) — IMPLEMENTED
 - `core`: `wait_for_user` tool (`tools/wait_for_user.rs`) carrying an
   injected `PauseHook` closure (no event channel, no oneshot);
-  `wake_scheduler.pause()` latch (a paused terminal reserves no window;
-  the debounce task re-checks `paused` before committing, closing the
-  reserve-just-before-pause race; `note_input` releases the latch).
+  `wake_scheduler.pause()` latch (a paused terminal reserves no window —
+  it is HELD in the pending slot; the debounce task re-checks `paused`
+  before committing, closing the reserve-just-before-pause race;
+  `note_input` releases the latch AND flushes the deferred wake).
 - `runtime`/`cli`: registered in `run_with_tui` right after the wake
   scheduler is built (`SessionRuntime::register_tool` is the narrow
   passthrough); guidance lives in the tool description, not a prompt line.
@@ -241,7 +254,10 @@ is the wake channel; `cancel_flag` is the abort mechanism.
      would ripple into every persona.
   2. Pause-only — no `resume()`: the un-pause IS `note_input` at the TUI
      Submit choke point, so "until the next external user message" is
-     strictly "until the next TUI Submit".
+     strictly "until the next TUI Submit". Post-P4 amendment: `note_input`
+     also FLUSHES the pending slot, so a terminal that landed while paused
+     is delivered right after the user's next Submit (deferred, never
+     dropped) instead of being silently lost.
   3. Child strip via `strip_child_only_tools` (spawn + revive paths):
      `spawn_subagent` is the real fix — a child has no spawn consumer, so
      a grandchild spawn would park on the undrained oneshot for the full
