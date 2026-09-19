@@ -204,6 +204,39 @@ outermost-of-retry contract. Knobs in `[middleware]`
 cost-guard trips loudly (`Err`, zero provider calls) on estimated
 session spend ≥ budget.
 
+### Provider Fallback
+
+`[fallback]` (default off) wraps the session's primary provider in
+`core::provider::fallback::FallbackProvider` at the factory build point
+(`build_provider_with_events`) — the `Provider` trait itself is unchanged,
+and the supervisor passes the session's event channel so every switch is
+announced via `AgentEvent::ProviderFallback` (never silent; CLI stream and
+TUI transcript render one dim line per switch).
+
+- **Chain**: `chain` is an ordered list of provider names (same parser as
+  `/provider`); each fallback provider uses its own `[provider.<name>]`
+  credentials and model (called with an empty model string). Entries that
+  repeat the primary or an earlier entry are skipped; unparseable names or
+  missing credentials fail loudly at build time.
+- **Failover classes (deliberately tight)**: HTTP 429, 5xx, 408,
+  network/timeout transport errors (including client response-header
+  timeouts), content-moderation 400s (`content_policy_violation`,
+  `cyber_policy`, moderation markers), and empty completions. 401/403,
+  404, other 400s, context overflow, and local request guards surface
+  verbatim — retrying them elsewhere would mask a real problem.
+- **Zero-content rule**: a mid-stream failure only fails over while ZERO
+  content chunks (text, reasoning, or tool-use deltas) have been delivered
+  downstream; after that the error propagates as-is so partial output is
+  never duplicated. A zero-content `Finish` is held back and dropped when
+  the failed generation is abandoned.
+- **Throttle**: first switch waits `initial_retry_delay_ms` (default 0);
+  subsequent switches are spaced `retry_delay_ms` (default 500) apart,
+  measured per provider instance across turns (anti-storm).
+- **Exhaustion**: error-class chains end in `ProviderError::FallbackExhausted`
+  with one line per attempted provider; empty-completion chains forward the
+  empty stream verbatim so the driver's existing empty-response policy
+  (bounded retries, then a loud error) stays in charge.
+
 Provider responses are streamed token-by-token via `tokio::sync::mpsc` using MiniMax SSE. The CLI can render:
 
 - human-readable live progress

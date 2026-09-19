@@ -35,7 +35,7 @@ use nca_core::middleware::default_chain;
 use nca_core::plugin::PluginRegistry;
 use nca_core::provider::Provider;
 use nca_core::provider::ProviderError;
-use nca_core::provider::factory::build_provider;
+use nca_core::provider::factory::build_provider_with_events;
 use nca_core::skills::SkillCatalog;
 use nca_core::tools::AskQuestionTool;
 use nca_core::tools::InvokeSkillTool;
@@ -417,16 +417,19 @@ async fn persist_mounted_paths(workspace_root: &Path, paths: Vec<PathBuf>) {
     }
 }
 
-/// Resolve the session's provider: an injected provider wins verbatim, else
-/// build from config. `create` uses this so tests can supply a mock `Provider`
+/// Resolve the session's provider: an injected provider wins verbatim (no
+/// fallback wrapping — test seams own their entire provider behavior), else
+/// build from config with fallback wrapping and event notifications.
+/// `create` uses this so tests can supply a mock `Provider`
 /// and skip `build_provider` entirely.
 fn resolve_provider(
     injected: Option<Arc<dyn Provider>>,
     config: &NcaConfig,
+    event_tx: Option<tokio::sync::mpsc::Sender<AgentEvent>>,
 ) -> Result<Arc<dyn Provider>, ProviderError> {
     match injected {
         Some(provider) => Ok(provider),
-        None => build_provider(config),
+        None => build_provider_with_events(config, event_tx),
     }
 }
 
@@ -483,7 +486,11 @@ impl Supervisor {
             }
         }
 
-        let provider = resolve_provider(cfg.provider, &config)?;
+        // Event channel is created BEFORE the provider build so a fallback
+        // wrapper can emit ProviderFallback notifications on it from the
+        // first turn onward.
+        let (event_tx, event_rx) = mpsc::channel(256);
+        let provider = resolve_provider(cfg.provider, &config, Some(event_tx.clone()))?;
         let fs: Arc<dyn WorkspaceFs> = Arc::new(RealFs::new(workspace_root.clone()));
         let fs_for_supervisor = fs.clone();
         // Restore mounts persisted in the workspace-local config. A missing or
@@ -607,7 +614,6 @@ impl Supervisor {
                 })
         };
 
-        let (event_tx, event_rx) = mpsc::channel(256);
         let question_pending = Arc::new(Mutex::new(HashMap::new()));
         tools.register(Box::new(AskQuestionTool::new(
             event_tx.clone(),
@@ -1695,7 +1701,7 @@ impl Supervisor {
         }
 
         // Rebuild provider if config changed.
-        let provider = build_provider(&effective)?;
+        let provider = build_provider_with_events(&effective, self.agent.event_sender())?;
         self.config = config;
         self.model = effective.model.default_model.clone();
         let m = self.model.clone();
@@ -1772,7 +1778,7 @@ impl Supervisor {
     /// Apply a new [`NcaConfig`] and rebuild the active LLM provider (in-session provider switch).
     /// An injected test provider (via `SupervisorConfig::provider`) is discarded here.
     pub fn apply_nca_config(&mut self, mut config: NcaConfig) -> Result<(), ProviderError> {
-        let provider = build_provider(&config)?;
+        let provider = build_provider_with_events(&config, self.agent.event_sender())?;
         // Live mounts win: callers may pass a snapshot taken before a `/mount`,
         // and adopting it verbatim lets the next whole-config save erase the
         // persisted `extra_paths` (see mount_config_persistence regression).
@@ -2882,7 +2888,7 @@ mod tests {
     fn resolve_provider_uses_injected_verbatim_else_builds() {
         // (a) injected provider is returned verbatim — `build_provider` skipped.
         let mock: Arc<dyn Provider> = Arc::new(StubProvider);
-        let injected = match resolve_provider(Some(mock.clone()), &NcaConfig::default()) {
+        let injected = match resolve_provider(Some(mock.clone()), &NcaConfig::default(), None) {
             Ok(p) => p,
             Err(e) => panic!("injected provider should be used verbatim, got: {e}"),
         };
@@ -2891,14 +2897,14 @@ mod tests {
         // (b) no injection → builds from config (DeepSeek default needs a key).
         let mut with_key = NcaConfig::default();
         with_key.provider.deepseek.api_key = Some("test-key".into());
-        assert!(resolve_provider(None, &with_key).is_ok());
+        assert!(resolve_provider(None, &with_key, None).is_ok());
 
         // (c) no injection + keyless config → loud configuration error.
         // DeepSeek (the default) validates its key lazily at request time, so
         // use OpenAI here — its `from_config` fails loudly on a missing key.
         let mut keyless = NcaConfig::default();
         keyless.provider.default = nca_common::config::ProviderKind::OpenAi;
-        let err = match resolve_provider(None, &keyless) {
+        let err = match resolve_provider(None, &keyless, None) {
             Ok(_) => panic!("keyless config should fail to build a provider"),
             Err(e) => e,
         };

@@ -619,6 +619,13 @@ fn render_event(event: &AgentEvent, stats: &StreamStats) {
                 }
             }
         }
+        AgentEvent::ProviderFallback { from, to, reason } => {
+            print!("{}", theme::CLEAR_LINE);
+            println!(
+                "  {}",
+                format!("↳ provider fallback · {from} → {to} · {reason}").color(theme::TEXT_DIM)
+            );
+        }
         AgentEvent::ContextCompactionStart {
             tokens_before,
             reason,
@@ -729,6 +736,15 @@ mod tests {
             },
         };
         render_human_event(&ev);
+    }
+
+    #[test]
+    fn render_provider_fallback_does_not_panic() {
+        render_human_event(&AgentEvent::ProviderFallback {
+            from: "DeepSeek".into(),
+            to: "OpenAI".into(),
+            reason: "rate_limited: Rate limited, retry after 1000ms".into(),
+        });
     }
 
     #[test]

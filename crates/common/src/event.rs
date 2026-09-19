@@ -297,6 +297,23 @@ pub enum AgentEvent {
         #[serde(default)]
         kv_prefix_broken: bool,
     },
+    /// A provider fallback (failover) occurred mid-session: the step was
+    /// retried on the next provider of the `[fallback]` chain after a
+    /// failover-class failure. Always user-visible — failover is never
+    /// silent. Replay surfaces ignore it; it is informational.
+    ProviderFallback {
+        /// Display name of the provider that failed (e.g. "DeepSeek").
+        #[serde(default)]
+        from: String,
+        /// Display name of the provider being retried (e.g. "OpenAI").
+        #[serde(default)]
+        to: String,
+        /// Short reason: failure class plus a truncated error summary
+        /// (e.g. "rate_limited: Rate limited, retry after 1000ms") or
+        /// "empty completion".
+        #[serde(default)]
+        reason: String,
+    },
     /// Busy state transition (for animated indicator rendering).
     BusyStateChanged {
         state: BusyState,
@@ -579,6 +596,41 @@ mod interactive_question_serde_tests {
             } => {
                 assert_eq!(tokens_after, 4_000);
                 assert!(kv_prefix_broken);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn provider_fallback_roundtrip() {
+        let ev = AgentEvent::ProviderFallback {
+            from: "DeepSeek".into(),
+            to: "OpenAI".into(),
+            reason: "rate_limited: Rate limited, retry after 1000ms".into(),
+        };
+        let json = serde_json::to_string(&ev).expect("serialize");
+        let back: AgentEvent = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            AgentEvent::ProviderFallback { from, to, reason } => {
+                assert_eq!(from, "DeepSeek");
+                assert_eq!(to, "OpenAI");
+                assert_eq!(reason, "rate_limited: Rate limited, retry after 1000ms");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn provider_fallback_torn_tail_still_deserializes() {
+        // A partially-written log tail may drop trailing fields; serde
+        // defaults must tolerate a missing reason.
+        let raw = r#"{"type":"ProviderFallback","from":"DeepSeek","to":"OpenAI"}"#;
+        let back: AgentEvent = serde_json::from_str(raw).expect("deserialize");
+        match back {
+            AgentEvent::ProviderFallback { from, to, reason } => {
+                assert_eq!(from, "DeepSeek");
+                assert_eq!(to, "OpenAI");
+                assert_eq!(reason, "");
             }
             _ => panic!("wrong variant"),
         }

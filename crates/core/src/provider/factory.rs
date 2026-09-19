@@ -1,10 +1,12 @@
 use std::sync::Arc;
 
 use nca_common::config::{NcaConfig, ProviderKind};
+use nca_common::event::AgentEvent;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::json;
 
 use super::anthropic::AnthropicProvider;
+use super::fallback::{FallbackEntry, FallbackProvider};
 use super::kimi::KimiProvider;
 use super::minimax::MiniMaxProvider;
 use super::openai_compat::{CompatProfile, OpenAiCompatProvider};
@@ -35,8 +37,77 @@ const DEEPSEEK_PROFILE: CompatProfile = CompatProfile {
 };
 
 /// Build the configured provider for the current workspace (uses `config.provider.default`).
+///
+/// Equivalent to [`build_provider_with_events`] with no event channel:
+/// fallback notifications degrade to `tracing` only.
 pub fn build_provider(config: &NcaConfig) -> Result<Arc<dyn Provider>, ProviderError> {
-    build_provider_for(config, config.provider.default)
+    build_provider_with_events(config, None)
+}
+
+/// Build the session provider, wrapping it in a
+/// [`FallbackProvider`] when `[fallback] enabled = true` and a non-empty
+/// `chain` resolves. `event_tx`, when present, receives an
+/// [`AgentEvent::ProviderFallback`] on every failover switch (never silent).
+///
+/// Chain entries are parsed with [`ProviderKind::from_cli_name`] (strict:
+/// unknown names fail loudly) and built with the same factory as the
+/// primary. Entries matching the primary provider or repeating an earlier
+/// entry are skipped — a provider that just failed is not retried
+/// immediately. Each fallback provider uses its own configured model.
+pub fn build_provider_with_events(
+    config: &NcaConfig,
+    event_tx: Option<tokio::sync::mpsc::Sender<AgentEvent>>,
+) -> Result<Arc<dyn Provider>, ProviderError> {
+    let primary = build_provider_for(config, config.provider.default)?;
+    let Some(entries) = resolve_fallback_entries(config)? else {
+        return Ok(primary);
+    };
+    Ok(Arc::new(FallbackProvider::new(
+        primary,
+        config.provider.default.display_name().to_string(),
+        entries,
+        config.fallback.initial_retry_delay_ms,
+        config.fallback.retry_delay_ms,
+        event_tx,
+    )))
+}
+
+/// Resolve the `[fallback]` chain into built entries. `None` when fallback
+/// is disabled or the chain resolves to nothing after skipping.
+///
+/// Entries are parsed with [`ProviderKind::from_cli_name`] (strict: unknown
+/// names fail loudly) and built with the same factory as the primary.
+/// Entries matching the primary provider or repeating an earlier entry are
+/// skipped — a provider that just failed is not retried immediately. Each
+/// fallback provider uses its own configured model.
+fn resolve_fallback_entries(
+    config: &NcaConfig,
+) -> Result<Option<Vec<FallbackEntry>>, ProviderError> {
+    if !config.fallback.enabled || config.fallback.chain.is_empty() {
+        return Ok(None);
+    }
+    let mut entries: Vec<FallbackEntry> = Vec::with_capacity(config.fallback.chain.len());
+    let mut seen_kinds = vec![config.provider.default];
+    for raw in &config.fallback.chain {
+        let Some(kind) = ProviderKind::from_cli_name(raw) else {
+            return Err(ProviderError::Configuration(format!(
+                "[fallback] chain entry {raw:?} is not a known provider name"
+            )));
+        };
+        if seen_kinds.contains(&kind) {
+            tracing::warn!(
+                entry = raw,
+                "[fallback] chain entry duplicates an earlier provider; skipping"
+            );
+            continue;
+        }
+        seen_kinds.push(kind);
+        entries.push(FallbackEntry {
+            name: kind.display_name().to_string(),
+            provider: build_provider_for(config, kind)?,
+        });
+    }
+    Ok(Some(entries).filter(|entries| !entries.is_empty()))
 }
 
 /// Build a provider for a specific [`ProviderKind`], ignoring `config.provider.default`.
@@ -295,6 +366,101 @@ mod tests {
         // build_provider_for can override to openai
         let provider = build_provider_for(&config, ProviderKind::OpenAi);
         assert!(provider.is_ok(), "expected openai provider to build");
+    }
+
+    // ---- [fallback] wrapping ----
+
+    #[test]
+    fn fallback_disabled_builds_bare_provider() {
+        let mut config = NcaConfig::default();
+        config.provider.deepseek.api_key = Some("deepseek-key".into());
+        config.fallback.chain = vec!["openai".into()];
+        config.provider.openai.api_key = Some("openai-key".into());
+        // enabled defaults to false → chain ignored, build succeeds.
+        assert!(build_provider(&config).is_ok());
+    }
+
+    #[test]
+    fn fallback_chain_skips_primary_and_duplicates() {
+        let mut config = NcaConfig::default();
+        config.provider.deepseek.api_key = Some("deepseek-key".into());
+        config.provider.openai.api_key = Some("openai-key".into());
+        config.provider.kimi.api_key = Some("kimi-key".into());
+        config.fallback.enabled = true;
+        // "deepseek" repeats the primary; "openai" appears twice.
+        config.fallback.chain = vec![
+            "deepseek".into(),
+            "openai".into(),
+            "openai".into(),
+            "kimi".into(),
+        ];
+        let entries = resolve_fallback_entries(&config)
+            .expect("chain resolves")
+            .expect("non-empty");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["OpenAI", "Kimi"], "primary + dup skipped");
+    }
+
+    #[test]
+    fn fallback_disabled_chain_resolution_returns_none() {
+        let mut config = NcaConfig::default();
+        config.fallback.chain = vec!["openai".into()];
+        assert!(
+            resolve_fallback_entries(&config)
+                .expect("resolve")
+                .is_none()
+        );
+
+        // Enabled but everything skips → still None (bare provider).
+        let mut config = NcaConfig::default();
+        config.provider.deepseek.api_key = Some("deepseek-key".into());
+        config.fallback.enabled = true;
+        config.fallback.chain = vec!["deepseek".into()];
+        assert!(
+            resolve_fallback_entries(&config)
+                .expect("resolve")
+                .is_none(),
+            "chain that only repeats the primary resolves to bare provider"
+        );
+    }
+
+    #[test]
+    fn fallback_unknown_chain_entry_fails_loudly() {
+        let mut config = NcaConfig::default();
+        config.provider.deepseek.api_key = Some("deepseek-key".into());
+        config.fallback.enabled = true;
+        config.fallback.chain = vec!["not-a-provider".into()];
+        match build_provider(&config) {
+            Ok(_) => panic!("unknown chain entry must fail"),
+            Err(ProviderError::Configuration(message)) => {
+                assert!(
+                    message.contains("not-a-provider"),
+                    "error must name the bad entry: {message}"
+                );
+                assert!(message.contains("[fallback]"), "error: {message}");
+            }
+            Err(other) => panic!("expected Configuration error, got {other}"),
+        }
+    }
+
+    #[test]
+    fn fallback_missing_secondary_credentials_fail_loudly() {
+        let mut config = NcaConfig::default();
+        config.provider.deepseek.api_key = Some("deepseek-key".into());
+        config.fallback.enabled = true;
+        config.fallback.chain = vec!["openai".into()];
+        // No OPENAI key → the secondary provider build must fail at startup,
+        // not at failover time.
+        match build_provider(&config) {
+            Ok(_) => panic!("missing fallback credentials must fail"),
+            Err(ProviderError::Configuration(message)) => {
+                assert!(
+                    message.contains("missing OpenAI API key"),
+                    "error: {message}"
+                );
+            }
+            Err(other) => panic!("expected Configuration error, got {other}"),
+        }
     }
 
     #[test]

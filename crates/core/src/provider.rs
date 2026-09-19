@@ -3,6 +3,7 @@ pub mod anthropic_compat;
 pub mod custom;
 pub mod deepseek;
 pub mod factory;
+pub mod fallback;
 pub mod kimi;
 pub mod minimax;
 pub mod minimax_vlm;
@@ -117,12 +118,21 @@ pub enum ProviderError {
     Configuration(String),
     #[error("API request failed: {0}")]
     RequestFailed(String),
+    /// A non-success HTTP response not covered by a more specific variant
+    /// (5xx, most 4xx). Carries the numeric status so failover/retry
+    /// policies can classify without parsing the body.
+    #[error("provider HTTP {status}: {body}")]
+    Http { status: u16, body: String },
     #[error("Authentication error: {0}")]
     AuthError(String),
     #[error("Rate limited, retry after {retry_after_ms}ms")]
     RateLimited { retry_after_ms: u64 },
     #[error("Model not found: {0}")]
     ModelNotFound(String),
+    /// A provider fallback chain ran out of providers. `reasons` carries one
+    /// line per attempted provider so the root causes stay visible.
+    #[error("fallback chain exhausted [{chain}]: {reasons}")]
+    FallbackExhausted { chain: String, reasons: String },
     #[error("{0}")]
     Other(String),
 }
@@ -150,12 +160,15 @@ impl ProviderError {
     /// Whether this error is a context-window overflow rejection (HTTP 4xx
     /// raised before streaming started). Recoverable by compaction + retry.
     ///
-    /// Case-insensitive substring match over the payloads of `RequestFailed`
-    /// and `Other` — all providers route non-401/403/404/429 HTTP bodies to
-    /// `RequestFailed(body_text)` via the compat stream parsers.
+    /// Case-insensitive substring match over the payloads of `RequestFailed`,
+    /// `Http`, and `Other` — all providers route non-401/403/404/429 HTTP
+    /// bodies to `Http { status, body_text }` via the compat stream parsers
+    /// (legacy `RequestFailed(body_text)` bodies still match).
     pub fn is_context_overflow(&self) -> bool {
         let payload = match self {
-            ProviderError::RequestFailed(body) | ProviderError::Other(body) => body,
+            ProviderError::RequestFailed(body)
+            | ProviderError::Http { body, .. }
+            | ProviderError::Other(body) => body,
             _ => return false,
         };
         let lower = payload.to_ascii_lowercase();
@@ -202,6 +215,27 @@ mod tests {
 
         let anthropic_style = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 200001 tokens > 200000 maximum"}}"#;
         assert!(ProviderError::RequestFailed(anthropic_style.into()).is_context_overflow());
+    }
+
+    #[test]
+    fn is_context_overflow_matches_http_variant_bodies() {
+        // Non-401/403/404/429 HTTP bodies arrive as `Http { status, body }`
+        // since fallback classification needs the status; overflow must
+        // still be detected on the 400 path.
+        assert!(
+            ProviderError::Http {
+                status: 400,
+                body: "This model's maximum context length is 65536 tokens".into()
+            }
+            .is_context_overflow()
+        );
+        assert!(
+            !ProviderError::Http {
+                status: 500,
+                body: "internal server error".into()
+            }
+            .is_context_overflow()
+        );
     }
 
     #[test]

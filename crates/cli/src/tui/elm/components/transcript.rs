@@ -541,6 +541,15 @@ impl TranscriptState {
                 });
                 self.blocks_pushed();
             }
+            AgentEvent::ProviderFallback { from, to, reason } => {
+                // Failover is never silent: one dim system line naming both
+                // providers and the failure class.
+                let reason = truncate(reason, 120);
+                self.blocks.push(DisplayBlock::System(format!(
+                    "↳ provider fallback · {from} → {to} · {reason}"
+                )));
+                self.blocks_pushed();
+            }
             AgentEvent::ContextCompactionStart {
                 tokens_before,
                 reason,
@@ -1239,6 +1248,25 @@ impl TranscriptState {
 mod tests {
     use super::*;
     use nca_common::event::{AgentEvent, BusyState};
+
+    #[test]
+    fn provider_fallback_pushes_dim_system_line() {
+        let mut t = TranscriptState::new();
+        let before = t.blocks.len();
+        t.apply_event(&AgentEvent::ProviderFallback {
+            from: "DeepSeek".into(),
+            to: "OpenAI".into(),
+            reason: "rate_limited: Rate limited, retry after 1000ms".into(),
+        });
+        assert_eq!(t.blocks.len(), before + 1, "one system line pushed");
+        match t.blocks.last() {
+            Some(DisplayBlock::System(text)) => {
+                assert!(text.contains("DeepSeek → OpenAI"), "line: {text}");
+                assert!(text.contains("rate_limited"), "line: {text}");
+            }
+            other => panic!("expected System block, got {other:?}"),
+        }
+    }
 
     // ── Follow-tail self-heal ────────────────────────────────────
     // Regression: users who scroll back up and then return to the newest
