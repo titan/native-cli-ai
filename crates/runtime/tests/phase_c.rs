@@ -528,7 +528,7 @@ async fn t27_consumer_wiring_routes_child_spawn_into_parent_log() {
         spawn_rx,
         "t27-parent".into(),
         ws.path().to_path_buf(),
-        config,
+        Arc::new(std::sync::RwLock::new(config)),
         Arc::new(std::sync::Mutex::new(vec![Message::user("parent context")])),
         Some(parent_tx),
         Arc::new(nca_runtime::subagent_registry::SubagentRegistry::new()),

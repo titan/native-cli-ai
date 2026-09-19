@@ -256,6 +256,14 @@ impl SessionRuntime {
         self.supervisor.request_cancel();
     }
 
+    /// Live spawn-time config handle shared with the subagent spawn
+    /// consumer — see [`nca_runtime::supervisor::Supervisor::live_config`].
+    /// Read at each spawn so children inherit the CURRENT provider/model
+    /// routing, not the wiring-time snapshot.
+    pub fn live_config(&self) -> Arc<std::sync::RwLock<nca_common::config::NcaConfig>> {
+        self.supervisor.live_config()
+    }
+
     pub fn cancel_handle(&self) -> Arc<AtomicBool> {
         self.supervisor.cancel_handle()
     }

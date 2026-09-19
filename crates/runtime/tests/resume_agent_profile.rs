@@ -144,8 +144,8 @@ async fn resume_sup(
 }
 
 /// Text of the most recent system message (the active system prompt).
-/// `set_system_prompt` appends, so after a profile switch the last System
-/// message is the live persona.
+/// `set_system_prompt` REPLACES (single-system-message model), so after a
+/// profile switch there is exactly one System message — the live persona.
 fn system_prompt_of(sup: &Supervisor) -> String {
     sup.agent()
         .messages
