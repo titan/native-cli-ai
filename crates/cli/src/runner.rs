@@ -170,6 +170,13 @@ impl SessionRuntime {
         self.supervisor.subagent_registry()
     }
 
+    /// Ghost-children report from the last resume (background tasks that
+    /// provably died with the previous parent process). Delegates to
+    /// [`nca_runtime::supervisor::Supervisor::take_restart_ghosts`].
+    pub fn take_restart_ghosts(&mut self) -> Vec<nca_runtime::supervisor::RestartGhost> {
+        self.supervisor.take_restart_ghosts()
+    }
+
     /// Shared plugin registry handle (G3: `subagentDispatch` hooks fire
     /// against the parent-rooted plugin instances).
     pub fn plugin_registry(&self) -> Option<Arc<nca_core::plugin::PluginRegistry>> {

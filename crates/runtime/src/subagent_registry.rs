@@ -605,8 +605,10 @@ pub fn subagent_control_consumer(
                 // full child turn) — execute it on its own tokio task so
                 // this loop keeps serving status/result/message/cancel;
                 // the reply rides the request's oneshot from inside that
-                // task. The lease is held for the whole sequence inside
-                // `handle_revive_request`.
+                // task. The lease is held only for the mutation prefix
+                // inside `handle_revive_request` and released before the
+                // revived turn runs, so a gen-1 cancel is never refused
+                // as "in flight".
                 SubagentControlRequest::Revive {
                     session_id,
                     prompt,
@@ -720,10 +722,14 @@ async fn handle_message_request(
     (response, parent, accepted)
 }
 
-/// Execute a `task_cancel` request: acquire the control lease, flip the
-/// child's cooperative cancel flag, record the reason, and release the
-/// lease immediately — the abort itself is asynchronous (the child's
-/// stream/tool loops poll the flag every 25–50ms).
+/// Execute a `task_cancel` request: acquire the control lease, re-validate
+/// the target UNDER the lease (explicit identity fence — see below), flip
+/// the child's cooperative cancel flag, record the reason, and release the
+/// lease immediately. The abort itself is asynchronous (the child's
+/// stream/tool loops poll the flag every 25–50ms), but the reply never
+/// over-claims it: a run that already reached a terminal state by the time
+/// of the flag-set is reported as-is (`ok=false` + the real state), not
+/// with the stale "aborts in ≤50ms" promise.
 async fn handle_cancel_request(
     registry: &SubagentRegistry,
     session_id: &str,
@@ -744,7 +750,7 @@ async fn handle_cancel_request(
             );
         }
     };
-    let base = |state, note: Option<String>, ok: bool| SubagentControlResponse {
+    let base = |state, note: Option<String>, ok: bool, generation: u64| SubagentControlResponse {
         session_id: entry.session_id.clone(),
         state,
         task: None,
@@ -755,31 +761,111 @@ async fn handle_cancel_request(
         note,
         ok,
         error_message: None,
-        generation: None,
+        generation: Some(generation),
     };
     let Some(_lease) = registry.try_acquire_lease(&entry.session_id) else {
         return base(
             entry.state,
             Some("another control operation is in flight for this task".into()),
             false,
+            entry.generation,
         );
     };
-    let Some(cancel_flag) = entry.cancel_flag else {
-        return base(entry.state, Some("task is not running".into()), false);
+
+    // Identity fence: re-read the entry under the lease. The snapshot above
+    // predates the lease, so a revive (or a terminal fold) may have raced
+    // it; each generation carries its OWN cancel-flag Arc, so ptr-equality
+    // between the snapshot's flag and the live one is the explicit proof
+    // that this cancel targets the run the caller saw. Without it, a
+    // cancelled-and-revived task would have the DEAD generation's flag
+    // flipped while the reply truthfully-looking claims success.
+    let live = match registry.get(&entry.session_id) {
+        Some(live) => live,
+        None => {
+            return SubagentControlResponse::unknown(
+                session_id,
+                unknown_task_error(registry, session_id),
+            );
+        }
     };
-    if entry.state != ChildSessionState::Running {
-        return base(entry.state, Some("task is not running".into()), false);
-    }
+    let cancel_flag = if live.state != ChildSessionState::Running {
+        return base(
+            live.state,
+            Some("task is not running".into()),
+            false,
+            live.generation,
+        );
+    } else {
+        match live.cancel_flag.as_ref() {
+            Some(current)
+                if entry
+                    .cancel_flag
+                    .as_ref()
+                    .is_some_and(|snapshot| Arc::ptr_eq(snapshot, current)) =>
+            {
+                current.clone()
+            }
+            // Running but the handle is not the one the caller saw (a revive
+            // bumped the generation) or there is no live handle at all: the
+            // truthful reply names the situation instead of flipping a
+            // stale flag and claiming success.
+            Some(_) => {
+                return base(
+                    live.state,
+                    Some(format!(
+                        "task is running under a different generation ({}) and cannot be \
+                         cancelled through this request's snapshot; re-issue task_cancel",
+                        live.generation
+                    )),
+                    false,
+                    live.generation,
+                );
+            }
+            None => {
+                return base(
+                    live.state,
+                    Some(
+                        "task is running but has no live cancel handle in this process \
+                         (stale projection); reconcile with task_status"
+                            .into(),
+                    ),
+                    false,
+                    live.generation,
+                );
+            }
+        }
+    };
+
     cancel_flag.store(true, std::sync::atomic::Ordering::SeqCst);
     registry.record_cancel_requested(&entry.session_id, reason);
+
+    // Post-set truth (bounded — no polling): a run that reached terminal
+    // between the fence and the flag-set is reported with its real state
+    // rather than a promise that it will abort.
+    if let Some(after) = registry.get(&entry.session_id)
+        && after.state.is_terminal()
+    {
+        return base(
+            after.state,
+            Some(format!(
+                "task already terminal (state {}, generation {})",
+                state_tag(after.state),
+                after.generation
+            )),
+            false,
+            after.generation,
+        );
+    }
+
     let response = base(
-        entry.state,
+        ChildSessionState::Running,
         Some(
             "cancel requested; the child aborts cooperatively at its next poll (≤50ms). \
              Worktree and branch are retained for revive."
                 .into(),
         ),
         true,
+        live.generation,
     );
     // The lease guarded only the flag-set; release it now (explicit drop
     // documents that the abort itself is asynchronous and un-leased).

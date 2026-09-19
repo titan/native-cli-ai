@@ -1682,6 +1682,21 @@ impl Repl {
         self.runtime
             .register_tool(Box::new(WaitForUserTool::new(pause_hook)));
 
+        // Restart ghost reconciliation: background children that provably
+        // died with the previous parent process (resume sweep — cross-pid
+        // json evidence) are reported ONCE through the wake delivery
+        // channel (the same Submit path `wake_submit_trigger` feeds). The
+        // model learns which tasks never finished and which worktrees were
+        // orphaned — listed only, never deleted (`task_revive` stays
+        // available). No debounce: this is a one-shot startup fact, not a
+        // terminal race.
+        let restart_ghosts = self.runtime.take_restart_ghosts();
+        if !restart_ghosts.is_empty() {
+            let _ = cmd_tx.send(Msg::Cmd(TuiCmd::Submit(format_restart_ghost_wake(
+                &restart_ghosts,
+            ))));
+        }
+
         let commit_tx = self.runtime.take_turn_commit_tx().map(|(tx, _flag)| tx);
         let _bridge = spawn_tui_bridge(
             rx,
@@ -2314,6 +2329,30 @@ fn wake_submit_trigger(cmd_tx: tokio::sync::mpsc::UnboundedSender<Msg>) -> WakeT
     Arc::new(move |text: &str| {
         let _ = cmd_tx.send(Msg::Cmd(TuiCmd::Submit(text.to_string())));
     })
+}
+
+/// Composite wake text for the resume ghost sweep (see
+/// `Supervisor::take_restart_ghosts`): which background tasks did not
+/// survive the parent restart and which worktrees they orphaned. List-only
+/// — worktrees are retained for `task_revive`, never deleted here.
+fn format_restart_ghost_wake(ghosts: &[nca_runtime::supervisor::RestartGhost]) -> String {
+    let items: Vec<String> = ghosts
+        .iter()
+        .map(|ghost| {
+            let name = ghost.alias.as_deref().unwrap_or(&ghost.child_session_id);
+            match ghost.worktree_path.as_deref() {
+                Some(path) => format!("{name} (worktree {path})"),
+                None => format!("{name} (no worktree)"),
+            }
+        })
+        .collect();
+    format!(
+        "[wake] {} background task(s) did not survive the parent restart and were marked \
+         failed: {}. Orphaned worktrees are retained for task_revive (not deleted); \
+         reconcile with task_status and continue.",
+        ghosts.len(),
+        items.join(", ")
+    )
 }
 
 fn build_model_picker_entries(

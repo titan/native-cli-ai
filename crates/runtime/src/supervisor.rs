@@ -23,7 +23,8 @@ use nca_common::config::{AgentProfileConfig, NcaConfig};
 use nca_common::event::{AgentEvent, EndReason, EventEnvelope};
 use nca_common::message::{ContentPart, Message, MessageContent, Role};
 use nca_common::session::{
-    OrchestrationContext, SessionMeta, SessionSnapshot, SessionState, SessionStatus,
+    ChildSessionState, OrchestrationContext, SessionMeta, SessionSnapshot, SessionState,
+    SessionStatus,
 };
 use nca_core::agent::AgentLoop;
 use nca_core::agent_driver::InboxItem;
@@ -123,6 +124,83 @@ pub struct Supervisor {
     /// Wiring marker: `true` once a fanout has taken the sender. The barrier
     /// skips waiting when nobody was wired (liveness over false durability).
     turn_commit_wired: Arc<AtomicBool>,
+    /// Ghost children collected by the resume sweep (cross-pid `Running`
+    /// registry entries — see [`RestartGhost`]). Taken once by the session
+    /// wiring and delivered through the wake channel; empty for fresh
+    /// sessions and clean resumes.
+    restart_ghosts: Vec<RestartGhost>,
+}
+
+/// Terminal `result_summary` stamped on ghost children by the resume sweep:
+/// the run was cut off by a parent-process restart, not by its own logic.
+pub(crate) const GHOST_TERMINAL_SUMMARY: &str =
+    "interrupted: parent process restarted before completion";
+
+/// One background child that provably died with a previous parent process,
+/// collected by [`Supervisor::resume`]'s ghost sweep.
+///
+/// Evidence: the registry (folded from the parent's event log) says
+/// `Running`, but the child session json was last written by a DIFFERENT
+/// pid — children are same-process tokio tasks, so a cross-pid writer is
+/// authoritative proof the task cannot be alive in this process. The
+/// retained worktree (if any) is LISTED for the user, never deleted —
+/// `task_revive` stays available.
+#[derive(Debug, Clone)]
+pub struct RestartGhost {
+    pub parent_session_id: String,
+    pub child_session_id: String,
+    /// Generation the ghost was running at (tombstoned in place).
+    pub generation: u64,
+    pub alias: Option<String>,
+    pub task: String,
+    /// Retained worktree of the dead child, if it ran in one.
+    pub worktree_path: Option<String>,
+}
+
+/// Sweep the freshly folded registry for ghost `Running` entries whose child
+/// json was written by another process, and fold each to `Failed`. Returns
+/// the ghost report for the wake channel. Read-only on the child jsons
+/// (single-writer invariant: only the child's own supervisor writes them);
+/// mutates only the in-memory registry projection. Entries whose json is
+/// unloadable carry no pid evidence and are left untouched (conservative).
+async fn sweep_restart_ghosts(
+    registry: &SubagentRegistry,
+    store: &SessionStore,
+    current_pid: u32,
+) -> Vec<RestartGhost> {
+    let mut ghosts = Vec::new();
+    for entry in registry.list() {
+        if entry.state != ChildSessionState::Running {
+            continue;
+        }
+        // `meta.pid` is stamped at the child's create() by its own
+        // supervisor; a live child of THIS process necessarily carries our
+        // pid (also under in-process switch_to, where old children keep
+        // running). Anything else — a foreign pid or `None` — is a writer
+        // that cannot be alive here.
+        let Ok(child) = store.load(&entry.session_id).await else {
+            continue;
+        };
+        if child.meta.pid == Some(current_pid) {
+            continue;
+        }
+        registry.record_terminal(
+            &entry.session_id,
+            ChildSessionState::Failed,
+            Some(GHOST_TERMINAL_SUMMARY.to_string()),
+        );
+        ghosts.push(RestartGhost {
+            parent_session_id: entry.parent_session_id,
+            child_session_id: entry.session_id,
+            generation: entry.generation,
+            alias: entry.alias,
+            task: entry.task,
+            // The registry fold carries no worktree path (runtime-only
+            // state); the child json is the authoritative record.
+            worktree_path: child.meta.worktree_path.map(|p| p.display().to_string()),
+        });
+    }
+    ghosts
 }
 
 /// Configuration for creating a new supervised session.
@@ -789,6 +867,7 @@ impl Supervisor {
             turn_commit_tx,
             turn_commit_rx: Some(commit_rx),
             turn_commit_wired,
+            restart_ghosts: Vec::new(),
         };
         sup.save().await.map_err(ProviderError::Other)?;
         sup.update_last_session()
@@ -984,6 +1063,54 @@ impl Supervisor {
         )
         .await;
 
+        // Ghost-child sweep: a `Running` registry entry whose child json was
+        // last written by ANOTHER process is authoritative death evidence
+        // (children are same-process tokio tasks — a cross-pid writer cannot
+        // be alive here). Without this, a parent that crashed mid-child-run
+        // resumes with permanently-`Running` ghosts that `task_status` keeps
+        // reporting as live. Each ghost is folded to `Failed` and a
+        // `ChildSessionStatusChanged` tombstone envelope is appended to THIS
+        // session's own event log (single-writer: only the parent log + the
+        // in-memory projection are touched — never the child json), so a
+        // later resume folds the tombstone instead of re-ghosting. The report
+        // rides the wake channel via [`Supervisor::take_restart_ghosts`].
+        // The one-shot writer is safe here: the fanout for this session has
+        // not spawned yet (the event receiver is still held), so there is no
+        // concurrent log writer, and the fanout's own writer seeds its id
+        // counter from the appended tombstones when it opens later.
+        let ghosts = sweep_restart_ghosts(
+            &sup.subagent_registry,
+            &sup.session_store,
+            std::process::id(),
+        )
+        .await;
+        if !ghosts.is_empty() {
+            let mut writer = crate::event_log::EventLogWriter::open(&sup.event_log_path()).await;
+            for ghost in &ghosts {
+                let envelope = EventEnvelope::new(
+                    writer.next_id(),
+                    AgentEvent::ChildSessionStatusChanged {
+                        parent_session_id: ghost.parent_session_id.clone(),
+                        child_session_id: ghost.child_session_id.clone(),
+                        state: ChildSessionState::Failed,
+                        generation: ghost.generation,
+                        alias: ghost.alias.clone(),
+                        result_summary: Some(GHOST_TERMINAL_SUMMARY.to_string()),
+                    },
+                );
+                if let Err(e) = writer.append(&envelope).await {
+                    tracing::error!(
+                        "ghost-sweep tombstone append failed for {}: {e}",
+                        ghost.child_session_id
+                    );
+                }
+            }
+            if let Err(e) = writer.commit().await {
+                tracing::error!("ghost-sweep tombstone commit failed: {e}");
+            }
+            sup.restart_ghosts = ghosts;
+        }
+
         // Re-save immediately after restore: closes the create()-saves-empty-
         // state window so a crash right after resume no longer wipes the json.
         sup.save().await.map_err(ProviderError::Other)?;
@@ -1028,6 +1155,17 @@ impl Supervisor {
     /// event log.
     pub fn subagent_registry(&self) -> Arc<SubagentRegistry> {
         Arc::clone(&self.subagent_registry)
+    }
+
+    /// Take the ghost-children report collected by the last
+    /// [`Self::resume`]: background tasks that provably died with the
+    /// previous parent process (cross-pid json evidence, already folded to
+    /// `Failed` + tombstoned in this session's event log). The session
+    /// wiring delivers it once through the wake channel (list-only — the
+    /// retained worktrees stay available for `task_revive`). Empty for
+    /// fresh sessions and clean resumes; consecutive calls return nothing.
+    pub fn take_restart_ghosts(&mut self) -> Vec<RestartGhost> {
+        std::mem::take(&mut self.restart_ghosts)
     }
 
     pub async fn run_turn(&mut self, prompt: &str) -> Result<String, ProviderError> {
