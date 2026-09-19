@@ -570,8 +570,9 @@ pub async fn spawn_child_session(
 ///
 /// Order of operations (port of upstream `task-revive.ts`):
 /// 1. resolve id/alias → unknown/ambiguous error reply;
-/// 2. acquire the control lease for the WHOLE cancel-then-run sequence
-///    (a concurrent cancel/revive reports "in flight" instead);
+/// 2. acquire the control lease for the MUTATION PREFIX only
+///    (cancel-wait + resume + record_revive + record_handles); a
+///    concurrent cancel/revive reports "in flight" instead;
 /// 3. a still-`Running` target is cancelled first (cooperative flag flip)
 ///    and awaited to terminal — bounded 30s;
 /// 4. `Supervisor::resume` folds the child's own json + event log (the
@@ -579,7 +580,9 @@ pub async fn spawn_child_session(
 ///    instance replaces the finished one), re-attaches the retained
 ///    worktree, and `ask_question` is stripped like any child;
 /// 5. `record_revive` (state=Running, generation+=1) + fresh handles +
-///    running `ChildSessionStatusChanged`;
+///    running `ChildSessionStatusChanged`, then the lease is RELEASED —
+///    the revived child must stay cancellable (`task_cancel`) through its
+///    whole second life, so the run itself is un-leased;
 /// 6. the new turn runs through [`run_prepared_child`] with the bumped
 ///    generation (same terminal mapping as a spawn).
 ///
@@ -631,8 +634,12 @@ pub async fn handle_revive_request(
             generation: None,
         };
 
-    // The lease is held for the WHOLE revive (cancel-wait + resume + run):
-    // a concurrent cancel/revive must not interleave with this sequence.
+    // The lease covers only the mutation prefix (cancel-wait + resume +
+    // record_revive + record_handles): a concurrent cancel/revive must not
+    // interleave with the registry/state mutations. It is explicitly
+    // dropped BELOW, before the revived turn runs — holding it across the
+    // run would make the generation-1 child un-cancellable for its whole
+    // second life (task_cancel would report "in flight").
     let Some(_lease) = registry.try_acquire_lease(&child_id) else {
         return base(
             entry.state,
@@ -725,6 +732,12 @@ pub async fn handle_revive_request(
         );
     };
     registry.record_handles(&child_id, sup.cancel_handle(), sup.inbox_sender());
+    // Lease boundary: the registry mutation prefix is complete (the revived
+    // child is Running at the bumped generation with live handles), so
+    // release the control lease BEFORE the turn runs. The gen-1 run is an
+    // ordinary live child — task_cancel must reach it immediately, not
+    // report "control operation in flight" for the whole second life.
+    drop(_lease);
     if let Some(ref tx) = event_tx {
         let _ = tx
             .send(AgentEvent::ChildSessionStatusChanged {
