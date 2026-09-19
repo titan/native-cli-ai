@@ -424,6 +424,17 @@ mod tests {
     }
 
     async fn run(tools: ToolRegistry, calls: Vec<ToolCall>) -> Result<PipelineResult, String> {
+        let mut guard = RepeatCallGuard::new();
+        run_with_guard(&tools, calls, &mut guard).await
+    }
+
+    /// Like [`run`] but the caller owns the guard, so consecutive batches
+    /// share session/turn state exactly as steps within one agent turn do.
+    async fn run_with_guard(
+        tools: &ToolRegistry,
+        calls: Vec<ToolCall>,
+        guard: &mut RepeatCallGuard,
+    ) -> Result<PipelineResult, String> {
         let mut config = nca_common::config::NcaConfig::default();
         // Bypass so the fake tool names ("instant", "slow_read", …) never hit
         // the approval Ask tier — only ask_question is on the read allowlist.
@@ -431,15 +442,14 @@ mod tests {
         let mut approval = ApprovalPolicy::new(config.permissions);
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
         let cancel = AtomicBool::new(false);
-        let mut guard = RepeatCallGuard::new();
         run_tool_pipeline(
-            &tools,
+            tools,
             &mut approval,
             &None,
             &event_tx,
             &cancel,
             calls,
-            &mut guard,
+            guard,
             "/ws",
         )
         .await
@@ -629,5 +639,132 @@ mod tests {
         let ids: Vec<&str> = result.results.iter().map(|r| r.call_id.as_str()).collect();
         assert_eq!(ids, vec!["a", "q1", "b", "q2"]);
         assert!(result.results.iter().all(|r| r.success));
+    }
+
+    // ── P4 wait-guard: same-turn repeated `wait_for_user` protection ──────
+
+    /// Stub registered under the real name so `ToolRegistry::is_interactive`
+    /// barrier-serializes it exactly like production. Counts executions so
+    /// refusals can be proven to skip execution.
+    struct WaitStub {
+        executions: Arc<Mutex<u32>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for WaitStub {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                timeout_ms: None,
+                name: "wait_for_user".into(),
+                description: "stub wait tool".into(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+
+        async fn execute(&self, call: &ToolCall) -> ToolResult {
+            *self.executions.lock().unwrap() += 1;
+            ToolResult {
+                timed_out: false,
+                call_id: call.id.clone(),
+                success: true,
+                output: "Standing by for the user.".into(),
+                error: None,
+            }
+        }
+    }
+
+    fn wait_call(id: &str) -> ToolCall {
+        call(id, "wait_for_user")
+    }
+
+    /// Within one turn (one guard): 1st call runs clean, the 2nd runs with
+    /// the marker warning appended, the 3rd is refused without execution,
+    /// and `reset_turn` (next turn) restores first-call behavior.
+    #[tokio::test]
+    async fn wait_tool_repeats_warn_then_refuse_then_reset_per_turn() {
+        use crate::tool_guards::WAIT_GUARD_MARKER;
+
+        let executions = Arc::new(Mutex::new(0));
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(WaitStub {
+            executions: Arc::clone(&executions),
+        }));
+
+        // One guard shared across batches = one agent turn (steps share the
+        // AgentLoop-owned `repeat_guard`).
+        let mut guard = RepeatCallGuard::new();
+
+        // 1st call: executes, output clean.
+        let r = run_with_guard(&tools, vec![wait_call("w1")], &mut guard)
+            .await
+            .expect("pipeline");
+        assert!(r.results[0].success, "1st wait must execute");
+        assert!(
+            !r.results[0].output.contains(WAIT_GUARD_MARKER),
+            "1st wait output must be clean: {}",
+            r.results[0].output
+        );
+        assert_eq!(*executions.lock().unwrap(), 1);
+
+        // 2nd call: still executes, warning appended at the output tail.
+        let r = run_with_guard(&tools, vec![wait_call("w2")], &mut guard)
+            .await
+            .expect("pipeline");
+        assert!(r.results[0].success, "2nd wait must still execute");
+        let out = &r.results[0].output;
+        assert!(
+            out.starts_with("Standing by for the user."),
+            "original output preserved: {out}"
+        );
+        assert!(
+            out.contains(WAIT_GUARD_MARKER),
+            "2nd wait output must carry the marker: {out}"
+        );
+        assert_eq!(*executions.lock().unwrap(), 2);
+
+        // 3rd call: refused — failed result with actionable error, tool NOT
+        // executed.
+        let r = run_with_guard(&tools, vec![wait_call("w3")], &mut guard)
+            .await
+            .expect("pipeline");
+        assert!(!r.results[0].success, "3rd wait must be refused");
+        let err = r.results[0].error.as_deref().unwrap_or_default();
+        assert!(!err.is_empty(), "refusal must explain itself");
+        assert_eq!(*executions.lock().unwrap(), 2, "refused call must not run");
+
+        // New turn: counter reset → first call clean again.
+        guard.reset_turn();
+        let r = run_with_guard(&tools, vec![wait_call("w4")], &mut guard)
+            .await
+            .expect("pipeline");
+        assert!(r.results[0].success);
+        assert!(!r.results[0].output.contains(WAIT_GUARD_MARKER));
+        assert_eq!(*executions.lock().unwrap(), 3);
+    }
+
+    /// Two `wait_for_user` calls in ONE batch: the barrier serialization is
+    /// untouched and both calls are counted (Phase-1 checks are sequential),
+    /// so the degenerate pair is already warned within a single batch.
+    #[tokio::test]
+    async fn wait_tool_double_call_in_one_batch_counts_both() {
+        use crate::tool_guards::WAIT_GUARD_MARKER;
+
+        let executions = Arc::new(Mutex::new(0));
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(WaitStub {
+            executions: Arc::clone(&executions),
+        }));
+
+        let mut guard = RepeatCallGuard::new();
+        let r = run_with_guard(&tools, vec![wait_call("w1"), wait_call("w2")], &mut guard)
+            .await
+            .expect("pipeline");
+
+        assert_eq!(r.results.len(), 2);
+        assert!(r.results[0].success);
+        assert!(!r.results[0].output.contains(WAIT_GUARD_MARKER));
+        assert!(r.results[1].success, "2nd in batch executes (warn regime)");
+        assert!(r.results[1].output.contains(WAIT_GUARD_MARKER));
+        assert_eq!(*executions.lock().unwrap(), 2, "both calls ran, serialized");
     }
 }

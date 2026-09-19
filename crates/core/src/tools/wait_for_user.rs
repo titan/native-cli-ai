@@ -8,7 +8,8 @@
 //! the user's next Submit (a terminal landing while paused is held and
 //! delivered right after that Submit, never dropped). Registered
 //! `is_interactive` so the tool pipeline runs it strictly alone, last in a
-//! batch.
+//! batch. Same-turn repeats are guarded separately: see
+//! `crate::tool_guards` (warn on the 2nd call in a turn, refuse from the 3rd).
 
 use std::sync::Arc;
 
