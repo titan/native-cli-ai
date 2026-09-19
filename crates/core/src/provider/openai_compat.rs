@@ -275,7 +275,13 @@ pub fn map_provider_error(status: reqwest::StatusCode, body_text: String) -> Pro
         429 => ProviderError::RateLimited {
             retry_after_ms: 1000,
         },
-        _ => ProviderError::RequestFailed(body_text),
+        // Everything else keeps the numeric status so failover/retry
+        // policies can classify by status class (5xx vs 400) without
+        // parsing the body.
+        _ => ProviderError::Http {
+            status: status.as_u16(),
+            body: body_text,
+        },
     }
 }
 

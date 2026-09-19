@@ -96,6 +96,7 @@ Sessions are persisted to disk. `nca --resume` picks up the last session with fu
 - Custom instructions (`.ncarc` project file, `.nca/instructions.md` personal file)
 - Markdown-rendered responses with syntax highlighting in the terminal
 - Token usage and cost tracking per session
+- Optional provider fallback chain (`[fallback]`): ordered failover across providers on 429/5xx/network/moderation failures and empty completions, with zero-content mid-stream protection and user-visible switch notifications (default off)
 - Colored diffs for file changes
 - Optional orchestration metadata via `NCA_ORCH_*` environment variables (injected into session state and harness)
 

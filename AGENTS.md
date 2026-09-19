@@ -53,6 +53,7 @@ Infrastructure modules in the same directory:
 
 - `core` depends on `genai 0.5` (multi-provider LLM library) and `rmcp 1.7` (MCP client).
 - `prepare_messages_for_request()` is the hook for provider-specific message rewriting (e.g. DeepSeek strips `reasoning_content`).
+- **Provider fallback** (`[fallback]`, default off): `factory::build_provider_with_events` wraps the primary in `provider::fallback::FallbackProvider` — tight failover classes (429/5xx/408/network/content-moderation 400/empty completion), zero-content mid-stream rule (never retry after any chunk was delivered), per-instance throttle (`initial_retry_delay_ms`/`retry_delay_ms`), loud `ProviderError::FallbackExhausted` on chain end, and an `AgentEvent::ProviderFallback` notification per switch (never silent).
 - Never hard-code a model name. Always read from config (`common::config::NcaConfig`).
 - Empty completions must fail loudly (never silently succeed).
 

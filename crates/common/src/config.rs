@@ -18,6 +18,9 @@ pub struct NcaConfig {
     /// Step-request middleware knobs (`[middleware]`): retry, cost guard.
     #[serde(default)]
     pub middleware: MiddlewareConfig,
+    /// Provider fallback (failover) chain (`[fallback]`).
+    #[serde(default)]
+    pub fallback: FallbackConfig,
     /// CLI/TUI preferences (e.g. external editor).
     #[serde(default)]
     pub ui: UiConfig,
@@ -205,6 +208,9 @@ impl NcaConfig {
         }
         if let Some(middleware) = partial.middleware {
             self.middleware.merge(middleware);
+        }
+        if let Some(fallback) = partial.fallback {
+            self.fallback.merge(fallback);
         }
         if let Some(agents) = partial.agents {
             self.merge_agents(agents);
@@ -2007,6 +2013,59 @@ impl MiddlewareConfig {
     }
 }
 
+/// Provider fallback (failover) configuration (`[fallback]` section).
+///
+/// When enabled, the session's primary provider is wrapped in a
+/// [`nca_core::provider::fallback::FallbackProvider`] that retries a failed
+/// step against the ordered `chain` of alternate providers (each using its
+/// own `[provider.<name>]` credentials and model). Off by default.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct FallbackConfig {
+    /// Master switch. `false` (the default) keeps single-provider behavior.
+    pub enabled: bool,
+    /// Ordered fallback provider names, each parseable by
+    /// [`ProviderKind::from_cli_name`] (e.g. `["openai", "zhipuai"]`).
+    /// Entries matching the primary provider (or repeated entries) are
+    /// skipped at build time — a provider that just failed is not retried
+    /// immediately.
+    pub chain: Vec<String>,
+    /// Delay before the FIRST failover switch of a provider instance, in
+    /// milliseconds. Default 0: the first switch is immediate.
+    pub initial_retry_delay_ms: u64,
+    /// Minimum spacing between consecutive failover switches (anti-storm
+    /// throttle), in milliseconds. Default 500.
+    pub retry_delay_ms: u64,
+}
+
+impl Default for FallbackConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            chain: Vec::new(),
+            initial_retry_delay_ms: 0,
+            retry_delay_ms: 500,
+        }
+    }
+}
+
+impl FallbackConfig {
+    fn merge(&mut self, partial: PartialFallbackConfig) {
+        if let Some(enabled) = partial.enabled {
+            self.enabled = enabled;
+        }
+        if let Some(chain) = partial.chain {
+            self.chain = chain;
+        }
+        if let Some(initial_retry_delay_ms) = partial.initial_retry_delay_ms {
+            self.initial_retry_delay_ms = initial_retry_delay_ms;
+        }
+        if let Some(retry_delay_ms) = partial.retry_delay_ms {
+            self.retry_delay_ms = retry_delay_ms;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
     pub history_dir: PathBuf,
@@ -2410,6 +2469,7 @@ struct PartialNcaConfig {
     web: Option<PartialWebConfig>,
     ui: Option<PartialUiConfig>,
     middleware: Option<PartialMiddlewareConfig>,
+    fallback: Option<PartialFallbackConfig>,
     agents: Option<BTreeMap<String, PartialAgentProfileConfig>>,
     extra_paths: Option<Vec<PathBuf>>,
     subagent: Option<PartialSubagentConfig>,
@@ -2608,6 +2668,14 @@ struct PartialMiddlewareConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+struct PartialFallbackConfig {
+    enabled: Option<bool>,
+    chain: Option<Vec<String>>,
+    initial_retry_delay_ms: Option<u64>,
+    retry_delay_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
 struct PartialHarnessConfig {
     built_in_enabled: Option<bool>,
     global_instructions_path: Option<PathBuf>,
@@ -2753,6 +2821,67 @@ fn expand_tilde(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_defaults_to_disabled_empty_chain() {
+        let fallback = NcaConfig::default().fallback;
+        assert!(!fallback.enabled, "fallback must be opt-in");
+        assert!(fallback.chain.is_empty());
+        assert_eq!(fallback.initial_retry_delay_ms, 0);
+        assert_eq!(fallback.retry_delay_ms, 500);
+    }
+
+    #[test]
+    fn fallback_parses_full_toml_section() {
+        let raw = r#"
+            [fallback]
+            enabled = true
+            chain = ["openai", "zhipuai"]
+            initial_retry_delay_ms = 250
+            retry_delay_ms = 1000
+        "#;
+        let partial: PartialNcaConfig = toml::from_str(raw).expect("parse");
+        let mut config = NcaConfig::default();
+        config.merge(partial);
+        assert!(config.fallback.enabled);
+        assert_eq!(config.fallback.chain, vec!["openai", "zhipuai"]);
+        assert_eq!(config.fallback.initial_retry_delay_ms, 250);
+        assert_eq!(config.fallback.retry_delay_ms, 1000);
+    }
+
+    #[test]
+    fn fallback_partial_merge_is_per_field() {
+        // A bare `enabled = true` flips the switch without touching the rest.
+        let partial: PartialNcaConfig =
+            toml::from_str("[fallback]\nenabled = true\n").expect("parse");
+        let mut config = NcaConfig::default();
+        config.fallback.chain = vec!["kimi".into()];
+        config.merge(partial);
+        assert!(config.fallback.enabled);
+        assert_eq!(config.fallback.chain, vec!["kimi"], "chain untouched");
+        assert_eq!(config.fallback.retry_delay_ms, 500, "delays untouched");
+    }
+
+    #[test]
+    fn fallback_chain_merge_replaces_not_appends() {
+        let partial: PartialNcaConfig =
+            toml::from_str("[fallback]\nchain = [\"openai\"]\n").expect("parse");
+        let mut config = NcaConfig::default();
+        config.fallback.chain = vec!["kimi".into(), "openai".into()];
+        config.merge(partial);
+        assert_eq!(config.fallback.chain, vec!["openai"], "chain is wholesale");
+    }
+
+    #[test]
+    fn fallback_roundtrips_through_serde() {
+        let mut config = NcaConfig::default();
+        config.fallback.enabled = true;
+        config.fallback.chain = vec!["openai".into(), "kimi".into()];
+        config.fallback.retry_delay_ms = 2_000;
+        let json = serde_json::to_string(&config).expect("serialize");
+        let back: NcaConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.fallback, config.fallback);
+    }
 
     #[test]
     fn session_accepts_max_turn_per_run_typo_alias() {
