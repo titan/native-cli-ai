@@ -477,7 +477,7 @@ mod fallback_backend {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub use fallback_backend::{backend_supported, exec_confined};
+pub use fallback_backend::{backend_supported, confine_cmd, exec_confined};
 
 #[cfg(test)]
 mod tests {
