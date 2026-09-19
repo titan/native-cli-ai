@@ -192,6 +192,13 @@ impl AgentLoop {
         let turn_id = self.turn_seq;
         self.emit(AgentEvent::TurnStarted { turn_id }).await;
 
+        // New turn = fresh per-turn guard state. The wait-tool repeat counter
+        // (`RepeatCallGuard::reset_turn`) is turn-scoped by contract: calling
+        // `wait_for_user` once per turn is legitimate, so each new user
+        // message restores first-call behavior. The generic identical-call
+        // counts are deliberately NOT reset here (session-scoped).
+        self.repeat_guard.reset_turn();
+
         // Claim leftover inbox items from a previous turn (arrival order),
         // BEFORE the new user message.
         self.claim_inbox().await;
@@ -633,6 +640,52 @@ mod tests {
             .expect("normal turn");
         assert_eq!(text, "all done");
         assert_eq!(agent.messages.len(), 2, "user + assistant messages");
+    }
+
+    // P4 wait-guard turn boundary: the wait-tool repeat counter is
+    // turn-scoped. Burning it into the refused state during "turn 1" must
+    // NOT leak into the next turn — `run_turn` resets it at `TurnStarted`,
+    // so the first `wait_for_user` of the new turn proceeds again.
+    #[tokio::test]
+    async fn run_turn_resets_wait_tool_guard_at_turn_start() {
+        use crate::tool_guards::RepeatAction;
+
+        let (provider, _calls) = ScriptedProvider::new(vec![vec![
+            StreamChunk::TextDelta("ok".into()),
+            StreamChunk::Finish {
+                reason: "stop".into(),
+            },
+        ]]);
+        let mut agent = test_agent(Arc::new(provider));
+
+        // Simulate a degenerate prior turn: wait called 3+ times → refused.
+        let input = serde_json::json!({});
+        for _ in 0..3 {
+            let _ = agent.repeat_guard.record("wait_for_user", &input);
+        }
+        assert!(
+            matches!(
+                agent.repeat_guard.record("wait_for_user", &input),
+                RepeatAction::Stop(_)
+            ),
+            "burn-in must reach the refused state"
+        );
+
+        agent
+            .run_turn("next user message", Path::new("."), &[])
+            .await
+            .expect("turn must complete");
+
+        // New turn: first wait call is legitimate again; the escalation only
+        // restarts on repeats *within* the new turn.
+        assert_eq!(
+            agent.repeat_guard.record("wait_for_user", &input),
+            RepeatAction::Proceed
+        );
+        assert!(matches!(
+            agent.repeat_guard.record("wait_for_user", &input),
+            RepeatAction::Hint(_)
+        ));
     }
 
     fn tc(id: &str) -> MessageToolCall {
