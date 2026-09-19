@@ -1108,4 +1108,304 @@ mod tests {
             }
         }
     }
+
+    // ---- Stream-level failover (cross-model verification) ----
+
+    /// Spawn a channel that emits `chunks` in order, then closes.
+    fn chunk_stream(chunks: Vec<StreamChunk>) -> mpsc::Receiver<StreamChunk> {
+        let (tx, rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            for chunk in chunks {
+                if tx.send(chunk).await.is_err() {
+                    return;
+                }
+            }
+        });
+        rx
+    }
+
+    /// A provider that hands out one crafted chunk stream and counts how
+    /// many times `chat()` was called. Lets a test drive exact stream
+    /// shapes (mid-stream errors, partial content) — no network.
+    struct CraftedProvider {
+        calls: Mutex<usize>,
+        rx: Mutex<Option<mpsc::Receiver<StreamChunk>>>,
+    }
+
+    impl CraftedProvider {
+        fn new(chunks: Vec<StreamChunk>) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(0),
+                rx: Mutex::new(Some(chunk_stream(chunks))),
+            })
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.lock().map_or(0, |c| *c)
+        }
+    }
+
+    #[async_trait]
+    impl Provider for CraftedProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _model: &str,
+            _workspace_root: &Path,
+        ) -> Result<mpsc::Receiver<StreamChunk>, ProviderError> {
+            if let Ok(mut calls) = self.calls.lock() {
+                *calls += 1;
+            }
+            match self.rx.lock() {
+                Ok(mut guard) => match guard.take() {
+                    Some(rx) => Ok(rx),
+                    None => Err(ProviderError::Other("no crafted stream".into())),
+                },
+                Err(poisoned) => Err(ProviderError::Other(format!(
+                    "crafted rx poisoned: {poisoned}"
+                ))),
+            }
+        }
+    }
+
+    /// Drain every queued `ProviderFallback` as `(from, to, reason)`.
+    fn drain_fallbacks(rx: &mut mpsc::Receiver<AgentEvent>) -> Vec<(String, String, String)> {
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::ProviderFallback { from, to, reason } = event {
+                out.push((from, to, reason));
+            }
+        }
+        out
+    }
+
+    // Scenario 1: the first provider fails at STREAM level with zero
+    // delivered content → the chain's second provider continues and answers,
+    // and the switch is announced with a user-visible ProviderFallback event.
+    #[tokio::test]
+    async fn stream_zero_content_error_fails_over_and_announces_switch() {
+        let primary = CraftedProvider::new(vec![StreamChunk::Error(ProviderError::RequestFailed(
+            "connection reset by peer".into(),
+        ))]);
+        let secondary = ScriptedProvider::new(vec![]);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+
+        let provider = fallback(
+            primary.clone(),
+            vec![FallbackEntry {
+                name: "Secondary".into(),
+                provider: secondary.clone(),
+            }],
+            Some(event_tx),
+        );
+
+        let chunks = collect(
+            provider
+                .chat(&[Message::user("hi")], &[], "primary-model", Path::new("."))
+                .await
+                .expect("fallback stream"),
+        )
+        .await;
+        // No Finish chunk was ever produced before the failure, so the
+        // delivered stream is exactly the secondary's completion.
+        assert_eq!(text_of(&chunks), "hello…done", "secondary answered");
+        assert_eq!(primary.call_count(), 1);
+        assert_eq!(secondary.call_count(), 1);
+
+        let events = drain_fallbacks(&mut event_rx);
+        assert_eq!(events.len(), 1, "failover must never be silent");
+        assert_eq!(events[0].0, "Primary");
+        assert_eq!(events[0].1, "Secondary");
+        assert!(
+            events[0].2.starts_with("network_error"),
+            "reason names the failure class: {:?}",
+            events[0].2
+        );
+    }
+
+    // Scenario 2: a failure AFTER >=1 delivered content chunk is surfaced
+    // verbatim — no retry, no second request, no fallback event.
+    #[tokio::test]
+    async fn midstream_error_after_content_is_verbatim_and_silent() {
+        let primary = CraftedProvider::new(vec![
+            StreamChunk::TextDelta("partial ".into()),
+            StreamChunk::Error(ProviderError::Http {
+                status: 502,
+                body: "upstream dropped".into(),
+            }),
+        ]);
+        let secondary = ScriptedProvider::new(vec![]);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+
+        let provider = fallback(
+            primary.clone(),
+            vec![FallbackEntry {
+                name: "Secondary".into(),
+                provider: secondary.clone(),
+            }],
+            Some(event_tx),
+        );
+        let chunks = collect(
+            provider
+                .chat(&[Message::user("hi")], &[], "m", Path::new("."))
+                .await
+                .expect("stream"),
+        )
+        .await;
+        assert_eq!(text_of(&chunks), "partial ", "partial output preserved");
+        // The original failure surfaces unchanged (status + body intact).
+        match chunks.last() {
+            Some(StreamChunk::Error(ProviderError::Http { status, body })) => {
+                assert_eq!(*status, 502);
+                assert_eq!(body, "upstream dropped");
+            }
+            other => panic!("expected verbatim 502 error, got {other:?}"),
+        }
+        assert_eq!(primary.call_count(), 1);
+        assert_eq!(secondary.call_count(), 0, "never retry mid-stream");
+        assert!(
+            drain_fallbacks(&mut event_rx).is_empty(),
+            "a mid-stream failure must not announce a switch"
+        );
+    }
+
+    // Scenario 3: a second failure inside the retry window does not switch
+    // immediately — the walk waits out `retry_delay_ms` (initial = 0 makes
+    // the FIRST switch instant, isolating the gap on the second switch).
+    #[tokio::test(start_paused = true)]
+    async fn second_switch_waits_out_retry_delay() {
+        let primary =
+            ScriptedProvider::new(vec![ScriptRound::ChatErr(ProviderError::RateLimited {
+                retry_after_ms: 1,
+            })]);
+        let secondary =
+            ScriptedProvider::new(vec![ScriptRound::ChatErr(ProviderError::RateLimited {
+                retry_after_ms: 1,
+            })]);
+        let tertiary = ScriptedProvider::new(vec![]);
+        let provider = FallbackProvider::new(
+            primary,
+            "Primary".into(),
+            vec![
+                FallbackEntry {
+                    name: "Secondary".into(),
+                    provider: secondary,
+                },
+                FallbackEntry {
+                    name: "Tertiary".into(),
+                    provider: tertiary.clone(),
+                },
+            ],
+            0,   // first switch: instant
+            400, // subsequent switches: 400ms apart
+            None,
+        );
+
+        let start = Instant::now();
+        let chunks = collect(
+            provider
+                .chat(&[Message::user("hi")], &[], "m", Path::new("."))
+                .await
+                .expect("tertiary stream"),
+        )
+        .await;
+        assert_eq!(text_of(&chunks), "hello…done");
+        assert_eq!(tertiary.call_count(), 1);
+        assert!(
+            start.elapsed() >= Duration::from_millis(400),
+            "second switch must wait out retry_delay_ms, elapsed {:?}",
+            start.elapsed()
+        );
+    }
+
+    // Scenario 4: stream-level exhaustion aggregates every hop's reason into
+    // one loud error.
+    #[tokio::test]
+    async fn stream_chain_exhaustion_aggregates_every_hop_reason() {
+        let primary = CraftedProvider::new(vec![StreamChunk::Error(ProviderError::RateLimited {
+            retry_after_ms: 7,
+        })]);
+        let secondary = ScriptedProvider::new(vec![ScriptRound::ChatErr(ProviderError::Http {
+            status: 503,
+            body: "upstream unavailable".into(),
+        })]);
+        let tertiary = ScriptedProvider::new(vec![ScriptRound::ChatErr(
+            ProviderError::RequestFailed("connection timed out".into()),
+        )]);
+        let provider = fallback(
+            primary.clone(),
+            vec![
+                FallbackEntry {
+                    name: "Secondary".into(),
+                    provider: secondary,
+                },
+                FallbackEntry {
+                    name: "Tertiary".into(),
+                    provider: tertiary,
+                },
+            ],
+            None,
+        );
+
+        let chunks = collect(
+            provider
+                .chat(&[Message::user("hi")], &[], "m", Path::new("."))
+                .await
+                .expect("stream"),
+        )
+        .await;
+        match chunks.last() {
+            Some(StreamChunk::Error(ProviderError::FallbackExhausted { chain, reasons })) => {
+                assert_eq!(chain, "Primary → Secondary → Tertiary");
+                for hop in ["Primary:", "Secondary:", "Tertiary:"] {
+                    assert!(
+                        reasons.contains(hop),
+                        "aggregate must name {hop} — reasons: {reasons}"
+                    );
+                }
+            }
+            other => panic!("expected FallbackExhausted, got {other:?}"),
+        }
+        assert_eq!(primary.call_count(), 1);
+    }
+
+    // Scenario 5: a stream-level 401 is not failover-class — it surfaces
+    // verbatim and the chain is never contacted.
+    #[tokio::test]
+    async fn stream_auth_error_surfaces_verbatim_and_never_touches_chain() {
+        let primary = CraftedProvider::new(vec![StreamChunk::Error(ProviderError::AuthError(
+            "invalid api key".into(),
+        ))]);
+        let secondary = ScriptedProvider::new(vec![]);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let provider = fallback(
+            primary.clone(),
+            vec![FallbackEntry {
+                name: "Secondary".into(),
+                provider: secondary.clone(),
+            }],
+            Some(event_tx),
+        );
+
+        let chunks = collect(
+            provider
+                .chat(&[Message::user("hi")], &[], "m", Path::new("."))
+                .await
+                .expect("stream"),
+        )
+        .await;
+        match chunks.last() {
+            Some(StreamChunk::Error(ProviderError::AuthError(msg))) => {
+                assert_eq!(msg, "invalid api key");
+            }
+            other => panic!("expected verbatim AuthError, got {other:?}"),
+        }
+        assert_eq!(primary.call_count(), 1);
+        assert_eq!(secondary.call_count(), 0, "auth error must not fail over");
+        assert!(
+            drain_fallbacks(&mut event_rx).is_empty(),
+            "chain untouched → no switch event"
+        );
+    }
 }
