@@ -203,7 +203,7 @@ async fn sweep_restart_ghosts(
         if child.meta.pid == Some(current_pid) {
             continue;
         }
-    registry.record_terminal(
+        registry.record_terminal(
             &entry.session_id,
             ChildSessionState::Failed,
             Some(GHOST_TERMINAL_SUMMARY.to_string()),
