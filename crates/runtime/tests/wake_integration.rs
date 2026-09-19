@@ -265,7 +265,7 @@ fn wire_consumer(
         spawn_rx,
         "parent-1".into(),
         ws.to_path_buf(),
-        offline_config(),
+        Arc::new(std::sync::RwLock::new(offline_config())),
         Arc::new(std::sync::Mutex::new(vec![Message::user("parent context")])),
         Some(event_tx.clone()),
         registry.clone(),

@@ -1043,12 +1043,18 @@ fn apply_child_routing(
 /// DETACHED (background) child reaches a terminal state so an idle parent
 /// can be woken — foreground spawns and `task_revive` never notify (their
 /// callers already hold the reply).
+///
+/// `config` is a LIVE handle (see [`Supervisor::live_config`]), not a
+/// wiring-time clone: the current value is read at each spawn so children
+/// born after an in-session `/model`, `/provider`, or agent switch inherit
+/// the new routing. The supervisor refreshes the handle after every
+/// successful `apply_agent_profile` / `apply_nca_config`.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_subagent_consumer(
     mut spawn_rx: mpsc::Receiver<SpawnRequest>,
     parent_session_id: String,
     workspace_root: PathBuf,
-    config: NcaConfig,
+    config: Arc<std::sync::RwLock<NcaConfig>>,
     parent_history: Arc<Mutex<Vec<nca_common::message::Message>>>,
     event_tx: Option<tokio::sync::mpsc::Sender<AgentEvent>>,
     registry: std::sync::Arc<crate::subagent_registry::SubagentRegistry>,
@@ -1062,11 +1068,19 @@ pub fn spawn_subagent_consumer(
         while let Some(req) = spawn_rx.recv().await {
             let parent_session_id = parent_session_id.clone();
             let workspace_root = workspace_root.clone();
-            // Sync runtime mounts from the parent's live FS state so that
-            // paths added via `/mount` during the session are inherited by
-            // child sessions. The `config` snapshot captured at consumer
-            // creation does not reflect runtime mounts.
-            let mut config = config.clone();
+            // Snapshot the CURRENT config (read-clone-release — the guard
+            // never crosses an await) so a child spawned after an in-session
+            // `/model`, `/provider`, or agent switch inherits the new
+            // routing; the supervisor refreshes the shared snapshot on
+            // every successful rebuild. Runtime mounts are then synced from
+            // the parent's live FS state (the snapshot's `extra_paths` may
+            // predate a `/mount` performed during the session).
+            let mut config = {
+                let guard = config
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.clone()
+            };
             let live_mounts = parent_fs.mounted_paths();
             if config.extra_paths != live_mounts {
                 config.extra_paths = live_mounts;

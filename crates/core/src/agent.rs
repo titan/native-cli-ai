@@ -162,9 +162,25 @@ impl AgentLoop {
         self.keepalive_profile = profile;
     }
 
-    /// Add a system prompt once at startup.
+    /// Set the session's system prompt, REPLACING any system message
+    /// already in the history (single-system-message model).
+    ///
+    /// This used to be a plain push, so every in-session rebuild (Tab
+    /// profile switch, `/mount`) stacked the new persona's system message
+    /// on top of the old one — stale personas kept steering (and billing)
+    /// every later turn. Replace semantics mirror the resume path
+    /// (`select_resume_messages` in `nca-runtime` drops every persisted
+    /// system message and prepends exactly one fresh prompt).
+    /// Mid-history system notes recorded via [`AgentLoop::record_system_note`]
+    /// are likewise superseded by the next rebuild: a rebuild IS a prompt
+    /// reset, and the note's content was already observed by the turns that
+    /// ran while it was live.
+    ///
+    /// The first call on a fresh history (no system message present) is an
+    /// ordinary prepend and leaves every other message untouched.
     pub fn set_system_prompt(&mut self, prompt: impl Into<String>) {
-        self.messages.push(Message::system(prompt));
+        self.messages.retain(|m| m.role != Role::System);
+        self.messages.insert(0, Message::system(prompt));
     }
 
     /// Replace the LLM provider (e.g. after user switches provider in-session).
@@ -547,6 +563,56 @@ mod tests {
             0,
             None,
         )
+    }
+
+    #[test]
+    fn set_system_prompt_replaces_stacked_persona() {
+        use nca_common::message::MessageContent;
+
+        // Persona-stacking regression: every rebuild (Tab switch, /mount)
+        // used to PUSH a new system message, so switching @oracle → @fixer
+        // left both personas steering (and billing) every later turn.
+        // Replace semantics: exactly one system message — the newest —
+        // at the head, non-system history preserved in order.
+        let (provider, _calls) = ScriptedProvider::new(Vec::new());
+        let mut agent = test_agent(Arc::new(provider));
+
+        agent.set_system_prompt("first persona");
+        agent.messages.push(Message::user("hello"));
+        agent.messages.push(Message::assistant("hi"));
+        agent.messages.push(Message::system("mid-history note"));
+
+        agent.set_system_prompt("second persona");
+        agent.set_system_prompt("third persona");
+
+        let system_count = agent
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, Role::System))
+            .count();
+        assert_eq!(system_count, 1, "exactly one system message after switches");
+        assert_eq!(agent.messages[0].role, Role::System);
+        let MessageContent::Text(text) = &agent.messages[0].content else {
+            panic!("expected text system prompt");
+        };
+        assert_eq!(text, "third persona", "the newest prompt wins");
+        assert!(!text.contains("first persona"));
+        assert!(!text.contains("second persona"));
+        // Non-system history survives the rebuild, in order.
+        assert_eq!(agent.messages.len(), 3);
+        assert_eq!(agent.messages[1].role, Role::User);
+        assert_eq!(agent.messages[2].role, Role::Assistant);
+    }
+
+    #[test]
+    fn set_system_prompt_on_fresh_history_is_plain_prepend() {
+        // Initial-call path (no existing system message): behavior identical
+        // to the old push — the prompt lands at the head of an empty history.
+        let (provider, _calls) = ScriptedProvider::new(Vec::new());
+        let mut agent = test_agent(Arc::new(provider));
+        agent.set_system_prompt("initial prompt");
+        assert_eq!(agent.messages.len(), 1);
+        assert_eq!(agent.messages[0].role, Role::System);
     }
 
     #[tokio::test]

@@ -952,7 +952,7 @@ async fn run_one_shot(
                 spawn_rx,
                 runtime.session_id().to_string(),
                 runtime.workspace_root().to_path_buf(),
-                config.clone(),
+                runtime.live_config(),
                 runtime.spawn_history(),
                 event_tx,
                 runtime.subagent_registry(),

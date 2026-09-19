@@ -129,8 +129,27 @@ pub struct Supervisor {
     /// wiring and delivered through the wake channel; empty for fresh
     /// sessions and clean resumes.
     restart_ghosts: Vec<RestartGhost>,
+    /// Explicit turn fence: `true` for the whole duration of
+    /// [`Supervisor::run_turn_with_images`] (RAII guard, panic-safe).
+    /// [`Supervisor::apply_agent_profile`] and [`Supervisor::apply_nca_config`]
+    /// — the two provider/config rebuild entry points — refuse to run while
+    /// it is set. Today the `&mut self` exclusivity plus the single cmd
+    /// consumer already serialize these against turns by construction; the
+    /// flag turns that implicit convention into an executable contract so a
+    /// future second mutation entry (IPC extension, attach protocol) fails
+    /// loudly instead of silently racing the turn driver's provider calls.
+    turn_in_flight: Arc<AtomicBool>,
+    /// Spawn-time config snapshot shared with the subagent spawn consumer
+    /// (live handle, not a wiring-time clone — the old clone froze the
+    /// provider/model routing at consumer-creation time, so children spawned
+    /// after an in-session `/model` or agent switch inherited stale routing).
+    /// Refreshed by [`Supervisor::apply_agent_profile`] /
+    /// [`Supervisor::apply_nca_config`] after a successful rebuild via
+    /// [`Supervisor::refresh_live_config`]; always mirrors `self.config`.
+    /// Runtime mounts are NOT synced through it — the consumer re-syncs
+    /// those from the live workspace FS at each spawn.
+    live_config: Arc<std::sync::RwLock<NcaConfig>>,
 }
-
 /// Terminal `result_summary` stamped on ghost children by the resume sweep:
 /// the run was cut off by a parent-process restart, not by its own logic.
 pub(crate) const GHOST_TERMINAL_SUMMARY: &str =
@@ -184,7 +203,7 @@ async fn sweep_restart_ghosts(
         if child.meta.pid == Some(current_pid) {
             continue;
         }
-        registry.record_terminal(
+    registry.record_terminal(
             &entry.session_id,
             ChildSessionState::Failed,
             Some(GHOST_TERMINAL_SUMMARY.to_string()),
@@ -508,6 +527,39 @@ fn resolve_provider(
     }
 }
 
+/// RAII marker for "a turn is currently running on this supervisor".
+///
+/// [`Supervisor::run_turn_with_images`] acquires it for the whole turn —
+/// including the overflow-retry second attempt and every await in between.
+/// `Drop` clears the flag on BOTH the normal path and a panic unwind, so a
+/// panicking turn can never wedge every later agent switch behind a stuck
+/// fence. Owns an `Arc` clone (not a borrow) so holding the guard never
+/// pins the supervisor borrow across the turn's awaits.
+struct TurnInFlightGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl TurnInFlightGuard {
+    fn acquire(flag: Arc<AtomicBool>) -> Self {
+        flag.store(true, Ordering::SeqCst);
+        Self { flag }
+    }
+}
+
+impl Drop for TurnInFlightGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Fence refusal shared by [`Supervisor::apply_agent_profile`] and
+/// [`Supervisor::apply_nca_config`]: provider/config rebuilds are deferred
+/// while a turn is running. Classification is `Configuration` — the session
+/// is in a transient state the caller (UI, IPC) can retry once idle.
+fn turn_in_flight_err() -> ProviderError {
+    ProviderError::Configuration("agent switch deferred: turn in flight".into())
+}
+
 impl Supervisor {
     /// Create a new supervised session. This sets up the agent loop, IPC server,
     /// event channels, and persists initial session metadata.
@@ -825,6 +877,12 @@ impl Supervisor {
         let turn_commit_wired = Arc::new(AtomicBool::new(false));
         let turn_commit_tx = Some((commit_tx, turn_commit_wired.clone()));
 
+        // Turn fence (see field docs) + spawn-time config snapshot: both
+        // start in their neutral state — no turn running, snapshot == the
+        // config this supervisor was created with.
+        let turn_in_flight = Arc::new(AtomicBool::new(false));
+        let live_config = Arc::new(std::sync::RwLock::new(config.clone()));
+
         let sup = Self {
             session_id,
             workspace_root,
@@ -868,6 +926,8 @@ impl Supervisor {
             turn_commit_rx: Some(commit_rx),
             turn_commit_wired,
             restart_ghosts: Vec::new(),
+            turn_in_flight,
+            live_config,
         };
         sup.save().await.map_err(ProviderError::Other)?;
         sup.update_last_session()
@@ -1168,6 +1228,46 @@ impl Supervisor {
         std::mem::take(&mut self.restart_ghosts)
     }
 
+    /// Whether a turn is currently running on this supervisor. Read side of
+    /// the turn fence: while `true`, [`Self::apply_agent_profile`] /
+    /// [`Self::apply_nca_config`] refuse with a deferred error.
+    pub fn is_turn_in_flight(&self) -> bool {
+        self.turn_in_flight.load(Ordering::SeqCst)
+    }
+
+    /// Handle to the turn-fence flag (mirrors `AgentLoop::cancel_handle`):
+    /// the flag is owned by [`Supervisor::run_turn_with_images`] via its
+    /// RAII guard; the handle exists so embedders and tests can OBSERVE the
+    /// fence mid-turn without borrowing the supervisor.
+    pub fn turn_in_flight_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.turn_in_flight)
+    }
+
+    /// Live config snapshot shared with the subagent spawn consumer.
+    ///
+    /// Unlike the old wiring-time `NcaConfig` clone (which froze provider /
+    /// model routing at consumer creation), this handle is refreshed by
+    /// [`apply_agent_profile`] / [`apply_nca_config`], so a child spawned
+    /// after an in-session `/model`, `/provider`, or agent switch builds its
+    /// provider from the CURRENT config. Consumers must read-clone-release
+    /// (never hold the guard across an await).
+    pub fn live_config(&self) -> Arc<std::sync::RwLock<NcaConfig>> {
+        Arc::clone(&self.live_config)
+    }
+
+    /// Re-point the shared spawn-time config snapshot at the current
+    /// `self.config`. Called after every successful provider/config rebuild
+    /// (`apply_agent_profile`, `apply_nca_config`). Poison-tolerant: a
+    /// panicking consumer clone never poisons this lock in practice, and
+    /// stale-but-readable beats unwritable.
+    fn refresh_live_config(&self) {
+        let mut guard = self
+            .live_config
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = self.config.clone();
+    }
+
     pub async fn run_turn(&mut self, prompt: &str) -> Result<String, ProviderError> {
         self.run_turn_with_images(prompt, &[]).await
     }
@@ -1188,11 +1288,16 @@ impl Supervisor {
     }
 
     /// Like [`run_turn`], but attaches on-disk images (paths relative to workspace) for vision models.
+    ///
+    /// Fenced: the turn holds the [`TurnInFlightGuard`] for its entire
+    /// duration, so [`apply_agent_profile`] / [`apply_nca_config`] fail
+    /// fast with a deferred error instead of racing the turn driver.
     pub async fn run_turn_with_images(
         &mut self,
         prompt: &str,
         attachments: &[nca_common::message::ImageAttachment],
     ) -> Result<String, ProviderError> {
+        let _turn_fence = TurnInFlightGuard::acquire(Arc::clone(&self.turn_in_flight));
         if !attachments.is_empty()
             && !nca_common::model_caps::model_accepts_native_images(
                 self.config.provider.default,
@@ -1791,7 +1896,15 @@ impl Supervisor {
     ///   (a resume with a dead recorded name must not hard-fail), but the
     ///   honest `None` lets callers report the fallback instead of a
     ///   false "switched" success.
-    /// - `Err` — the provider rebuild failed.
+    /// - `Err` — the provider rebuild failed, or a turn is currently in
+    ///   flight (deferred: see [`Supervisor::is_turn_in_flight`]).
+    ///
+    /// Turn fence: refuses with [`turn_in_flight_err`] while a turn runs.
+    /// Today `&mut self` exclusivity plus the single cmd consumer make a
+    /// concurrent call unreachable; the explicit check keeps it that way by
+    /// contract, not convention — a future second mutation entry (IPC
+    /// extension, attach protocol) gets a loud retryable error instead of
+    /// silently swapping the provider under a running turn.
     ///
     /// This rebuilds the LLM provider if the profile changes provider/model.
     /// An injected test provider (via `SupervisorConfig::provider`) is discarded here.
@@ -1799,6 +1912,9 @@ impl Supervisor {
         &mut self,
         name: Option<&str>,
     ) -> Result<Option<String>, ProviderError> {
+        if self.is_turn_in_flight() {
+            return Err(turn_in_flight_err());
+        }
         // Start from the clean base config (before any agent overrides).
         let config = self.base_config.clone();
         let profile = name.and_then(|n| config.agent_profile(n).cloned());
@@ -1858,6 +1974,9 @@ impl Supervisor {
         self.active_agent_name = name.map(str::to_string);
         self.rebuild_system_prompt();
         self.rebuild_context_manager_sync();
+        // `self.config` changed (back to the clean base): children spawned
+        // from now on must route against it, not the wiring-time snapshot.
+        self.refresh_live_config();
         Ok(applied)
     }
 
@@ -1909,7 +2028,14 @@ impl Supervisor {
 
     /// Apply a new [`NcaConfig`] and rebuild the active LLM provider (in-session provider switch).
     /// An injected test provider (via `SupervisorConfig::provider`) is discarded here.
+    ///
+    /// Turn fence: same contract as [`apply_agent_profile`] — refuses with a
+    /// deferred error while a turn is in flight instead of swapping the
+    /// provider/config under the running turn driver.
     pub fn apply_nca_config(&mut self, mut config: NcaConfig) -> Result<(), ProviderError> {
+        if self.is_turn_in_flight() {
+            return Err(turn_in_flight_err());
+        }
         let provider = build_provider(&config)?;
         // Live mounts win: callers may pass a snapshot taken before a `/mount`,
         // and adopting it verbatim lets the next whole-config save erase the
@@ -1928,6 +2054,9 @@ impl Supervisor {
         agent.replace_provider(provider);
         agent.set_keepalive_profile(cache_keepalive::resolve_profile(provider_kind));
         self.rebuild_context_manager_sync();
+        // Children spawned from now on route against the NEW config (the
+        // spawn consumer reads this snapshot at consumption time).
+        self.refresh_live_config();
         Ok(())
     }
 
