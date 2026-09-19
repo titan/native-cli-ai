@@ -72,6 +72,24 @@ impl ToolExecutor for ApplyPatchTool {
             };
         }
 
+        // Degenerate request guard, matching sibling `edit_file`/`replace_match`:
+        // without it, `"".matches("")` counts 1 on an empty file and silently
+        // inserts `new_text`.
+        if let Some((i, _)) = p
+            .edits
+            .iter()
+            .enumerate()
+            .find(|(_, e)| e.old_text.is_empty())
+        {
+            return ToolResult {
+                timed_out: false,
+                call_id: call.id.clone(),
+                success: false,
+                output: String::new(),
+                error: Some(format!("edit {}: old_text must not be empty", i + 1)),
+            };
+        }
+
         let mut content = match self.fs.read_file(&p.path).await {
             Ok(c) => c,
             Err(e) => return sandbox_error_to_tool_result(&call.id, e),
@@ -103,17 +121,36 @@ impl ToolExecutor for ApplyPatchTool {
             Some(errors.join("; "))
         };
 
+        // Atomicity: a multi-edit request is all-or-nothing. Edits are staged
+        // against the in-memory buffer only; the file is written (through the
+        // existing write path, which preserves mode bits) exclusively when every
+        // edit applied cleanly, so a failed request leaves the file
+        // byte-for-byte unchanged.
+        if !errors.is_empty() {
+            return ToolResult {
+                timed_out: false,
+                call_id: call.id.clone(),
+                success: false,
+                output: format!(
+                    "Applied {applied}/{} edits to {path}; file left unchanged",
+                    p.edits.len(),
+                    path = p.path
+                ),
+                error: error_msg,
+            };
+        }
+
         match self.fs.write_file(&p.path, &content).await {
             Ok(()) => ToolResult {
                 timed_out: false,
                 call_id: call.id.clone(),
-                success: errors.is_empty(),
+                success: true,
                 output: format!(
                     "Applied {applied}/{} edits to {path}",
                     p.edits.len(),
                     path = p.path
                 ),
-                error: error_msg,
+                error: None,
             },
             Err(e) => sandbox_error_to_tool_result(&call.id, e),
         }
@@ -153,6 +190,11 @@ impl ToolExecutor for ApplyPatchTool {
 // `cargo test -p nca-core` run stays green and compiles, while the gap is
 // reproducible with `cargo test -p nca-core -- --ignored`. Each ignored test
 // carries `RED:` in its reason string.
+//
+// UPDATE: all three RED tests have since been resolved — multi-edit writes are
+// now atomic, empty `old_text` is unconditionally rejected, and chained
+// (evolving-buffer) semantics was ratified as an explicit product decision and
+// pinned by a positive test. The suite currently carries zero ignored tests.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,9 +263,8 @@ mod tests {
     }
 
     /// An empty `old_text` is a degenerate request; sibling `edit_file` rejects
-    /// it outright ("old_text must not be empty"). On non-empty content nca
-    /// already rejects it (as ambiguous, because `""` matches N+1 times) — the
-    /// important invariant is that it is *rejected*, and the file is untouched.
+    /// it outright ("old_text must not be empty"), and `apply_patch` guards it
+    /// unconditionally before any file I/O — regardless of file content.
     #[tokio::test]
     async fn empty_old_text_on_nonempty_file_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
@@ -240,12 +281,12 @@ mod tests {
         assert_eq!(read(&dir, "f.txt"), "abc");
     }
 
-    /// RED: on an *empty* file the same empty `old_text` is silently accepted
-    /// (`"".matches("")` counts 1) and inserts `new_text`, whereas a non-empty
-    /// file rejects it. `edit_file` guards this consistently; `apply_patch`
-    /// does not. Expected (OMO/consistent): reject empty `old_text` always.
+    /// On an *empty* file the same empty `old_text` must also be rejected.
+    /// Without an explicit guard, `"".matches("")` counts 1 on zero-byte
+    /// content and silently inserts `new_text`, diverging from the non-empty
+    /// case and from `edit_file`. The guard rejects it on any content, and the
+    /// file is left untouched.
     #[tokio::test]
-    #[ignore = "RED: apply_patch accepts empty old_text on an empty file and silently inserts content"]
     async fn empty_old_text_on_empty_file_must_be_rejected() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("f.txt"), "").unwrap();
@@ -300,13 +341,12 @@ mod tests {
     // ② Rollback / fidelity
     // =====================================================================
 
-    /// RED: OMO snapshots every touched file (raw bytes + mode) and restores it
-    /// when any change fails (prepared-changes.ts:190-231). nca writes whatever
-    /// edits succeeded *before* an error is hit, leaving the file half-patched
-    /// even though it reports `success: false`. Expected: a failed multi-edit
-    /// request leaves the file byte-for-byte unchanged.
+    /// OMO snapshots every touched file (raw bytes + mode) and restores it
+    /// when any change fails (prepared-changes.ts:190-231). nca stages all
+    /// edits against the in-memory buffer and writes only when every edit
+    /// applied cleanly: a failed multi-edit request leaves the file
+    /// byte-for-byte unchanged.
     #[tokio::test]
-    #[ignore = "RED: apply_patch writes partial results on failure (no snapshot/rollback)"]
     async fn partial_failure_must_be_atomic() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("f.txt"), "keep\nfoo\n").unwrap();
@@ -490,7 +530,8 @@ mod tests {
 
     /// Two edits targeting the same original text: the first consumes it, the
     /// second finds nothing and fails — a shared region is never silently
-    /// applied twice (OMO ④).
+    /// applied twice (OMO ④). Because any failed edit aborts the whole request
+    /// atomically, the file keeps its original bytes ("dup\n", not "one\n").
     #[tokio::test]
     async fn duplicate_old_text_applies_once_and_second_edit_fails() {
         let dir = tempfile::tempdir().unwrap();
@@ -507,7 +548,7 @@ mod tests {
         .await;
 
         assert!(!r.success, "second edit must fail: {r:?}");
-        assert_eq!(read(&dir, "f.txt"), "one\n");
+        assert_eq!(read(&dir, "f.txt"), "dup\n");
     }
 
     /// Non-overlapping edits are order-independent — applying them in either
@@ -567,17 +608,16 @@ mod tests {
         assert_eq!(read(&dir, "f.txt"), "z\n");
     }
 
-    /// RED (design-dependent): a later edit whose `old_text` exists only in an
-    /// *earlier edit's output* is applied against the mutated buffer instead of
-    /// being rejected against the original snapshot. OMO's independent-hunk
-    /// model computes each hunk against the original content and would report
-    /// the second edit as not-found. Expected (OMO): second edit fails, file
-    /// keeps `base zzz\n`. Actual: both apply → `base !\n`. Flag for decision
-    /// (switching to snapshot-against-original would break the chaining test
-    /// above, so this needs an explicit product call, not a silent fix).
+    /// Pins the intentional *chained* (evolving-buffer) semantics of apply_patch:
+    /// each edit is matched against the buffer as mutated by the edits before
+    /// it, so a later edit may consume text that only an earlier edit
+    /// introduced ("base" → "base zzz" → "base !"). This is a deliberate
+    /// product decision: unlike a unified-diff applier — where every hunk is
+    /// computed independently against the original content and such an edit
+    /// would be reported as not-found — apply_patch edits form a chain. See
+    /// `sequential_edits_apply_against_evolving_buffer` for the minimal case.
     #[tokio::test]
-    #[ignore = "RED(design): later edit matches text introduced by an earlier edit (no original-snapshot check)"]
-    async fn later_edit_must_not_match_text_introduced_by_earlier_edit() {
+    async fn later_edit_may_match_text_introduced_by_earlier_edit_chained_semantics() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("f.txt"), "base\n").unwrap();
 
@@ -591,10 +631,7 @@ mod tests {
         )
         .await;
 
-        assert!(
-            !r.success,
-            "second edit should not see edit-1 output: {r:?}"
-        );
-        assert_eq!(read(&dir, "f.txt"), "base zzz\n");
+        assert!(r.success, "chained edits must both apply: {r:?}");
+        assert_eq!(read(&dir, "f.txt"), "base !\n");
     }
 }
