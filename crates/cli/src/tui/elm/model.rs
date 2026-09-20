@@ -24,7 +24,7 @@ use crate::tui::busy_indicator;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
 // ── Tick drain budget ───────────────────────────────────────────
@@ -56,6 +56,23 @@ const BRIDGE_DRAIN_BUDGET: usize = 48;
 /// between ticks, so input stays responsive. 4096/tick ≈ 100k msg/s: even a
 /// very long session replay completes within a handful of ticks.
 const BRIDGE_BULK_DRAIN_BUDGET: usize = 4096;
+
+/// Hard wall-clock slice for a single `drain_bridge` call.
+///
+/// The bulk budget is an *event-count* cap, not a time cap: cheap replay events
+/// drain quickly, but a flood of expensive events can still stall the tick and
+/// starve the 40 ms crossterm input poll. The drain therefore also stops as soon
+/// as this slice elapses; the remainder drains on the next tick.
+///
+/// The slice must stay above the time it takes to drain
+/// [`BRIDGE_BULK_DRAIN_BUDGET`] *cheap* events (replay), or the count budget
+/// would become unreachable and a resumed session's one-shot replay would
+/// regress to frame-by-frame playback. Draining 4096 cheap events (one block
+/// push each) measures ~14 ms in an unoptimized test build, so the slice is set
+/// to 25 ms (~1.8× headroom): cheap replay still reaches the full count budget,
+/// while a flood of *expensive* events (e.g. bursts of large block mutations)
+/// is bounded to well under one frame.
+const BRIDGE_DRAIN_TIME_SLICE: Duration = Duration::from_millis(25);
 
 // ── Side-effect channels ─────────────────────────────────────────
 
@@ -464,10 +481,17 @@ impl NcaModel {
         } else {
             BRIDGE_DRAIN_BUDGET
         };
+        let started = Instant::now();
         for _ in 0..budget {
             match self.bridge_rx.try_recv() {
                 Ok(msg) => self.update_feedback(msg),
                 Err(_) => break,
+            }
+            // Time-slice guard: bound the wall-clock work per tick, not just
+            // the event count, so a live event flood can never starve the
+            // input poll.
+            if started.elapsed() > BRIDGE_DRAIN_TIME_SLICE {
+                break;
             }
         }
     }
