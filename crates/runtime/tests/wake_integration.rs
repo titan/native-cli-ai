@@ -14,12 +14,12 @@
 //!   NO additional wake (the reviving parent is mid-turn holding the
 //!   reply);
 //! - two background children terminating inside the debounce window
-//!   produce exactly ONE wake;
+//!   produce exactly ONE wake (a composite carrying BOTH terminals);
 //! - P4 wiring chain: `WaitForUserTool` built with the scheduler's `pause`
 //!   closure (exactly how `run_with_tui` wires it) holds/defers wakes;
 //!   `note_input` (the TUI Submit choke point) flushes the deferred
-//!   terminal immediately, then exactly one wake fires for a later
-//!   terminal.
+//!   terminal(s) as one composite immediately, then exactly one wake
+//!   fires for a later terminal.
 //!
 //! Hermetic, same scaffolding as `background_spawn.rs`/`task_control.rs`:
 //! gated scripted providers injected through the `child_provider` seam of
@@ -648,14 +648,20 @@ async fn two_background_terminals_in_window_coalesce_into_one_wake() {
         );
     }
 
-    // Exactly ONE reconciled wake emerges for the pair.
+    // Exactly ONE reconciled wake emerges for the pair — a COMPOSITE
+    // carrying BOTH children (the old first-terminal-wins coalescing is
+    // gone).
     let text = tokio::time::timeout(Duration::from_secs(10), wake_rx.recv())
         .await
         .expect("one wake must fire for the coalesced terminals")
         .expect("wake channel must not be dropped");
     assert!(
-        text.contains("fixer-a") || text.contains("fixer-b"),
-        "wake carries one of the child refs: {text}"
+        text.contains("fixer-a") && text.contains("fixer-b"),
+        "composite wake carries BOTH child refs: {text}"
+    );
+    assert!(
+        text.contains("2 background tasks reached terminal states"),
+        "composite wake header counts both terminals: {text}"
     );
     assert_silent(
         &mut wake_rx,
@@ -668,7 +674,7 @@ async fn two_background_terminals_in_window_coalesce_into_one_wake() {
 /// P4 wiring chain, without a full TUI: build the tool with the scheduler's
 /// `pause` closure exactly as `run_with_tui` does, execute it, and prove
 /// the defer + flush lifecycle end to end on real tokio time — the paused
-/// terminal is held in the deferred-wake slot (not dropped) and flushed
+/// terminal is held in the unseen-notes queue (not dropped) and flushed
 /// immediately by the next `note_input`.
 #[tokio::test(flavor = "multi_thread")]
 async fn wait_for_user_defers_wakes_until_next_user_input() {
@@ -687,7 +693,7 @@ async fn wait_for_user_defers_wakes_until_next_user_input() {
     assert!(res.success, "error: {:?}", res.error);
     assert!(res.output.contains("Standing by for the user."));
 
-    // A background terminal while paused: held in the deferred-wake slot —
+    // A background terminal while paused: held in the unseen-notes queue —
     // NO wake fires, even far past the debounce window.
     sched.notify_terminal("fixer-x", "completed", "while standing by");
     assert_silent(
