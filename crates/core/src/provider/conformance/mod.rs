@@ -1,8 +1,7 @@
 //! Conformance fixtures + pinning harness for the OpenAI-compatible SSE parser.
 //!
-//! Phase 1 covers only the OpenAI `chat.completions` wire format. The
-//! Anthropic side is deferred: the extracted `run_anthropic_sse` core now
-//! exists, but no anthropic fixtures have been pinned yet.
+//! The Anthropic Messages wire format has a mirrored suite in [`anthropic`]
+//! (see that module's docs for its fixtures and pinned gaps).
 //!
 //! ## Layout
 //!
@@ -39,6 +38,8 @@
 //!    glyph into U+FFFD.
 
 use serde_json::Value;
+
+mod anthropic;
 
 use crate::provider::openai_compat::run_openai_sse;
 use crate::provider::test_support::collect_chunks;
