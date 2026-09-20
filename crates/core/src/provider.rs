@@ -41,6 +41,39 @@ pub(crate) fn format_error_chain(err: &dyn std::error::Error) -> String {
     parts.join(" → ")
 }
 
+/// Byte-stream error payload consumed by the SSE compat core loops.
+///
+/// Captures everything the stream parsers log and propagate about a
+/// transport-level body-stream failure — the `Display` message, the full
+/// source chain, and reqwest's transport classification flags — decoupled
+/// from `reqwest` so the "bytes → StreamChunk" core loops in
+/// [`openai_compat`](self::openai_compat) / [`anthropic_compat`](self::anthropic_compat)
+/// can be unit-tested against plain in-memory byte streams without real HTTP.
+#[derive(Debug, Clone)]
+pub(crate) struct ByteStreamError {
+    /// `Display` of the underlying transport error.
+    pub display: String,
+    /// Full source chain, pre-formatted by [`format_error_chain`].
+    pub chain: String,
+    pub is_timeout: bool,
+    pub is_connect: bool,
+    pub is_request: bool,
+    pub is_body: bool,
+}
+
+impl From<reqwest::Error> for ByteStreamError {
+    fn from(err: reqwest::Error) -> Self {
+        Self {
+            display: err.to_string(),
+            chain: format_error_chain(&err),
+            is_timeout: err.is_timeout(),
+            is_connect: err.is_connect(),
+            is_request: err.is_request(),
+            is_body: err.is_body(),
+        }
+    }
+}
+
 /// A streamed chunk from the provider.
 #[derive(Debug, Clone)]
 pub enum StreamChunk {
