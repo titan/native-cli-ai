@@ -1537,6 +1537,7 @@ impl TranscriptState {
 
 #[cfg(test)]
 mod tests {
+    use super::super::transcript_render::{cached_block_lines, wrap_text};
     use super::*;
     use nca_common::event::{AgentEvent, BusyState};
 
@@ -2120,5 +2121,593 @@ mod tests {
             "the compaction bracket must stay fully incremental"
         );
         assert_eq!(t.blocks.len(), 2, "seed message + one compacted block");
+    }
+
+    // ── StreamingWrap incremental wrap == full wrap_text ──────────
+    // `StreamingWrap` wraps only the paragraphs a delta completes plus the
+    // trailing partial paragraph, so per-delta work is O(delta) instead of
+    // O(buffer). These tests pin the invariant that it is byte-for-byte
+    // equivalent to calling `wrap_text` on the whole accumulated buffer —
+    // including the empty-string and all-whitespace fallbacks and the
+    // mid-stream width-change rebuild.
+
+    /// Deterministic LCG (no external deps) for reproducible adversarial cases.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 11
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// Assert the incremental cache mirrors `wrap_text(full, w)` exactly —
+    /// both the line count and every individual line (and emptiness).
+    fn assert_streaming_wrap_equivalent(wrap: &mut StreamingWrap, full: &str, w: usize) {
+        wrap.ensure(full, w);
+        let expected = wrap_text(full, w);
+        assert_eq!(
+            wrap.len(),
+            expected.len(),
+            "line count mismatch: full={full:?} w={w}"
+        );
+        for (i, exp) in expected.iter().enumerate() {
+            assert_eq!(
+                wrap.line(i),
+                exp.as_str(),
+                "line {i} mismatch: full={full:?} w={w}"
+            );
+        }
+        assert_eq!(
+            wrap.is_empty(),
+            full.is_empty(),
+            "emptiness mismatch: full={full:?}"
+        );
+    }
+
+    /// Feed a `(width, delta)` sequence through a fresh `StreamingWrap`,
+    /// checking equivalence to `wrap_text` after every append (the reader path
+    /// also calls `ensure`, so a width-only change is exercised too).
+    fn check_delta_sequence(steps: &[(usize, String)]) {
+        let mut wrap = StreamingWrap::new();
+        let mut full = String::new();
+        for (w, delta) in steps {
+            wrap.append(delta, *w);
+            full.push_str(delta);
+            assert_streaming_wrap_equivalent(&mut wrap, &full, *w);
+        }
+    }
+
+    #[test]
+    fn streaming_wrap_matches_wrap_text_for_adversarial_deltas() {
+        let w = 30usize;
+
+        // Empty input: exactly one empty line, matching `wrap_text("")`.
+        check_delta_sequence(&[(w, String::new())]);
+
+        // CJK with no spaces: hard-split, no word boundaries.
+        let cjk = "中文没有空格的长句子需要逐字硬切分";
+        let cjk_chars: Vec<char> = cjk.chars().collect();
+        check_delta_sequence(&[
+            (w, cjk_chars[..5].iter().collect()),
+            (w, cjk_chars[5..9].iter().collect()),
+            (w, cjk_chars[9..].iter().collect()),
+        ]);
+
+        // Multi-byte emoji fed one char at a time (never split mid-scalar).
+        let emoji: Vec<(usize, String)> =
+            "😀🎉🌟✨🚀".chars().map(|c| (w, c.to_string())).collect();
+        check_delta_sequence(&emoji);
+
+        // A word split across two deltas (mid-word / mid-token cut).
+        check_delta_sequence(&[
+            (w, "supercalifragilistic".to_string()),
+            (w, "expialidocious yes".to_string()),
+        ]);
+
+        // A word whose width lands exactly on the wrap boundary, plus one over.
+        check_delta_sequence(&[(w, "e".repeat(w)), (w, " next".to_string())]);
+        check_delta_sequence(&[(w, "e".repeat(w + 1))]);
+
+        // Single-newline deltas, consecutive newlines, empty paragraphs.
+        check_delta_sequence(&[
+            (w, "\n".to_string()),
+            (w, "\n".to_string()),
+            (w, "text".to_string()),
+        ]);
+        check_delta_sequence(&[(w, "a\n\n\nb".to_string())]);
+        check_delta_sequence(&[
+            (w, "p1\n".to_string()),
+            (w, "p2\n".to_string()),
+            (w, "\n".to_string()),
+        ]);
+
+        // Whitespace-only paragraph (fallback semantics) then real text.
+        check_delta_sequence(&[(w, "   ".to_string()), (w, "x".to_string())]);
+        check_delta_sequence(&[(w, " \n ".to_string())]);
+
+        // Width changes mid-stream must trigger `rebuild_from`.
+        check_delta_sequence(&[
+            (
+                w,
+                "alpha beta gamma delta epsilon zeta eta theta iota kappa".to_string(),
+            ),
+            (24, " lambda mu nu xi omicron pi rho sigma tau".to_string()),
+            (w, " upsilon phi chi psi omega".to_string()),
+        ]);
+
+        // A width change observed by a *read* (`ensure`) rather than an append.
+        let mut wrap = StreamingWrap::new();
+        let text = "alpha beta gamma delta epsilon zeta eta theta";
+        wrap.append(text, 30);
+        assert_streaming_wrap_equivalent(&mut wrap, text, 20);
+        assert_streaming_wrap_equivalent(&mut wrap, text, 30);
+    }
+
+    #[test]
+    fn streaming_wrap_matches_wrap_text_under_fuzz() {
+        const TOKENS: &[&str] = &[
+            "hello",
+            "world",
+            "the quick brown fox jumps over the lazy dog",
+            "a",
+            "ab",
+            "abc",
+            "supercalifragilisticexpialidocious",
+            "中文没有空格的长句子需要硬切分",
+            "汉字内容",
+            "日本語のテキスト",
+            "😀",
+            "🎉🎉",
+            "é",
+            "naïve café",
+            "  ",
+            " ",
+            "\t",
+            "\n",
+            "\n\n",
+            "\n\n\n",
+            "word",
+            "= ",
+            "->",
+            "x",
+            "yyyyyyyyyyyyyyyy",
+        ];
+        const WIDTHS: &[usize] = &[20, 21, 24, 30, 40, 60, 78, 80, 100];
+
+        for case in 0..900u64 {
+            let mut rng = Lcg::new(0x9E37_79B9_7F4A_7C15 ^ case.wrapping_mul(0x0001_0000_0001));
+            let mut width = WIDTHS[rng.below(WIDTHS.len())];
+            let mut full = String::new();
+            let mut wrap = StreamingWrap::new();
+            let mut steps = 0usize;
+            while steps < 12 && full.len() < 320 {
+                steps += 1;
+                // Occasionally resize mid-stream (forces `rebuild_from`).
+                if rng.below(6) == 0 {
+                    width = WIDTHS[rng.below(WIDTHS.len())];
+                }
+                let token: String = match rng.below(10) {
+                    0 => "e".repeat(width),
+                    1 => "e".repeat(width + 1),
+                    2 => "中".repeat(width / 3 + 2),
+                    3 => format!("{} f", "e".repeat(width.saturating_sub(2))),
+                    _ => TOKENS[rng.below(TOKENS.len())].to_string(),
+                };
+                // Append whole, or split into two halves at a char boundary so
+                // words / multi-byte runs are cut across deltas.
+                if token.chars().count() >= 2 && rng.below(3) == 0 {
+                    let count = token.chars().count();
+                    let at = 1 + rng.below(count - 1);
+                    let byte = token
+                        .char_indices()
+                        .nth(at)
+                        .map(|(b, _)| b)
+                        .unwrap_or(token.len());
+                    let (head, tail) = token.split_at(byte);
+                    for piece in [head, tail] {
+                        wrap.append(piece, width);
+                        full.push_str(piece);
+                        assert_streaming_wrap_equivalent(&mut wrap, &full, width);
+                    }
+                } else {
+                    wrap.append(&token, width);
+                    full.push_str(&token);
+                    assert_streaming_wrap_equivalent(&mut wrap, &full, width);
+                }
+            }
+        }
+    }
+
+    // ── StreamingWrap reset at every buffer-clear point ───────────
+    // The wrap cache mirrors a specific streaming buffer; when that buffer is
+    // cleared (commit, tool flush, external set) the cache must be reset too,
+    // or stale wrapped lines would leak into the next streaming turn.
+
+    #[test]
+    fn streaming_wrap_is_cleared_at_every_stream_reset_point() {
+        let w = 40usize;
+
+        // 1) Committing a user message clears the assistant wrap.
+        let mut t = TranscriptState::new();
+        t.last_width = w as u16;
+        for d in ["alpha ", "beta ", "gamma delta"] {
+            t.apply_event(&AgentEvent::TokensStreamed { delta: d.into() });
+        }
+        assert!(
+            !t.streaming_assistant_wrap.is_empty(),
+            "wrap must track the live stream"
+        );
+        t.apply_event(&AgentEvent::MessageReceived {
+            role: "user".into(),
+            content: "next prompt".into(),
+            steering: false,
+        });
+        assert!(
+            t.streaming_assistant_wrap.is_empty(),
+            "user commit must reset the assistant wrap"
+        );
+        // A fresh delta must wrap exactly — no stale lines carried over.
+        t.apply_event(&AgentEvent::TokensStreamed {
+            delta: "fresh".into(),
+        });
+        assert_eq!(
+            t.streaming_assistant_wrap.len(),
+            wrap_text("fresh", w).len()
+        );
+        assert_eq!(t.streaming_assistant_wrap.line(0), "fresh");
+
+        // 2) Committing an assistant message clears reasoning + assistant wraps.
+        let mut t = TranscriptState::new();
+        t.last_width = w as u16;
+        t.apply_event(&AgentEvent::ReasoningStreamed {
+            delta: "thinking hard".into(),
+        });
+        t.apply_event(&AgentEvent::TokensStreamed {
+            delta: "answer text".into(),
+        });
+        assert!(!t.streaming_reasoning_wrap.is_empty());
+        assert!(!t.streaming_assistant_wrap.is_empty());
+        t.apply_event(&AgentEvent::MessageReceived {
+            role: "assistant".into(),
+            content: "final answer".into(),
+            steering: false,
+        });
+        assert!(
+            t.streaming_reasoning_wrap.is_empty(),
+            "assistant commit must reset the reasoning wrap"
+        );
+        assert!(
+            t.streaming_assistant_wrap.is_empty(),
+            "assistant commit must reset the assistant wrap"
+        );
+
+        // 3) flush_stream_before_tool clears both wraps.
+        let mut t = TranscriptState::new();
+        t.last_width = w as u16;
+        t.apply_event(&AgentEvent::ReasoningStreamed {
+            delta: "reason".into(),
+        });
+        t.apply_event(&AgentEvent::TokensStreamed {
+            delta: "text".into(),
+        });
+        t.apply_event(&AgentEvent::ToolCallStarted {
+            call_id: "c".into(),
+            tool: "bash".into(),
+            input: serde_json::json!({ "command": "true" }),
+        });
+        assert!(
+            t.streaming_reasoning_wrap.is_empty(),
+            "tool flush must reset the reasoning wrap"
+        );
+        assert!(
+            t.streaming_assistant_wrap.is_empty(),
+            "tool flush must reset the assistant wrap"
+        );
+
+        // 4) External set_streaming_* replaces (Some) / clears (None) the wrap.
+        let mut t = TranscriptState::new();
+        t.set_streaming_assistant(Some("hello world".into()));
+        assert!(!t.streaming_assistant_wrap.is_empty());
+        t.streaming_assistant_wrap.ensure("hello world", 78);
+        assert_eq!(
+            t.streaming_assistant_wrap.len(),
+            wrap_text("hello world", 78).len(),
+            "a set buffer must wrap exactly on first read"
+        );
+        t.set_streaming_assistant(None);
+        assert!(
+            t.streaming_assistant_wrap.is_empty(),
+            "set(None) must clear the assistant wrap"
+        );
+        t.set_streaming_reasoning(Some("deep thought".into()));
+        assert!(!t.streaming_reasoning_wrap.is_empty());
+        t.set_streaming_reasoning(None);
+        assert!(
+            t.streaming_reasoning_wrap.is_empty(),
+            "set(None) must clear the reasoning wrap"
+        );
+    }
+
+    // ── Committed-block content cache ─────────────────────────────
+    // `content_cache` memoizes each block's wrapped primary text. It must stay
+    // index-aligned with `blocks`, invalidate the mutated slot on in-place
+    // mutation, and drop *every* slot when the render width changes.
+
+    #[test]
+    fn content_cache_stays_aligned_and_invalidates_on_mutation() {
+        let mut t = TranscriptState::new();
+        let events = [
+            AgentEvent::MessageReceived {
+                role: "assistant".into(),
+                content: "first block text".into(),
+                steering: false,
+            },
+            AgentEvent::MessageReceived {
+                role: "assistant".into(),
+                content: "second block text".into(),
+                steering: false,
+            },
+            AgentEvent::TokensStreamed {
+                delta: "stream".into(),
+            },
+            AgentEvent::ToolCallStarted {
+                call_id: "c".into(),
+                tool: "bash".into(),
+                input: serde_json::json!({ "command": "x" }),
+            },
+            AgentEvent::ToolOutputChunk {
+                call_id: "c".into(),
+                delta: "chunk".into(),
+            },
+            AgentEvent::ToolCallCompleted {
+                call_id: "c".into(),
+                output: tool_result("c", "done"),
+                duration_ms: 3,
+            },
+        ];
+        for ev in &events {
+            t.apply_event(ev);
+            assert_eq!(
+                t.content_cache.len(),
+                t.blocks.len(),
+                "content_cache must stay index-aligned with blocks"
+            );
+        }
+
+        // Populate the cache via the full-build path the renderer uses.
+        let _ = t.build_all_lines(78);
+        assert_eq!(t.content_cache_width, 78);
+        let (idx, text) = t
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(i, b)| match b {
+                DisplayBlock::Assistant(s) | DisplayBlock::User(s) => Some((i, s.clone())),
+                _ => None,
+            })
+            .expect("fixture must contain a committed text block");
+        assert_eq!(
+            t.content_cache[idx].as_deref(),
+            Some(&wrap_text(&text, 78)),
+            "cache hit must hold the wrapped text"
+        );
+
+        // In-place mutation drops the slot's memoized lines.
+        t.block_mutated_at(idx);
+        assert!(
+            t.content_cache[idx].is_none(),
+            "block_mutated_at must invalidate the mutated slot"
+        );
+        assert_eq!(t.content_cache.len(), t.blocks.len());
+
+        // A render-width change must invalidate every slot, then re-wrap.
+        let other = (0..t.blocks.len()).find(|&i| i != idx && t.content_cache[i].is_some());
+        if let Some(other) = other {
+            let text_a = text.clone();
+            let fresh = cached_block_lines(
+                &mut t.content_cache,
+                &mut t.content_cache_width,
+                idx,
+                &text_a,
+                40,
+            );
+            assert_eq!(*fresh, wrap_text(&text_a, 40));
+            assert_eq!(t.content_cache_width, 40);
+            assert!(
+                t.content_cache[other].is_none(),
+                "a width change must invalidate every slot, not just the re-wrapped one"
+            );
+        }
+    }
+
+    // ── streamed_output bounding ──────────────────────────────────
+
+    #[test]
+    fn streamed_output_is_capped_and_never_split_mid_char() {
+        let mut t = TranscriptState::new();
+        t.apply_event(&AgentEvent::ToolCallStarted {
+            call_id: "c".into(),
+            tool: "bash".into(),
+            input: serde_json::json!({ "command": "true" }),
+        });
+
+        // 16 bytes per chunk (mix of 3- and 4-byte scalars); 30 chunks feed
+        // ~24 KiB, well past the 8 KiB cap.
+        let chunk = "中文😀内容".repeat(50);
+        let mut full = String::new();
+        for _ in 0..30 {
+            t.apply_event(&AgentEvent::ToolOutputChunk {
+                call_id: "c".into(),
+                delta: chunk.clone(),
+            });
+            full.push_str(&chunk);
+        }
+
+        let so = streamed_output_of(&t, 0);
+        assert!(
+            so.len() <= 8192,
+            "streamed_output must stay bounded at the 8 KiB cap: {} bytes",
+            so.len()
+        );
+        assert!(!so.is_empty());
+        assert!(
+            so.len() < full.len(),
+            "fixture must actually exercise the cap"
+        );
+        assert!(
+            full.ends_with(&so),
+            "the capped buffer must be a clean tail (never cut mid-char)"
+        );
+    }
+
+    // ── ToolOutputChunk O(1) routing ──────────────────────────────
+
+    #[test]
+    fn tool_output_chunk_routes_o1_and_falls_back_on_stale_index() {
+        let mut t = TranscriptState::new();
+        t.apply_event(&AgentEvent::ToolCallStarted {
+            call_id: "a".into(),
+            tool: "bash".into(),
+            input: serde_json::json!({ "command": "a" }),
+        });
+        t.apply_event(&AgentEvent::ToolCallStarted {
+            call_id: "b".into(),
+            tool: "bash".into(),
+            input: serde_json::json!({ "command": "b" }),
+        });
+        let ia = t
+            .blocks
+            .iter()
+            .position(|b| matches!(b, DisplayBlock::ToolRunning { call_id, .. } if call_id.as_str() == "a"))
+            .expect("block a");
+        let ib = t
+            .blocks
+            .iter()
+            .position(|b| matches!(b, DisplayBlock::ToolRunning { call_id, .. } if call_id.as_str() == "b"))
+            .expect("block b");
+        assert_eq!(t.tool_running_blocks.get("a"), Some(&ia));
+        assert_eq!(t.tool_running_blocks.get("b"), Some(&ib));
+
+        // O(1) hit: the chunk lands on the mapped block.
+        t.apply_event(&AgentEvent::ToolOutputChunk {
+            call_id: "a".into(),
+            delta: "A1".into(),
+        });
+        assert!(streamed_output_of(&t, ia).contains("A1"));
+
+        // Forge a stale entry pointing at b's slot; the O(1) map must reject
+        // it and the reverse-scan fallback must still find a's block.
+        t.tool_running_blocks.insert("a".into(), ib);
+        t.apply_event(&AgentEvent::ToolOutputChunk {
+            call_id: "a".into(),
+            delta: "A2".into(),
+        });
+        let a_out = streamed_output_of(&t, ia);
+        assert!(
+            a_out.contains("A1") && a_out.contains("A2"),
+            "fallback must deliver to the real block: {a_out}"
+        );
+        assert!(
+            streamed_output_of(&t, ib).is_empty(),
+            "the unrelated block must not receive a's chunk"
+        );
+
+        // Completion evicts the map entry (and only that entry).
+        t.apply_event(&AgentEvent::ToolCallCompleted {
+            call_id: "a".into(),
+            output: tool_result("a", "done"),
+            duration_ms: 1,
+        });
+        assert!(
+            !t.tool_running_blocks.contains_key("a"),
+            "completion must evict the call_id entry"
+        );
+        assert!(
+            t.tool_running_blocks.contains_key("b"),
+            "an unrelated entry must stay"
+        );
+    }
+
+    // ── ToolOutputChunk height growth without cache invalidation ──
+
+    #[test]
+    fn tool_output_chunk_grows_cached_height_without_bumping_generation() {
+        let mut t = TranscriptState::new();
+        t.apply_event(&AgentEvent::ToolCallStarted {
+            call_id: "c".into(),
+            tool: "bash".into(),
+            input: serde_json::json!({ "command": "run" }),
+        });
+        let idx = t.blocks.len() - 1;
+        let total_before = t.total_line_count(78); // builds the line cache
+        assert!(
+            t.line_cache
+                .is_valid(t.blocks_generation, 78, t.blocks.len()),
+            "fixture: cache must be built before chunks arrive"
+        );
+        let gen0 = t.blocks_generation;
+        let h0 = t.line_cache.heights[idx];
+
+        for i in 0..40 {
+            t.apply_event(&AgentEvent::ToolOutputChunk {
+                call_id: "c".into(),
+                delta: format!("output line {i}\n"),
+            });
+        }
+
+        assert_eq!(
+            t.blocks_generation, gen0,
+            "ToolOutputChunk must not bump blocks_generation"
+        );
+        assert!(
+            t.line_cache.is_valid(gen0, 78, t.blocks.len()),
+            "the incremental height patch must keep the cache valid"
+        );
+        let h1 = t.line_cache.heights[idx];
+        assert!(
+            h1 > h0,
+            "cached height must grow with streamed output ({h0} -> {h1})"
+        );
+        let total_after = t.total_line_count(78);
+        assert!(
+            total_after > total_before,
+            "total_line_count must reflect the grown height"
+        );
+        assert_eq!(
+            total_after,
+            t.line_cache.total(),
+            "with no streaming blocks the total is the committed-block total"
+        );
+    }
+
+    fn tool_result(call_id: &str, out: &str) -> ToolResult {
+        ToolResult {
+            timed_out: false,
+            call_id: call_id.into(),
+            success: true,
+            output: out.into(),
+            error: None,
+        }
+    }
+
+    fn streamed_output_of(t: &TranscriptState, idx: usize) -> String {
+        match &t.blocks[idx] {
+            DisplayBlock::ToolRunning {
+                streamed_output, ..
+            } => streamed_output.clone(),
+            other => panic!("expected ToolRunning at {idx}, got {other:?}"),
+        }
     }
 }

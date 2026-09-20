@@ -1233,4 +1233,29 @@ mod tests {
             "draining an empty bridge must not mutate state"
         );
     }
+
+    // The drain also has a wall-clock slice (`BRIDGE_DRAIN_TIME_SLICE`) so a
+    // flood of expensive live events cannot starve the input poll. That slice
+    // must never *drop* events: whatever a single pass leaves behind drains on
+    // the next tick, so a resumed-session replay still reaches completion.
+    #[test]
+    fn drain_bridge_time_slice_never_drops_events() {
+        let (mut model, bridge_tx) = test_model();
+        let n = BRIDGE_BULK_DRAIN_BUDGET * 2 + 7;
+        for _ in 0..n {
+            bridge_tx.send(assistant_msg("m")).expect("bridge send");
+        }
+
+        let mut passes = 0usize;
+        while !model.bridge_rx.is_empty() {
+            model.drain_bridge();
+            passes += 1;
+            assert!(passes < 100_000, "drain must make progress each pass");
+        }
+        assert_eq!(
+            model.components.transcript.blocks.len(),
+            n,
+            "every enqueued event must eventually land despite the time slice"
+        );
+    }
 }

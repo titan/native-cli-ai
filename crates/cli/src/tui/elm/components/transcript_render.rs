@@ -1199,3 +1199,96 @@ pub(super) fn emit_empty_fallback_lines(
         None,
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `wrap_paragraph` is the extracted per-paragraph core of `wrap_text`.
+    // These tests pin that the extraction preserved the historical semantics:
+    // wrapping paragraph-by-paragraph and concatenating must equal the
+    // whole-string wrap, and the empty/whitespace fallbacks must be unchanged.
+    #[test]
+    fn wrap_text_equals_concatenated_wrap_paragraph() {
+        let curated = [
+            String::new(),
+            "\n".to_string(),
+            "\n\n".to_string(),
+            "a\nb\nc".to_string(),
+            "e".repeat(20),  // word exactly `width` wide
+            "e".repeat(21),  // one over → hard split
+            "中".repeat(40), // long CJK run, no spaces
+            "no newline here".to_string(),
+            "trailing\n".to_string(),
+            "\nleading".to_string(),
+            "mixed 中文 and ascii words here".to_string(),
+            "word ".repeat(20).trim_end().to_string(),
+        ];
+        for s in &curated {
+            for &w in &[20usize, 21, 30, 78] {
+                let expected: Vec<String> =
+                    s.split('\n').flat_map(|p| wrap_paragraph(p, w)).collect();
+                assert_eq!(wrap_text(s, w), expected, "s={s:?} w={w}");
+            }
+        }
+    }
+
+    #[test]
+    fn wrap_paragraph_handles_named_boundaries() {
+        // Empty paragraph → exactly one empty line.
+        assert_eq!(wrap_paragraph("", 20), vec![String::new()]);
+        // Whitespace-only paragraph → no lines (the caller applies the
+        // verbatim fallback).
+        assert_eq!(wrap_paragraph("   ", 20), Vec::<String>::new());
+        // A word landing exactly on the boundary is not split.
+        assert_eq!(wrap_paragraph(&"e".repeat(20), 20), vec!["e".repeat(20)]);
+        // One over the boundary hard-splits into two lines.
+        assert_eq!(
+            wrap_paragraph(&"e".repeat(21), 20),
+            vec!["e".repeat(20), "e".to_string()]
+        );
+    }
+
+    #[test]
+    fn wrap_text_keeps_empty_and_whitespace_fallbacks() {
+        assert_eq!(wrap_text("", 80), vec![String::new()]);
+        // All-whitespace (non-empty) → verbatim single line, since every
+        // paragraph wraps to nothing.
+        assert_eq!(wrap_text("   ", 80), vec!["   ".to_string()]);
+        assert_eq!(wrap_text(" \n ", 80), vec![" \n ".to_string()]);
+        // Sub-8 width bypasses wrapping entirely.
+        assert_eq!(wrap_text("abc\ndef", 4), vec!["abc\ndef".to_string()]);
+    }
+
+    #[test]
+    fn cached_block_lines_memoizes_and_resets_on_width_change() {
+        let mut cache = vec![None, None];
+        let mut cache_width = 0u16;
+
+        let a = cached_block_lines(&mut cache, &mut cache_width, 0, "hello world", 78);
+        assert_eq!(*a, wrap_text("hello world", 78));
+        assert_eq!(cache_width, 78);
+        let _b = cached_block_lines(&mut cache, &mut cache_width, 1, "second block", 78);
+        assert!(cache[0].is_some() && cache[1].is_some());
+
+        // Same width → memoized (identical Arc, no re-wrap).
+        let again = cached_block_lines(&mut cache, &mut cache_width, 0, "hello world", 78);
+        assert!(
+            Arc::ptr_eq(&a, &again),
+            "same width must reuse the memoized lines"
+        );
+
+        // Width change → invalidate every slot, then re-wrap the requested one.
+        let narrow = cached_block_lines(&mut cache, &mut cache_width, 0, "hello world", 20);
+        assert_eq!(*narrow, wrap_text("hello world", 20));
+        assert_eq!(cache_width, 20);
+        assert!(
+            !Arc::ptr_eq(&a, &narrow),
+            "a width change must not reuse stale lines"
+        );
+        assert!(
+            cache[1].is_none(),
+            "a width change must invalidate every slot"
+        );
+    }
+}
