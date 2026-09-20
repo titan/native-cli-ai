@@ -472,12 +472,48 @@ fn state_tag(state: ChildSessionState) -> &'static str {
     }
 }
 
+/// True when `s` has the canonical UUID shape: 36 chars of ASCII hex
+/// digits in an 8-4-4-4-12 layout separated by dashes. nca session ids
+/// are `session-<ts>-<n>` (see `Supervisor` id minting) and never match,
+/// so a UUID-shaped id in a control request is a reliable marker of a
+/// model-fabricated id — the known degraded-provider failure signature
+/// where a later turn imitates the hallucinated pattern from compressed
+/// history. Hand-parsed (`u8` walk); no regex crate.
+fn is_uuid_shaped(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    bytes.iter().enumerate().all(|(i, b)| match i {
+        8 | 13 | 18 | 23 => *b == b'-',
+        _ => b.is_ascii_hexdigit(),
+    })
+}
+
 /// Unknown-id control error: the offending id plus the registry's
 /// known-tasks hint, so the model can self-correct. Every control path
 /// (`task_status`/`task_result`/`task_message`/`task_cancel`/
 /// `task_revive`) reports resolution misses through this one helper for a
 /// consistent contract.
+///
+/// UUID-shaped unknown ids get anti-loop guidance instead (nca adaptation
+/// of OMO `tool-execute-hooks.ts`): the message says the id is fabricated
+/// and points at the real id source, while still appending the hint —
+/// without this, a model that learned the hallucination from history
+/// retries the ghost id and wedges the delegation chain. Alias resolution
+/// runs before this helper, so semantics beat shape: a UUID-shaped string
+/// that actually resolves never reaches this branch.
 pub(crate) fn unknown_task_error(registry: &SubagentRegistry, id: &str) -> String {
+    if is_uuid_shaped(id) {
+        return format!(
+            "unknown subagent task id '{id}' — it does not exist, and its UUID shape marks it \
+             as fabricated (a known failure signature of degraded providers), so retrying it \
+             will keep failing. Real task ids are never invented by you: spawn_subagent \
+             generates the id and returns it in its result — address tasks by that id or an \
+             alias. {}",
+            registry.known_tasks_hint()
+        );
+    }
     format!(
         "unknown subagent task id '{id}'; {}",
         registry.known_tasks_hint()
@@ -1207,6 +1243,101 @@ mod tests {
         assert!(hint.contains("child-08"), "latest entry must show: {hint}");
         assert!(hint.ends_with("… +2 earlier"), "got: {hint}");
         assert!(!hint.contains("child-01") && !hint.contains("child-02"));
+    }
+
+    // ------------------------------------------------------------------
+    // Hallucinated-UUID unknown ids (anti-loop guidance)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn is_uuid_shaped_accepts_canonical_uuids() {
+        assert!(is_uuid_shaped("550e8400-e29b-41d4-a716-446655440000"));
+        // Uppercase hex is still a UUID.
+        assert!(is_uuid_shaped("550E8400-E29B-41D4-A716-446655440000"));
+        // Mixed case too.
+        assert!(is_uuid_shaped("550e8400-E29b-41D4-a716-446655440000"));
+        assert!(is_uuid_shaped("00000000-0000-0000-0000-000000000000"));
+    }
+
+    #[test]
+    fn is_uuid_shaped_rejects_real_ids_and_near_misses() {
+        // Real nca session ids are `session-<ts>-<n>` — never UUID-shaped.
+        assert!(!is_uuid_shaped("session-1789832478292811-7"));
+        // Aliases and plain strings.
+        assert!(!is_uuid_shaped("ghost"));
+        assert!(!is_uuid_shaped("fixer-1"));
+        // Short segment.
+        assert!(!is_uuid_shaped("550e8400-e29b-41d-a716-446655440000"));
+        // Extra trailing char (37 chars).
+        assert!(!is_uuid_shaped("550e8400-e29b-41d4-a716-4466554400000"));
+        // Non-hex character in a hex position.
+        assert!(!is_uuid_shaped("550e8400-e29b-41d4-a716-44665544000g"));
+        // 36 chars but a dash sits where a hex digit belongs.
+        assert!(!is_uuid_shaped("550e8400ee29b-41d4-a716-446655440000"));
+        // Empty and wrapped forms (prefix/suffix disqualify).
+        assert!(!is_uuid_shaped(""));
+        assert!(!is_uuid_shaped("{550e8400-e29b-41d4-a716-446655440000}"));
+        assert!(!is_uuid_shaped(
+            "urn:uuid:550e8400-e29b-41d4-a716-446655440000"
+        ));
+    }
+
+    #[test]
+    fn unknown_uuid_shaped_id_error_calls_out_fabrication_and_keeps_hint() {
+        let registry = SubagentRegistry::new();
+        registry.record_spawned("p", "session-1-1", "t", "/ws".into(), None);
+        registry.set_alias("session-1-1", Some("fixer"));
+        let error = unknown_task_error(&registry, "550e8400-e29b-41d4-a716-446655440000");
+        assert!(
+            error.starts_with("unknown subagent task id '550e8400-e29b-41d4-a716-446655440000'"),
+            "error must still name the offending id: {error}"
+        );
+        assert!(
+            error.contains("fabricated"),
+            "UUID-shaped unknown id must be called out as fabricated: {error}"
+        );
+        assert!(
+            error.contains("spawn_subagent"),
+            "must point at the real id source (spawn_subagent result): {error}"
+        );
+        assert!(
+            error.contains("known tasks:") && error.contains("session-1-1 (alias fixer)"),
+            "self-correction hint must survive the anti-loop guidance: {error}"
+        );
+    }
+
+    #[test]
+    fn unknown_uuid_shaped_id_error_keeps_empty_registry_hint() {
+        let error = unknown_task_error(
+            &SubagentRegistry::new(),
+            "550e8400-e29b-41d4-a716-446655440000",
+        );
+        assert!(
+            error.contains("fabricated"),
+            "anti-loop guidance must fire on an empty registry too: {error}"
+        );
+        assert!(
+            error.contains("no subagent tasks are registered"),
+            "empty-registry hint must say so plainly: {error}"
+        );
+    }
+
+    #[test]
+    fn unknown_plain_id_error_text_is_unchanged() {
+        let registry = SubagentRegistry::new();
+        registry.record_spawned("p", "session-1-1", "t", "/ws".into(), None);
+        // Non-UUID unknown ids (alias typo / hand-slip) keep the exact
+        // legacy contract — the consumer tests anchor on this prefix.
+        assert_eq!(
+            unknown_task_error(&registry, "ghost"),
+            "unknown subagent task id 'ghost'; known tasks: session-1-1 [running]"
+        );
+        // A real session-id-shaped miss also stays on the legacy path.
+        assert_eq!(
+            unknown_task_error(&registry, "session-1789832478292811-7"),
+            "unknown subagent task id 'session-1789832478292811-7'; \
+             known tasks: session-1-1 [running]"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
