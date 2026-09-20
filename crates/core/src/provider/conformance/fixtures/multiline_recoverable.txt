@@ -1,5 +1,5 @@
-data: {"choices":[{"index":0,"delta":{"content":"split
-data: ted"}}]}
+data: {"choices":[{"index":0,
+data: "delta":{"content":"recovered"},"finish_reason":null}]}
 
 data: {"choices":[{"index":0,"delta":{"content":"kept"},"finish_reason":null}]}
 

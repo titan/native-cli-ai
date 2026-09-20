@@ -77,10 +77,13 @@ pub fn spawn_openai_stream(
 /// StreamChunk".
 ///
 /// Split out of [`spawn_openai_stream`] so conformance tests can feed
-/// fixture byte streams without real HTTP. Behavior is byte-identical to
-/// the former inline loop — the idle-timeout wrapping, error mapping
-/// (source chain + transport flags), and the `stream_idle_timeout` /
-/// `stream_byte_error` logging all live here.
+/// fixture byte streams without real HTTP. The idle-timeout wrapping, error
+/// mapping (source chain + transport flags), and the `stream_idle_timeout` /
+/// `stream_byte_error` logging all live here. Events are assembled per the
+/// WHATWG SSE spec: lines are extracted from a raw byte buffer (UTF-8 decoded
+/// per complete line, so mid-character chunk boundaries cannot corrupt) and
+/// dispatched in batch when the terminating blank line arrives — multi-line
+/// `data:` values are joined with `\n` as one event.
 pub(crate) fn run_openai_sse<B>(
     mut byte_stream: impl futures_util::Stream<Item = Result<B, ByteStreamError>>
     + Send
@@ -94,7 +97,19 @@ where
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
     tokio::spawn(async move {
-        let mut buffer = String::new();
+        // Raw-byte line-assembly buffer. UTF-8 decoding happens per COMPLETE
+        // extracted line, never per network chunk — a chunk boundary landing
+        // inside a multi-byte sequence stays buffered as raw bytes until its
+        // line is complete (`0x0A` can never appear inside a multi-byte UTF-8
+        // sequence — every lead/continuation byte is >= 0x80 — so slicing at
+        // `\n` bytes can never split a code point).
+        let mut buffer: Vec<u8> = Vec::new();
+        // `data:` field values of the event currently being assembled, per
+        // the SSE spec: an event's data may span multiple physical `data:`
+        // lines; the values are joined with `\n` and dispatched as ONE event
+        // when the terminating blank line arrives. An event still incomplete
+        // at EOF is discarded.
+        let mut data_lines: Vec<String> = Vec::new();
         let mut tool_calls: BTreeMap<u64, ToolCallAccumulator> = BTreeMap::new();
         // Last non-null finish_reason seen across chunks (OpenAI-compatible
         // streams repeat it on the final chunk of each choice). Surfaced via
@@ -115,7 +130,7 @@ where
                     let buffer_preview = if buffer.is_empty() {
                         String::from("(none)")
                     } else {
-                        buffer.chars().take(500).collect()
+                        String::from_utf8_lossy(&buffer).chars().take(500).collect()
                     };
                     tracing::error!(
                         provider = provider_name,
@@ -151,7 +166,7 @@ where
                     let buffer_preview = if buffer.is_empty() {
                         String::from("(none)")
                     } else {
-                        buffer.chars().take(500).collect()
+                        String::from_utf8_lossy(&buffer).chars().take(500).collect()
                     };
 
                     tracing::error!(
@@ -175,22 +190,35 @@ where
                 }
             };
 
-            buffer.push_str(&String::from_utf8_lossy(chunk.as_ref()));
+            buffer.extend_from_slice(chunk.as_ref());
 
-            while let Some(nl) = buffer.find('\n') {
-                let raw = buffer[..nl].to_string();
+            while let Some(nl) = buffer.iter().position(|&b| b == b'\n') {
+                let raw = String::from_utf8_lossy(&buffer[..nl]).into_owned();
                 buffer.drain(..=nl);
                 let line = raw.trim_end_matches('\r').trim();
 
-                if line.is_empty() || line.starts_with(':') {
+                if !line.is_empty() {
+                    // Accumulate the event's fields; dispatch happens on the
+                    // blank line below.
+                    if line.starts_with(':') {
+                        // SSE comment line (keep-alive ping) — ignored.
+                        continue;
+                    }
+                    if let Some(data) = line.strip_prefix("data:") {
+                        data_lines.push(data.trim().to_string());
+                    }
+                    // Other SSE fields (`event`, `id`, `retry`) are ignored on
+                    // the OpenAI path.
                     continue;
                 }
 
-                if !line.starts_with("data:") {
+                // Blank line: the current event is complete — dispatch the
+                // assembled data per the SSE spec. Events with no `data:`
+                // field (e.g. comment-only) dispatch nothing.
+                if data_lines.is_empty() {
                     continue;
                 }
-
-                let data = line["data:".len()..].trim();
+                let data = std::mem::take(&mut data_lines).join("\n");
                 if data == "[DONE]" {
                     flush_openai_tool_calls(&tx, &mut tool_calls).await;
                     if let Some(reason) = finish_reason.take() {
@@ -200,7 +228,7 @@ where
                     return;
                 }
 
-                let Ok(event) = serde_json::from_str::<Value>(data) else {
+                let Ok(event) = serde_json::from_str::<Value>(&data) else {
                     continue;
                 };
 
@@ -293,6 +321,9 @@ where
             }
         }
 
+        // Clean EOF: an event still incomplete (no blank-line terminator) is
+        // discarded per the SSE spec. Flush accumulated tool calls and surface
+        // the terminal finish reason, matching the `[DONE]` close.
         flush_openai_tool_calls(&tx, &mut tool_calls).await;
         if let Some(reason) = finish_reason.take() {
             let _ = tx.send(StreamChunk::Finish { reason }).await;
