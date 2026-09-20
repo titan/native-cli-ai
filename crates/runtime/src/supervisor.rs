@@ -767,19 +767,30 @@ impl Supervisor {
         let session_id = cfg.session_id.unwrap_or_else(generate_session_id);
         let session_store = SessionStore::new(workspace_root.join(&config.session.history_dir));
 
+        // Live config handle shared with the subagent consumers (see the
+        // `live_config` field docs) — constructed HERE, before the consumer
+        // wiring, so the control consumer and the struct hold the SAME
+        // handle (refreshed by `apply_agent_profile` /
+        // `apply_nca_config` after every successful rebuild).
+        let live_config = Arc::new(std::sync::RwLock::new(config.clone()));
+
         // Control consumer answers task_status/task_result/task_message/
         // task_cancel/task_revive against the registry + a read-only store
         // handle (never saves — single-writer invariant,
         // `docs/subagent-task-lifecycle.md` §6). `ChildMessageQueued`
         // envelopes ride the session's own bounded event channel. Revive
         // additionally needs the parent config + workspace root to rebuild
-        // the child (resume), so they ride along here.
+        // the child (resume), so the live config handle + the parent's fs
+        // ride along here — revive re-reads the current value and re-syncs
+        // runtime mounts from the live FS at each request, mirroring the
+        // spawn consumer.
         if let Some(control_rx) = subagent_control_rx.take() {
             tokio::spawn(subagent_control_consumer(
                 control_rx,
                 Arc::clone(&registry),
                 SessionStore::new(workspace_root.join(&config.session.history_dir)),
-                config.clone(),
+                Arc::clone(&live_config),
+                fs.clone(),
                 workspace_root.clone(),
                 Some(event_tx.clone()),
             ));
@@ -883,11 +894,8 @@ impl Supervisor {
         let turn_commit_wired = Arc::new(AtomicBool::new(false));
         let turn_commit_tx = Some((commit_tx, turn_commit_wired.clone()));
 
-        // Turn fence (see field docs) + spawn-time config snapshot: both
-        // start in their neutral state — no turn running, snapshot == the
-        // config this supervisor was created with.
+        // Turn fence (see field docs): starts neutral — no turn running.
         let turn_in_flight = Arc::new(AtomicBool::new(false));
-        let live_config = Arc::new(std::sync::RwLock::new(config.clone()));
 
         let sup = Self {
             session_id,

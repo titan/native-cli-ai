@@ -145,7 +145,8 @@ async fn cancel_mid_turn_ends_child_cancelled_and_retains_worktree() {
         control_rx,
         registry.clone(),
         SessionStore::new(sessions_dir.clone()),
-        offline_config(),
+        Arc::new(std::sync::RwLock::new(offline_config())),
+        Arc::new(nca_core::workspace_fs::RealFs::new(ws.path().to_path_buf())),
         ws.path().to_path_buf(),
         Some(parent_tx.clone()),
     );

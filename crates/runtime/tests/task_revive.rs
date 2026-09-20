@@ -118,18 +118,25 @@ fn wire_control_consumer(
     ws: &Path,
     registry: Arc<SubagentRegistry>,
     event_tx: Option<mpsc::Sender<AgentEvent>>,
-) -> mpsc::Sender<SubagentControlRequest> {
+) -> (
+    mpsc::Sender<SubagentControlRequest>,
+    Arc<std::sync::RwLock<NcaConfig>>,
+) {
     let (control_tx, control_rx) = mpsc::channel(16);
     let sessions_dir = ws.join(".nca").join("sessions");
+    // Live handle (mirrors the supervisor's `live_config` wiring) so tests
+    // can simulate an in-session config switch before a revive.
+    let live_config = Arc::new(std::sync::RwLock::new(offline_config()));
     let _consumer = subagent_control_consumer(
         control_rx,
         registry,
         SessionStore::new(sessions_dir),
-        offline_config(),
+        Arc::clone(&live_config),
+        Arc::new(nca_core::workspace_fs::RealFs::new(ws.to_path_buf())),
         ws.to_path_buf(),
         event_tx,
     );
-    control_tx
+    (control_tx, live_config)
 }
 
 /// Spawn a gated child (mid-turn on provider call #1) and return
@@ -198,7 +205,8 @@ async fn revive_cancelled_child_runs_new_prompt_in_retained_session() {
     let registry = Arc::new(SubagentRegistry::new());
     let (event_tx, _event_rx) = mpsc::channel(256);
     let provider = ScriptedProvider::new("second answer");
-    let control_tx = wire_control_consumer(ws.path(), registry.clone(), Some(event_tx.clone()));
+    let (control_tx, _live_config) =
+        wire_control_consumer(ws.path(), registry.clone(), Some(event_tx.clone()));
 
     // Child 1: gated mid-turn, then cancelled through the real consumer.
     let (child_task, child_id) = spawn_gated_child(
@@ -363,7 +371,7 @@ async fn revive_running_child_cancels_first_then_revives() {
 async fn revive_unknown_id_through_consumer_is_unknown() {
     let ws = tempfile::tempdir().expect("tempdir");
     let registry = Arc::new(SubagentRegistry::new());
-    let control_tx = wire_control_consumer(ws.path(), registry, None);
+    let (control_tx, _live_config) = wire_control_consumer(ws.path(), registry, None);
 
     let (reply_tx, reply_rx) = oneshot::channel();
     control_tx

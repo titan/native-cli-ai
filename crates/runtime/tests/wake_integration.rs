@@ -306,7 +306,8 @@ fn wire_control_consumer(
         control_rx,
         registry,
         SessionStore::new(sessions_dir),
-        offline_config(),
+        Arc::new(std::sync::RwLock::new(offline_config())),
+        Arc::new(nca_core::workspace_fs::RealFs::new(ws.to_path_buf())),
         ws.to_path_buf(),
         event_tx,
     );

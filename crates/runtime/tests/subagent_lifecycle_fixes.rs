@@ -366,7 +366,8 @@ fn control_consumer(
         rx,
         registry,
         SessionStore::new(sessions_dir(ws)),
-        offline_config(),
+        Arc::new(std::sync::RwLock::new(offline_config())),
+        Arc::new(nca_core::workspace_fs::RealFs::new(ws.to_path_buf())),
         ws.to_path_buf(),
         event_tx,
     );

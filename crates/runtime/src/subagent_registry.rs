@@ -499,6 +499,14 @@ pub(crate) fn ambiguous_task_error(registry: &SubagentRegistry, message: String)
 /// `event_tx` (the parent's bounded event channel) receives
 /// `ChildMessageQueued` envelopes for accepted/refused steering attempts.
 ///
+/// `config` is a LIVE handle (`Supervisor::live_config`), not a
+/// wiring-time clone: the Revive arm reads the current value at each
+/// request so a child revived after an in-session `/model`, `/provider`,
+/// or agent switch inherits the new routing. `fs` is the parent's live
+/// workspace FS — runtime mounts are re-synced from it per revive
+/// (mirroring the spawn consumer), so a `/mount` performed during the
+/// session reaches revived children too.
+///
 /// **Invariant:** never calls `session_store.save` — introspection and
 /// control signaling are strictly non-persisting (single-writer preserved:
 /// cancel flips the child's own in-memory flag; the child's supervisor
@@ -507,7 +515,8 @@ pub fn subagent_control_consumer(
     mut control_rx: mpsc::Receiver<SubagentControlRequest>,
     registry: Arc<SubagentRegistry>,
     session_store: SessionStore,
-    config: nca_common::config::NcaConfig,
+    config: Arc<std::sync::RwLock<nca_common::config::NcaConfig>>,
+    fs: Arc<dyn nca_core::workspace_fs::WorkspaceFs>,
     workspace_root: std::path::PathBuf,
     event_tx: Option<mpsc::Sender<AgentEvent>>,
 ) -> tokio::task::JoinHandle<()> {
@@ -627,10 +636,30 @@ pub fn subagent_control_consumer(
                     reply,
                 } => {
                     let registry = Arc::clone(&registry);
-                    let config = config.clone();
+                    let config = Arc::clone(&config);
+                    let fs = Arc::clone(&fs);
                     let workspace_root = workspace_root.clone();
                     let event_tx = event_tx.clone();
                     tokio::spawn(async move {
+                        // Snapshot the CURRENT config (read-clone-release —
+                        // the guard never crosses an await), mirroring the
+                        // spawn consumer: a child revived after an
+                        // in-session `/model`, `/provider`, or agent switch
+                        // inherits the new routing (the supervisor refreshes
+                        // the shared snapshot on every successful rebuild).
+                        // Runtime mounts are then synced from the parent's
+                        // live FS state (the snapshot's `extra_paths` may
+                        // predate a `/mount` performed during the session).
+                        let mut config = {
+                            let guard = config
+                                .read()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            guard.clone()
+                        };
+                        let live_mounts = fs.mounted_paths();
+                        if config.extra_paths != live_mounts {
+                            config.extra_paths = live_mounts;
+                        }
                         let response = crate::subagent::handle_revive_request(
                             registry,
                             config,
@@ -983,6 +1012,22 @@ mod tests {
     use nca_common::session::{SessionMeta, SessionStatus};
     use std::sync::atomic::AtomicBool;
     use tokio::sync::oneshot;
+
+    /// Live-config handle for the consumer wiring in these tests — the
+    /// mechanical stand-in for the supervisor's `live_config` field
+    /// (`Arc<RwLock<NcaConfig>>`; production refreshes it via
+    /// `apply_agent_profile` / `apply_nca_config`).
+    fn live_config() -> Arc<std::sync::RwLock<NcaConfig>> {
+        Arc::new(std::sync::RwLock::new(NcaConfig::default()))
+    }
+
+    /// Bare workspace FS for the consumer's mount-sync parameter (none of
+    /// these tests mount anything; the fs is only read by the Revive arm).
+    fn test_fs() -> Arc<dyn nca_core::workspace_fs::WorkspaceFs> {
+        Arc::new(nca_core::workspace_fs::RealFs::new(
+            std::path::PathBuf::from("/tmp/nca-registry-test-ws"),
+        ))
+    }
 
     fn spawned_envelope(id: u64, child: &str) -> EventEnvelope {
         EventEnvelope::new(
@@ -1573,7 +1618,8 @@ mod tests {
             rx,
             registry,
             store,
-            NcaConfig::default(),
+            live_config(),
+            test_fs(),
             std::path::PathBuf::from("/tmp/nca-registry-test-ws"),
             None,
         );
@@ -1627,7 +1673,8 @@ mod tests {
             rx,
             registry,
             store,
-            NcaConfig::default(),
+            live_config(),
+            test_fs(),
             std::path::PathBuf::from("/tmp/nca-registry-test-ws"),
             None,
         );
@@ -1668,7 +1715,8 @@ mod tests {
             rx,
             registry,
             store,
-            NcaConfig::default(),
+            live_config(),
+            test_fs(),
             std::path::PathBuf::from("/tmp/nca-registry-test-ws"),
             None,
         );
@@ -1725,7 +1773,8 @@ mod tests {
             rx,
             registry,
             store,
-            NcaConfig::default(),
+            live_config(),
+            test_fs(),
             std::path::PathBuf::from("/tmp/nca-registry-test-ws"),
             None,
         );
@@ -1813,7 +1862,8 @@ mod tests {
             rx,
             registry.clone(),
             store,
-            NcaConfig::default(),
+            live_config(),
+            test_fs(),
             std::path::PathBuf::from("/tmp/nca-registry-test-ws"),
             Some(event_tx),
         );
@@ -1858,7 +1908,8 @@ mod tests {
             rx,
             registry,
             store,
-            NcaConfig::default(),
+            live_config(),
+            test_fs(),
             std::path::PathBuf::from("/tmp/nca-registry-test-ws"),
             Some(event_tx),
         );
@@ -1894,7 +1945,8 @@ mod tests {
             rx,
             registry,
             store,
-            NcaConfig::default(),
+            live_config(),
+            test_fs(),
             std::path::PathBuf::from("/tmp/nca-registry-test-ws"),
             None,
         );
@@ -1922,7 +1974,8 @@ mod tests {
             rx,
             registry,
             store,
-            NcaConfig::default(),
+            live_config(),
+            test_fs(),
             std::path::PathBuf::from("/tmp/nca-registry-test-ws"),
             None,
         );
@@ -1942,7 +1995,8 @@ mod tests {
             rx,
             registry,
             store,
-            NcaConfig::default(),
+            live_config(),
+            test_fs(),
             std::path::PathBuf::from("/tmp/nca-registry-test-ws"),
             None,
         );
@@ -1971,7 +2025,8 @@ mod tests {
             rx,
             registry.clone(),
             store,
-            NcaConfig::default(),
+            live_config(),
+            test_fs(),
             std::path::PathBuf::from("/tmp/nca-registry-test-ws"),
             None,
         );
@@ -2011,7 +2066,8 @@ mod tests {
             rx,
             registry,
             store,
-            NcaConfig::default(),
+            live_config(),
+            test_fs(),
             std::path::PathBuf::from("/tmp/nca-registry-test-ws"),
             None,
         );
@@ -2032,7 +2088,8 @@ mod tests {
             rx,
             registry,
             store,
-            NcaConfig::default(),
+            live_config(),
+            test_fs(),
             std::path::PathBuf::from("/tmp/nca-registry-test-ws"),
             None,
         );
@@ -2061,7 +2118,8 @@ mod tests {
             rx,
             registry.clone(),
             store,
-            NcaConfig::default(),
+            live_config(),
+            test_fs(),
             std::path::PathBuf::from("/tmp/nca-registry-test-ws"),
             None,
         );
