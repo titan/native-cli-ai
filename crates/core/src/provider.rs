@@ -1,5 +1,7 @@
 pub mod anthropic;
 pub mod anthropic_compat;
+#[cfg(test)]
+pub(crate) mod conformance;
 pub mod custom;
 pub mod deepseek;
 pub mod factory;
