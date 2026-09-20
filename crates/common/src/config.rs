@@ -487,7 +487,13 @@ impl NcaConfig {
 /// permission_mode = "plan"
 /// system_prompt_append = "Focus on security and correctness."
 /// allowed_tools = ["read", "search", "list_directory"]
+/// skills_remove = ["web-search", "commit"]
 /// ```
+///
+/// Skill gating: `skills` (base whitelist), `skills_add`, and
+/// `skills_remove` fold into the agent's effective skill set
+/// ((base ∪ add) − remove, intersected with discovered skills). When all
+/// three are unset the agent sees every discovered skill (no filtering).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentProfileConfig {
     /// Human-readable description shown in agent pickers.
@@ -512,6 +518,20 @@ pub struct AgentProfileConfig {
     /// If set, only these tools are available (all others are disabled).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_tools: Option<Vec<String>>,
+    /// Base skill whitelist (skill command names). `None` = all discovered
+    /// skills form the base. Entries not present in discovery are ignored —
+    /// a skill that was never discovered cannot be granted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<String>>,
+    /// Skills merged into the effective set after the base (dedup; names not
+    /// present in discovery are ignored).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills_add: Option<Vec<String>>,
+    /// Skills cut from the effective set last. On a name clash with
+    /// `skills_add`, remove always wins. Removing an unknown name is a
+    /// no-op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills_remove: Option<Vec<String>>,
 }
 
 impl AgentProfileConfig {
@@ -537,6 +557,15 @@ impl AgentProfileConfig {
         }
         if let Some(v) = partial.allowed_tools {
             self.allowed_tools = Some(v);
+        }
+        if let Some(v) = partial.skills {
+            self.skills = Some(v);
+        }
+        if let Some(v) = partial.skills_add {
+            self.skills_add = Some(v);
+        }
+        if let Some(v) = partial.skills_remove {
+            self.skills_remove = Some(v);
         }
     }
 
@@ -565,6 +594,9 @@ struct PartialAgentProfileConfig {
     system_prompt: Option<String>,
     system_prompt_append: Option<String>,
     allowed_tools: Option<Vec<String>>,
+    skills: Option<Vec<String>>,
+    skills_add: Option<Vec<String>>,
+    skills_remove: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3806,6 +3838,38 @@ model = "claude-sonnet"
         let mut names = config.agent_profile_names();
         names.sort();
         assert_eq!(names, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn agent_profile_skills_directives_parse_from_toml() {
+        // New optional fields must parse, stay absent by default, and
+        // merge per-key across config layers (same as existing fields).
+        let partial: PartialNcaConfig = toml::from_str(
+            r#"
+[agents.gatekeeper]
+skills = ["alpha", "beta"]
+skills_add = ["gamma"]
+skills_remove = ["beta"]
+"#,
+        )
+        .unwrap();
+        let mut config = NcaConfig::default();
+        config.merge(partial);
+
+        let profile = config.agent_profile("gatekeeper").unwrap();
+        assert_eq!(profile.skills, Some(vec!["alpha".into(), "beta".into()]));
+        assert_eq!(profile.skills_add, Some(vec!["gamma".into()]));
+        assert_eq!(profile.skills_remove, Some(vec!["beta".into()]));
+
+        // Absent keys → None (no gating) — existing configs keep working.
+        let bare: PartialNcaConfig =
+            toml::from_str("[agents.plain]\nprovider = \"openai\"\n").unwrap();
+        let mut config2 = NcaConfig::default();
+        config2.merge(bare);
+        let plain = config2.agent_profile("plain").unwrap();
+        assert_eq!(plain.skills, None);
+        assert_eq!(plain.skills_add, None);
+        assert_eq!(plain.skills_remove, None);
     }
 
     #[test]

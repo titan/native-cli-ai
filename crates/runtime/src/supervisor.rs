@@ -37,7 +37,7 @@ use nca_core::plugin::PluginRegistry;
 use nca_core::provider::Provider;
 use nca_core::provider::ProviderError;
 use nca_core::provider::factory::build_provider_with_events;
-use nca_core::skills::SkillCatalog;
+use nca_core::skills::{SkillCatalog, SkillFilterHandle, effective_skills_for_profile};
 use nca_core::tools::AskQuestionTool;
 use nca_core::tools::InvokeSkillTool;
 use nca_core::tools::ToolRegistry;
@@ -149,6 +149,14 @@ pub struct Supervisor {
     /// Runtime mounts are NOT synced through it — the consumer re-syncs
     /// those from the live workspace FS at each spawn.
     live_config: Arc<std::sync::RwLock<NcaConfig>>,
+    /// Live per-agent skill gate shared with this session's `InvokeSkillTool`
+    /// (see [`SkillFilterHandle`]). The tool registry is built once in
+    /// `create` and NOT rebuilt on profile switches — `apply_agent_profile`
+    /// / `apply_nca_config` re-write this handle instead, so invoke_skill
+    /// gating always matches the active profile. `None` inside the handle =
+    /// no filtering (default harness persona or a profile without skill
+    /// directives).
+    skill_filter: SkillFilterHandle,
 }
 /// Terminal `result_summary` stamped on ghost children by the resume sweep:
 /// the run was cut off by a parent-process restart, not by its own logic.
@@ -749,10 +757,24 @@ impl Supervisor {
             event_tx.clone(),
             question_pending.clone(),
         )));
-        tools.register(Box::new(InvokeSkillTool::new(
-            workspace_root.clone(),
-            config.harness.skill_directories.clone(),
-        )));
+        // Per-agent skill gate: computed from the resolved profile here (the
+        // same path covers fresh sessions, `resume` via `SessionMeta::agent_name`,
+        // and child sessions via `SupervisorConfig::agent_name` = specialist),
+        // then re-written by `apply_agent_profile` on every runtime switch.
+        let skill_filter: SkillFilterHandle = Arc::new(std::sync::RwLock::new(None));
+        sync_skill_filter_handle(
+            &skill_filter,
+            agent_profile.as_ref(),
+            &workspace_root,
+            &config.harness.skill_directories,
+        );
+        tools.register(Box::new(
+            InvokeSkillTool::new(
+                workspace_root.clone(),
+                config.harness.skill_directories.clone(),
+            )
+            .with_skill_filter(skill_filter.clone()),
+        ));
 
         let todo_store: TodoStore = Arc::new(Mutex::new(Vec::new()));
         tools.register(Box::new(UpdateTodosTool::new(event_tx.clone(), todo_store)));
@@ -942,6 +964,7 @@ impl Supervisor {
             restart_ghosts: Vec::new(),
             turn_in_flight,
             live_config,
+            skill_filter,
         };
         sup.save().await.map_err(ProviderError::Other)?;
         sup.update_last_session()
@@ -1988,6 +2011,14 @@ impl Supervisor {
         self.active_agent_name = name.map(str::to_string);
         self.rebuild_system_prompt();
         self.rebuild_context_manager_sync();
+        // Re-gate invoke_skill against the new profile (the registry itself
+        // is not rebuilt — see the `skill_filter` field docs).
+        sync_skill_filter_handle(
+            &self.skill_filter,
+            self.agent_profile.as_ref(),
+            &self.workspace_root,
+            &self.config.harness.skill_directories,
+        );
         // `self.config` changed (back to the clean base): children spawned
         // from now on must route against it, not the wiring-time snapshot.
         self.refresh_live_config();
@@ -2068,6 +2099,15 @@ impl Supervisor {
         agent.replace_provider(provider);
         agent.set_keepalive_profile(cache_keepalive::resolve_profile(provider_kind));
         self.rebuild_context_manager_sync();
+        // Config changed (possibly `harness.skill_directories` or profile
+        // definitions): re-fold the active profile's gate against the new
+        // discovery roots.
+        sync_skill_filter_handle(
+            &self.skill_filter,
+            self.agent_profile.as_ref(),
+            &self.workspace_root,
+            &self.config.harness.skill_directories,
+        );
         // Children spawned from now on route against the NEW config (the
         // spawn consumer reads this snapshot at consumption time).
         self.refresh_live_config();
@@ -2469,6 +2509,36 @@ fn generate_session_id() -> String {
     format!("session-{}-{counter}", Utc::now().timestamp_micros())
 }
 
+/// Compute a profile's effective skill set (discovery + fold) and write it
+/// into the live gate. `profile: None` (or a profile without skill
+/// directives) clears the gate — no filtering. Discovery failure degrades to
+/// "no filtering" with a warning, mirroring the leniency of
+/// [`register_skill_agents`].
+fn sync_skill_filter_handle(
+    handle: &SkillFilterHandle,
+    profile: Option<&AgentProfileConfig>,
+    workspace_root: &Path,
+    skill_directories: &[PathBuf],
+) {
+    let effective = profile.and_then(|profile| {
+        match SkillCatalog::discover(workspace_root, skill_directories) {
+            Ok(skills) => {
+                let discovered: Vec<String> =
+                    skills.iter().map(|skill| skill.command.clone()).collect();
+                effective_skills_for_profile(Some(profile), &discovered)
+            }
+            Err(error) => {
+                tracing::warn!("skill discovery for invoke_skill gating failed: {error}");
+                None
+            }
+        }
+    });
+    match handle.write() {
+        Ok(mut guard) => *guard = effective,
+        Err(_) => tracing::error!("invoke_skill skill filter lock poisoned; gate not updated"),
+    }
+}
+
 /// Known OMO specialist agent names that auto-register as agent profiles.
 ///
 /// `tester` is split from `fixer` by design: they should use different models
@@ -2524,6 +2594,9 @@ pub(crate) fn register_skill_agents(config: &mut NcaConfig, workspace_root: &Pat
             system_prompt: Some(skill.expanded_body()),
             system_prompt_append: None,
             allowed_tools: None,
+            // Skill-discovered profiles never carry skill directives — the
+            // fold yields `None` (no gating) for them, unchanged behavior.
+            ..Default::default()
         };
         config.agents.insert(skill.command.clone(), profile);
     }
@@ -3140,6 +3213,78 @@ mod tests {
         assert_eq!(
             profile.system_prompt.as_deref(),
             Some("User-defined oracle.")
+        );
+    }
+
+    // === per-agent skill gate wiring (create init + apply_agent_profile) ===
+
+    async fn gated_supervisor(root: &Path) -> Supervisor {
+        for command in ["alpha", "beta"] {
+            let skill_dir = root.join(format!(".nca/skills/{command}"));
+            std::fs::create_dir_all(&skill_dir).expect("mkdir");
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                format!("---\nname: {command}\ncommand: {command}\ndescription: {command}\n---\n{command} body.\n"),
+            )
+            .expect("write skill");
+        }
+        let mut config = NcaConfig::default();
+        config.provider.deepseek.api_key = Some("test-key".into());
+        config.permissions.mode = nca_common::config::PermissionMode::BypassPermissions;
+        config.memory.context.auto_detect_context_window = false;
+        config.memory.context.query_provider_models_api = false;
+        config.memory.context.enable_auto_summarize = false;
+        config.agents.insert(
+            "gatekeeper".into(),
+            AgentProfileConfig {
+                skills: Some(vec!["alpha".into()]),
+                ..Default::default()
+            },
+        );
+        Supervisor::create(SupervisorConfig {
+            config,
+            workspace_root: root.to_path_buf(),
+            safe_mode: false,
+            interactive_approvals: false,
+            session_id: Some("skill-gate-wiring".into()),
+            approval_handler: None,
+            orchestration_context: None,
+            agent_name: Some("gatekeeper".into()),
+            provider: None,
+        })
+        .await
+        .expect("gated supervisor")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_initializes_skill_gate_from_profile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sup = gated_supervisor(dir.path()).await;
+
+        // Whitelist caps the gate regardless of host XDG skills.
+        assert_eq!(
+            *sup.skill_filter.read().unwrap(),
+            Some(["alpha".to_string()].into_iter().collect())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn apply_agent_profile_updates_and_clears_skill_gate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut sup = gated_supervisor(dir.path()).await;
+
+        // Switch to the default persona → gate cleared (no filtering).
+        sup.apply_agent_profile(None).expect("switch to default");
+        assert_eq!(*sup.skill_filter.read().unwrap(), None);
+
+        // Switch back → gate re-folded from the profile.
+        let applied = sup
+            .apply_agent_profile(Some("gatekeeper"))
+            .expect("switch to gatekeeper");
+        assert_eq!(applied.as_deref(), Some("gatekeeper"));
+        assert_eq!(
+            *sup.skill_filter.read().unwrap(),
+            Some(["alpha".to_string()].into_iter().collect())
         );
     }
 

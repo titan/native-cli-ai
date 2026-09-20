@@ -1,5 +1,18 @@
-use nca_common::config::{PermissionMode, ProviderKind};
+use nca_common::config::{AgentProfileConfig, PermissionMode, ProviderKind};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+
+/// Live gate for per-agent skill access, shared between the supervisor
+/// (writer) and the `invoke_skill` tool (reader).
+/// `None` (no handle, or a handle holding `None`) = no filtering — every
+/// discovered skill is invocable. `Some(set)` = only skills whose command
+/// name is in the set may be invoked or listed.
+/// The handle is live (not a wiring-time snapshot) because profile
+/// switches rebuild the provider/system prompt but do NOT rebuild the tool
+/// registry; writing the folded set here re-gates the already-registered
+/// `InvokeSkillTool` in place.
+pub type SkillFilterHandle = Arc<RwLock<Option<HashSet<String>>>>;
 
 #[derive(Debug, Clone)]
 pub struct Skill {
@@ -33,6 +46,78 @@ pub enum SkillSource {
 }
 
 pub struct SkillCatalog;
+
+/// Fold a profile's skill directives into the effective skill set — the
+/// simplified Rust port of OMO's `resolveEffectiveSkills` (no `"*"`/`!name`
+/// token syntax, no dual permission tracks).
+///
+/// Rules (strict):
+/// - All three directives `None` → `None` (no filtering — fully
+///   backward-compatible with profiles that predate skill gating).
+/// - `base` = `skills` when set, otherwise every discovered skill name.
+/// - `effective = (base ∪ add) − remove`, intersected with `discovered`:
+///   a name discovery never found cannot be granted (whitelist entries for
+///   non-existent skills and `add` names that were never discovered are
+///   silently dropped).
+/// - `remove` of a name that is not in the effective set is a no-op (no
+///   error); on a name clash, `remove` always wins over `add`.
+///
+/// Returns `Some(set)` even when the set is empty — an explicit gate that
+/// denies every skill is meaningful (`None` is reserved for "no gate").
+pub fn fold_effective_skills(
+    skills: Option<&[String]>,
+    skills_add: Option<&[String]>,
+    skills_remove: Option<&[String]>,
+    discovered: &[String],
+) -> Option<HashSet<String>> {
+    if skills.is_none() && skills_add.is_none() && skills_remove.is_none() {
+        return None;
+    }
+
+    let discovered: HashSet<&str> = discovered.iter().map(String::as_str).collect();
+    let mut effective: HashSet<String> = match skills {
+        Some(base) => base
+            .iter()
+            .map(String::as_str)
+            .filter(|name| discovered.contains(*name))
+            .map(str::to_string)
+            .collect(),
+        None => discovered.iter().map(|name| name.to_string()).collect(),
+    };
+
+    if let Some(add) = skills_add {
+        for name in add {
+            if discovered.contains(name.as_str()) {
+                effective.insert(name.clone());
+            }
+        }
+    }
+
+    if let Some(remove) = skills_remove {
+        for name in remove {
+            effective.remove(name.as_str());
+        }
+    }
+
+    Some(effective)
+}
+
+/// Profile-driven wrapper around [`fold_effective_skills`]: folds the
+/// profile's `skills` / `skills_add` / `skills_remove` directives against
+/// the currently discovered skill names. `profile: None` (no active agent)
+/// → `None` (no filtering).
+pub fn effective_skills_for_profile(
+    profile: Option<&AgentProfileConfig>,
+    discovered: &[String],
+) -> Option<HashSet<String>> {
+    let profile = profile?;
+    fold_effective_skills(
+        profile.skills.as_deref(),
+        profile.skills_add.as_deref(),
+        profile.skills_remove.as_deref(),
+        discovered,
+    )
+}
 
 impl SkillCatalog {
     /// Return every directory root [`Self::discover`] scans, in priority
@@ -802,6 +887,140 @@ fn extract_file_references(body: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn names(values: &[&str]) -> Vec<String> {
+        values.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn set(values: &[&str]) -> HashSet<String> {
+        values.iter().map(|s| s.to_string()).collect()
+    }
+
+    // === fold_effective_skills tests (OMO resolveEffectiveSkills port) ===
+
+    #[test]
+    fn fold_all_none_directives_means_no_filtering() {
+        // Backward compatibility: a profile without skill directives must not
+        // gate anything — `None` is reserved for "no gate".
+        let discovered = names(&["alpha", "beta", "gamma"]);
+        assert_eq!(
+            fold_effective_skills(None, None, None, &discovered),
+            None,
+            "all-None must fold to None (unfiltered), not an all-skills set"
+        );
+    }
+
+    #[test]
+    fn fold_add_with_no_base_changes_nothing() {
+        let discovered = names(&["alpha", "beta"]);
+        // base = all discovered, so `add` is a subset by construction; its
+        // unknown entry ("delta") is ignored — nothing can be granted that
+        // discovery never found.
+        let effective =
+            fold_effective_skills(None, Some(&names(&["alpha", "delta"])), None, &discovered)
+                .expect("add-only must produce a set");
+        assert_eq!(effective, set(&["alpha", "beta"]));
+    }
+
+    #[test]
+    fn fold_add_unknown_name_is_ignored() {
+        let discovered = names(&["alpha"]);
+        let effective = fold_effective_skills(None, Some(&names(&["ghost"])), None, &discovered)
+            .expect("set produced");
+        // A skill discovery never found cannot be granted.
+        assert_eq!(effective, set(&["alpha"]));
+    }
+
+    #[test]
+    fn fold_remove_cuts_from_all_discovered() {
+        let discovered = names(&["alpha", "beta", "gamma"]);
+        let effective = fold_effective_skills(None, None, Some(&names(&["beta"])), &discovered)
+            .expect("remove-only must produce a set");
+        assert_eq!(effective, set(&["alpha", "gamma"]));
+    }
+
+    #[test]
+    fn fold_remove_unknown_name_is_noop() {
+        let discovered = names(&["alpha"]);
+        let effective = fold_effective_skills(None, None, Some(&names(&["ghost"])), &discovered)
+            .expect("set produced");
+        assert_eq!(effective, set(&["alpha"]));
+    }
+
+    #[test]
+    fn fold_remove_wins_over_add_on_name_clash() {
+        let discovered = names(&["alpha", "beta"]);
+        let effective = fold_effective_skills(
+            None,
+            Some(&names(&["beta"])),
+            Some(&names(&["beta"])),
+            &discovered,
+        )
+        .expect("set produced");
+        assert_eq!(effective, set(&["alpha"]), "remove must always beat add");
+    }
+
+    #[test]
+    fn fold_whitelist_intersects_with_discovery() {
+        let discovered = names(&["alpha", "beta", "gamma"]);
+        let effective = fold_effective_skills(
+            Some(&names(&["alpha", "beta", "ghost"])),
+            None,
+            None,
+            &discovered,
+        )
+        .expect("set produced");
+        // Whitelist entries discovery never found cannot be granted either.
+        assert_eq!(effective, set(&["alpha", "beta"]));
+    }
+
+    #[test]
+    fn fold_whitelist_union_add_minus_remove() {
+        let discovered = names(&["alpha", "beta", "gamma", "delta"]);
+        let effective = fold_effective_skills(
+            Some(&names(&["alpha"])),
+            Some(&names(&["beta", "gamma"])),
+            Some(&names(&["gamma"])),
+            &discovered,
+        )
+        .expect("set produced");
+        // (base ∪ add) − remove = ({alpha} ∪ {beta, gamma}) − {gamma}.
+        assert_eq!(effective, set(&["alpha", "beta"]));
+    }
+
+    #[test]
+    fn fold_can_yield_explicitly_empty_set() {
+        let discovered = names(&["alpha", "beta"]);
+        let effective =
+            fold_effective_skills(None, None, Some(&names(&["alpha", "beta"])), &discovered)
+                .expect("removing everything must still produce a (empty) gate");
+        assert!(effective.is_empty(), "empty gate ≠ no gate");
+    }
+
+    #[test]
+    fn fold_for_profile_without_directives_is_none() {
+        let profile = AgentProfileConfig::default();
+        let discovered = names(&["alpha"]);
+        assert_eq!(
+            effective_skills_for_profile(Some(&profile), &discovered),
+            None
+        );
+        assert_eq!(effective_skills_for_profile(None, &discovered), None);
+    }
+
+    #[test]
+    fn fold_for_profile_applies_directives() {
+        let profile = AgentProfileConfig {
+            skills: Some(names(&["alpha"])),
+            skills_add: Some(names(&["beta"])),
+            ..Default::default()
+        };
+        let discovered = names(&["alpha", "beta", "gamma"]);
+        assert_eq!(
+            effective_skills_for_profile(Some(&profile), &discovered),
+            Some(set(&["alpha", "beta"]))
+        );
+    }
 
     #[test]
     fn parses_skill_frontmatter_and_body() {

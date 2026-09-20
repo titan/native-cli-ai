@@ -3,7 +3,7 @@ use nca_common::session::OrchestrationContext;
 use std::path::{Path, PathBuf};
 
 use crate::plugin::PluginRegistry;
-use crate::skills::SkillCatalog;
+use crate::skills::{SkillCatalog, effective_skills_for_profile};
 
 const BUILT_IN_SYSTEM_PROMPT: &str = r#"You are nca, a native Rust coding assistant running in a terminal workspace.
 
@@ -289,7 +289,11 @@ pub fn build_system_prompt_with_agent(
         sections.push(format!("Local Instructions:\n{}", text.trim()));
     }
 
-    if let Some(section) = skills_section(workspace_root, &config.harness.skill_directories) {
+    if let Some(section) = skills_section(
+        workspace_root,
+        &config.harness.skill_directories,
+        agent_profile,
+    ) {
         sections.push(section);
     }
 
@@ -346,11 +350,27 @@ fn permission_mode_section(mode: PermissionMode) -> Option<String> {
     }
 }
 
+/// Assemble the skills index for the system prompt.
+///
+/// When the active agent profile carries skill directives
+/// (`skills`/`skills_add`/`skills_remove`), the index lists only the folded
+/// effective set ([`crate::skills::effective_skills_for_profile`]) — the
+/// model must not be advertised skills it cannot invoke. The 4000-char
+/// truncation cap applies after filtering, unchanged.
 fn skills_section(
     workspace_root: &Path,
     skill_directories: &[std::path::PathBuf],
+    agent_profile: Option<&AgentProfileConfig>,
 ) -> Option<String> {
     let skills = SkillCatalog::discover(workspace_root, skill_directories).ok()?;
+    let discovered: Vec<String> = skills.iter().map(|s| s.command.clone()).collect();
+    let skills = match effective_skills_for_profile(agent_profile, &discovered) {
+        None => skills,
+        Some(effective) => skills
+            .into_iter()
+            .filter(|skill| effective.contains(&skill.command))
+            .collect::<Vec<_>>(),
+    };
     if skills.is_empty() {
         return None;
     }
@@ -649,5 +669,141 @@ mod tests {
         );
 
         assert_eq!(via_wrapper, via_with_agent);
+    }
+
+    // === per-agent skills index filtering ===
+
+    /// Two deterministic workspace skills; the profile whitelist caps the
+    /// effective set so assertions hold regardless of what the host XDG
+    /// skill directories contain.
+    fn write_two_skills(temp: &tempfile::TempDir) {
+        for (command, body) in [("alpha", "Alpha body."), ("beta", "Beta body.")] {
+            let dir = temp.path().join(format!(".nca/skills/{command}"));
+            fs::create_dir_all(&dir).expect("mkdir");
+            fs::write(
+                dir.join("SKILL.md"),
+                format!(
+                    "---\nname: {}\ncommand: {command}\ndescription: {command} skill\n---\n{body}\n",
+                    command
+                ),
+            )
+            .expect("write skill");
+        }
+    }
+
+    #[test]
+    fn skills_index_whitelisted_by_profile() {
+        let config = NcaConfig::default();
+        let temp = tempdir().expect("tempdir");
+        write_two_skills(&temp);
+        let profile = AgentProfileConfig {
+            skills: Some(vec!["alpha".into()]),
+            ..Default::default()
+        };
+
+        let prompt = build_system_prompt_with_agent(
+            &config,
+            temp.path(),
+            &PluginRegistry::new(),
+            None,
+            Some(&profile),
+            &Vec::new(),
+        );
+
+        let section = prompt
+            .find("Available Skills:")
+            .expect("skills section present");
+        let index = &prompt[section..];
+        assert!(
+            index.contains("/alpha:"),
+            "whitelisted skill must be listed"
+        );
+        assert!(
+            !index.contains("/beta:"),
+            "non-whitelisted skill must be filtered out of the index"
+        );
+    }
+
+    #[test]
+    fn skills_index_remove_wins_over_add() {
+        let config = NcaConfig::default();
+        let temp = tempdir().expect("tempdir");
+        write_two_skills(&temp);
+        let profile = AgentProfileConfig {
+            // Whitelist both, add beta (already in), remove beta → beta loses.
+            skills: Some(vec!["alpha".into(), "beta".into()]),
+            skills_add: Some(vec!["beta".into()]),
+            skills_remove: Some(vec!["beta".into()]),
+            ..Default::default()
+        };
+
+        let prompt = build_system_prompt_with_agent(
+            &config,
+            temp.path(),
+            &PluginRegistry::new(),
+            None,
+            Some(&profile),
+            &Vec::new(),
+        );
+
+        let section = prompt
+            .find("Available Skills:")
+            .expect("skills section present");
+        let index = &prompt[section..];
+        assert!(index.contains("/alpha:"));
+        assert!(!index.contains("/beta:"), "remove must beat add");
+    }
+
+    #[test]
+    fn skills_index_absent_when_profile_removes_everything() {
+        let config = NcaConfig::default();
+        let temp = tempdir().expect("tempdir");
+        write_two_skills(&temp);
+        let profile = AgentProfileConfig {
+            skills: Some(vec!["alpha".into(), "beta".into()]),
+            skills_remove: Some(vec!["alpha".into(), "beta".into()]),
+            ..Default::default()
+        };
+
+        let prompt = build_system_prompt_with_agent(
+            &config,
+            temp.path(),
+            &PluginRegistry::new(),
+            None,
+            Some(&profile),
+            &Vec::new(),
+        );
+
+        assert!(
+            !prompt.contains("Available Skills:"),
+            "an explicitly empty effective set must drop the section entirely"
+        );
+    }
+
+    #[test]
+    fn skills_index_unfiltered_without_directives() {
+        let config = NcaConfig::default();
+        let temp = tempdir().expect("tempdir");
+        write_two_skills(&temp);
+        let profile = AgentProfileConfig::default();
+
+        let prompt = build_system_prompt_with_agent(
+            &config,
+            temp.path(),
+            &PluginRegistry::new(),
+            None,
+            Some(&profile),
+            &Vec::new(),
+        );
+
+        let section = prompt
+            .find("Available Skills:")
+            .expect("skills section present");
+        let index = &prompt[section..];
+        assert!(index.contains("/alpha:"));
+        assert!(
+            index.contains("/beta:"),
+            "profile without directives keeps every skill"
+        );
     }
 }
