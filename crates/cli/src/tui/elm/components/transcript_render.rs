@@ -3,6 +3,9 @@
 //!
 //! Split from `transcript.rs` to keep state management and rendering separate.
 
+use std::sync::Arc;
+use std::time::Instant;
+
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
@@ -11,7 +14,7 @@ use crate::format::format_duration;
 use crate::tui::state::DisplayBlock;
 
 use super::searchable_list::theme;
-use super::transcript::{LineAnswerHit, TranscriptHit, TranscriptState};
+use super::transcript::{LineAnswerHit, StreamingWrap, TranscriptHit};
 
 // ── Text helpers ──────────────────────────────────────────────────
 
@@ -19,36 +22,37 @@ pub(super) fn char_width(ch: char) -> usize {
     ch.width().unwrap_or(1)
 }
 
-pub(super) fn wrap_text(s: &str, width: usize) -> Vec<String> {
-    if width < 8 {
-        return vec![s.to_string()];
+/// Wrap a single paragraph (a slice with no embedded `\n`) to `width` columns.
+///
+/// Pass 1 wraps on word boundaries; pass 2 hard-splits any line that still
+/// exceeds `width` (CJK text without spaces). An empty paragraph yields a
+/// single empty line. This is the exact per-paragraph core of [`wrap_text`],
+/// extracted so [`super::transcript::StreamingWrap`] can wrap one paragraph at
+/// a time without re-wrapping the whole buffer.
+pub(super) fn wrap_paragraph(p: &str, width: usize) -> Vec<String> {
+    if p.is_empty() {
+        return vec![String::new()];
     }
     let mut out = Vec::new();
-    for paragraph in s.split('\n') {
-        if paragraph.is_empty() {
-            out.push(String::new());
-            continue;
-        }
-        let mut line = String::new();
-        let mut line_w = 0usize;
-        for word in paragraph.split_whitespace() {
-            let word_w: usize = word.chars().map(char_width).sum();
-            if line.is_empty() {
-                line = word.to_string();
-                line_w = word_w;
-            } else if line_w + 1 + word_w <= width {
-                line.push(' ');
-                line.push_str(word);
-                line_w += 1 + word_w;
-            } else {
-                out.push(line);
-                line = word.to_string();
-                line_w = word_w;
-            }
-        }
-        if !line.is_empty() {
+    let mut line = String::new();
+    let mut line_w = 0usize;
+    for word in p.split_whitespace() {
+        let word_w: usize = word.chars().map(char_width).sum();
+        if line.is_empty() {
+            line = word.to_string();
+            line_w = word_w;
+        } else if line_w + 1 + word_w <= width {
+            line.push(' ');
+            line.push_str(word);
+            line_w += 1 + word_w;
+        } else {
             out.push(line);
+            line = word.to_string();
+            line_w = word_w;
         }
+    }
+    if !line.is_empty() {
+        out.push(line);
     }
     // Second pass: split any line that still exceeds width (CJK text without spaces).
     let mut final_out = Vec::new();
@@ -73,10 +77,58 @@ pub(super) fn wrap_text(s: &str, width: usize) -> Vec<String> {
             }
         }
     }
+    final_out
+}
+
+/// Wrap `s` to `width` columns, paragraph by paragraph.
+///
+/// Byte-for-byte equivalent to the historical single-pass implementation:
+/// each `\n`-separated paragraph is delegated to [`wrap_paragraph`], and an
+/// all-whitespace (but non-empty) string — which wraps to no lines — is
+/// emitted verbatim as a single line.
+pub(super) fn wrap_text(s: &str, width: usize) -> Vec<String> {
+    if width < 8 {
+        return vec![s.to_string()];
+    }
+    let mut final_out = Vec::new();
+    for paragraph in s.split('\n') {
+        final_out.extend(wrap_paragraph(paragraph, width));
+    }
     if final_out.is_empty() && !s.is_empty() {
         final_out.push(s.to_string());
     }
     final_out
+}
+
+/// Lazily wrap a block's primary text at `w`, memoizing the result in
+/// `cache` (index-aligned with the transcript's `blocks`).
+///
+/// Clears the whole cache when the render width changes so stale-width lines
+/// are never reused. The cache lives on `TranscriptState` as `content_cache`
+/// and `content_cache_width`; keeping it a free function lets the caller hold a
+/// disjoint borrow of `self.blocks` while handing out a mutable borrow of the
+/// cache.
+pub(super) fn cached_block_lines(
+    cache: &mut [Option<Arc<Vec<String>>>],
+    cache_width: &mut u16,
+    idx: usize,
+    text: &str,
+    w: usize,
+) -> Arc<Vec<String>> {
+    if usize::from(*cache_width) != w {
+        for slot in cache.iter_mut() {
+            *slot = None;
+        }
+        *cache_width = w as u16;
+    }
+    if let Some(Some(lines)) = cache.get(idx) {
+        return Arc::clone(lines);
+    }
+    let wrapped = Arc::new(wrap_text(text, w));
+    if idx < cache.len() {
+        cache[idx] = Some(Arc::clone(&wrapped));
+    }
+    wrapped
 }
 
 pub(super) fn wrap_preformatted(text: &str, _width: usize) -> Vec<String> {
@@ -556,10 +608,17 @@ pub(super) fn apply_selection_highlight(
 // ── emit_* functions (virtualized rendering) ─────────────────────
 
 /// Emit lines for a single block, with skip/take virtualization.
+///
+/// `content_cache`/`content_cache_width` memoize the wrapped "primary text"
+/// of User/Assistant/Thinking/ToolDone/System blocks so a long committed
+/// block is not re-wrapped on every frame (see [`cached_block_lines`]).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_block_lines(
     block: &DisplayBlock,
     bi: usize,
     w: usize,
+    content_cache: &mut [Option<Arc<Vec<String>>>],
+    content_cache_width: &mut u16,
     lines: &mut Vec<Line<'static>>,
     hits: &mut Vec<LineAnswerHit>,
     skip: usize,
@@ -592,9 +651,10 @@ pub(super) fn emit_block_lines(
                 None,
             );
             push(Line::default(), None);
-            for tl in wrap_text(content, w) {
+            let wrapped = cached_block_lines(content_cache, content_cache_width, bi, content, w);
+            for tl in wrapped.iter() {
                 push(
-                    Line::from(Span::styled(tl, Style::default().fg(theme::TEXT))),
+                    Line::from(Span::styled(tl.clone(), Style::default().fg(theme::TEXT))),
                     None,
                 );
             }
@@ -612,8 +672,9 @@ pub(super) fn emit_block_lines(
                 None,
             );
             push(Line::default(), None);
-            for tl in wrap_text(content, w) {
-                push(parse_md_line(&tl), None);
+            let wrapped = cached_block_lines(content_cache, content_cache_width, bi, content, w);
+            for tl in wrapped.iter() {
+                push(parse_md_line(tl), None);
             }
             push(Line::default(), None);
         }
@@ -745,7 +806,7 @@ pub(super) fn emit_block_lines(
         } => {
             let icon = "✓";
             let st = Style::default().fg(theme::SUCCESS);
-            let all_l: Vec<String> = wrap_text(full_output, w);
+            let all_l = cached_block_lines(content_cache, content_cache_width, bi, full_output, w);
             let total = all_l.len();
             let preview = 3usize;
             let is_exp = *expanded;
@@ -814,9 +875,13 @@ pub(super) fn emit_block_lines(
             push(Line::default(), None);
         }
         DisplayBlock::System(s) => {
-            for text_line in wrap_text(s, w) {
+            let wrapped = cached_block_lines(content_cache, content_cache_width, bi, s, w);
+            for text_line in wrapped.iter() {
                 push(
-                    Line::from(Span::styled(text_line, Style::default().fg(theme::WARN))),
+                    Line::from(Span::styled(
+                        text_line.clone(),
+                        Style::default().fg(theme::WARN),
+                    )),
                     None,
                 );
             }
@@ -918,7 +983,7 @@ pub(super) fn emit_block_lines(
             expanded,
             duration_ms,
         } => {
-            let all_l: Vec<String> = wrap_text(content, w);
+            let all_l = cached_block_lines(content_cache, content_cache_width, bi, content, w);
             let total = all_l.len();
             let is_exp = *expanded;
             let preview = 3usize;
@@ -983,113 +1048,112 @@ pub(super) fn emit_block_lines(
 }
 
 /// Virtualized streaming reasoning lines.
+///
+/// `wrap` is the precomputed incremental wrap cache for the reasoning buffer
+/// (see [`StreamingWrap`]). Only lines inside the requested `[skip,
+/// skip+max_lines)` window are materialized, so a long reasoning stream no
+/// longer re-wraps or re-spans the whole buffer on every frame.
 pub(super) fn emit_streaming_reasoning_lines(
-    state: &TranscriptState,
-    w: usize,
+    wrap: &StreamingWrap,
+    expanded: bool,
+    started_at: Option<Instant>,
     lines: &mut Vec<Line<'static>>,
     hits: &mut Vec<LineAnswerHit>,
     skip: usize,
     max_lines: usize,
 ) {
-    let reasoning = state.streaming_reasoning.as_deref().unwrap_or("");
-    let all_rl: Vec<String> = wrap_text(reasoning, w);
-    let total_rl = all_rl.len();
+    let total_rl = wrap.len();
     let preview_rl = 5usize;
-    let show_rl = if state.streaming_reasoning_expanded || total_rl <= preview_rl {
+    let show_rl = if expanded || total_rl <= preview_rl {
         total_rl
     } else {
         preview_rl
     };
-    let mut emitted = 0usize;
-    let mut skipped = 0usize;
-    let mut push = |line: Line<'static>, hit: LineAnswerHit| {
-        if skipped < skip {
-            skipped += 1;
-            return;
-        }
-        if emitted >= max_lines {
-            return;
-        }
-        lines.push(line);
-        hits.push(hit);
-        emitted += 1;
-    };
-    let mut title = vec![
-        Span::styled(" 💭 thinking ", Style::default().fg(theme::MUTED)),
-        Span::styled("…", Style::default().fg(theme::MUTED)),
-    ];
-    // Live elapsed timer while thinking; redrawn at the busy animation cadence.
-    if let Some(start) = state.reasoning_started_at {
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-        title.push(Span::styled(
-            format!(" · {}", format_duration(elapsed_ms)),
-            Style::default().fg(theme::MUTED),
-        ));
-    }
-    push(Line::from(title), None);
-    for rl in &all_rl[..show_rl] {
-        push(
-            Line::from(Span::styled(rl.clone(), Style::default().fg(theme::MUTED))),
-            None,
-        );
-    }
-    if total_rl > preview_rl {
-        let label: String = if state.streaming_reasoning_expanded {
-            " ▾ hide thinking ".into()
-        } else {
-            format!(" ▸ show thinking ({}/{}) ", show_rl, total_rl)
-        };
-        push(
-            Line::from(vec![
+    let has_toggle = total_rl > preview_rl;
+    // Logical layout: [title] + [show_rl content lines] + [toggle?] + [blank].
+    let n_logical = 1 + show_rl + usize::from(has_toggle) + 1;
+    let start = skip.min(n_logical);
+    let end = skip.saturating_add(max_lines).min(n_logical);
+    for idx in start..end {
+        if idx == 0 {
+            let mut title = vec![
+                Span::styled(" 💭 thinking ", Style::default().fg(theme::MUTED)),
+                Span::styled("…", Style::default().fg(theme::MUTED)),
+            ];
+            // Live elapsed timer while thinking; redrawn at the busy animation cadence.
+            if let Some(since) = started_at {
+                let elapsed_ms = since.elapsed().as_millis() as u64;
+                title.push(Span::styled(
+                    format!(" · {}", format_duration(elapsed_ms)),
+                    Style::default().fg(theme::MUTED),
+                ));
+            }
+            lines.push(Line::from(title));
+            hits.push(None);
+        } else if idx <= show_rl {
+            let rl = wrap.line(idx - 1);
+            lines.push(Line::from(Span::styled(
+                rl.to_string(),
+                Style::default().fg(theme::MUTED),
+            )));
+            hits.push(None);
+        } else if has_toggle && idx == 1 + show_rl {
+            let label: String = if expanded {
+                " ▾ hide thinking ".into()
+            } else {
+                format!(" ▸ show thinking ({}/{}) ", show_rl, total_rl)
+            };
+            lines.push(Line::from(vec![
                 Span::styled(label, Style::default().fg(theme::TOOL)),
                 Span::styled("(click)", Style::default().fg(theme::MUTED)),
-            ]),
-            Some(TranscriptHit::ToggleStreamingThinking),
-        );
+            ]));
+            hits.push(Some(TranscriptHit::ToggleStreamingThinking));
+        } else {
+            lines.push(Line::default());
+            hits.push(None);
+        }
     }
-    push(Line::default(), None);
 }
 
 /// Virtualized streaming assistant lines.
+///
+/// `wrap` is the precomputed incremental wrap cache for the assistant buffer;
+/// only the requested `[skip, skip+max_lines)` window is materialized (and only
+/// those lines go through `parse_md_line`).
 pub(super) fn emit_streaming_assistant_lines(
-    state: &TranscriptState,
-    w: usize,
+    wrap: &StreamingWrap,
     lines: &mut Vec<Line<'static>>,
     hits: &mut Vec<LineAnswerHit>,
     skip: usize,
     max_lines: usize,
 ) {
-    let stream = state.streaming_assistant.as_deref().unwrap_or("");
-    if stream.is_empty() {
+    // Logical layout: [" nca " header] + [blank] + [content lines].
+    // Mirrors the original early return: an empty streaming buffer emits no
+    // assistant lines at all.
+    if wrap.is_empty() {
         return;
     }
-    let mut emitted = 0usize;
-    let mut skipped = 0usize;
-    let mut push = |line: Line<'static>, hit: LineAnswerHit| {
-        if skipped < skip {
-            skipped += 1;
-            return;
+    let total = wrap.len();
+    let n_logical = 2 + total;
+    let start = skip.min(n_logical);
+    let end = skip.saturating_add(max_lines).min(n_logical);
+    for idx in start..end {
+        if idx == 0 {
+            lines.push(Line::from(vec![Span::styled(
+                " nca ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(theme::ASSISTANT)
+                    .add_modifier(Modifier::BOLD),
+            )]));
+            hits.push(None);
+        } else if idx == 1 {
+            lines.push(Line::default());
+            hits.push(None);
+        } else {
+            lines.push(parse_md_line(wrap.line(idx - 2)));
+            hits.push(None);
         }
-        if emitted >= max_lines {
-            return;
-        }
-        lines.push(line);
-        hits.push(hit);
-        emitted += 1;
-    };
-    push(
-        Line::from(vec![Span::styled(
-            " nca ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(theme::ASSISTANT)
-                .add_modifier(Modifier::BOLD),
-        )]),
-        None,
-    );
-    push(Line::default(), None);
-    for tl in wrap_text(stream, w) {
-        push(parse_md_line(&tl), None);
     }
 }
 

@@ -2,6 +2,7 @@
 //! text selection, streaming text, and collapsible blocks.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -23,7 +24,7 @@ use super::searchable_list::theme;
 use super::transcript_render::{
     apply_selection_highlight, block_line_count, emit_block_lines, emit_empty_fallback_lines,
     emit_streaming_assistant_lines, emit_streaming_reasoning_lines, plain_text_from_lines,
-    wrap_text,
+    wrap_paragraph,
 };
 
 const MOUSE_SCROLL_LINES: usize = 6;
@@ -171,6 +172,167 @@ impl BlockLineCache {
     }
 }
 
+// ── StreamingWrap ────────────────────────────────────────────────
+
+/// Incremental word-wrap cache for a streaming text buffer.
+///
+/// Streaming buffers grow one delta at a time (`TokensStreamed` /
+/// `ReasoningStreamed`). Re-wrapping the whole buffer on every delta — once
+/// for the line count, again for the visible slice, again for emission — is
+/// O(buffer) per frame and starves the input loop in long sessions. This cache
+/// wraps only the paragraphs a delta *completes* and re-wraps just the trailing
+/// (unterminated) paragraph, so per-delta work is O(delta) and per-frame reads
+/// are O(1).
+///
+/// `len()`/`line(i)` mirror `wrap_text(&text, width)` exactly, including the
+/// all-whitespace fallback and the empty-string single empty line.
+pub(crate) struct StreamingWrap {
+    /// Width the cached lines were wrapped at.
+    width: usize,
+    /// Raw text accumulated so far; kept in lockstep with the owning streaming
+    /// buffer so a width change (resize) can rebuild exactly.
+    text: String,
+    /// Wrapped lines of every *completed* paragraph (terminated by `\n`).
+    finalized: Vec<String>,
+    /// Trailing paragraph not yet terminated by `\n`.
+    active: String,
+    /// `wrap_paragraph(&active, width)`, recomputed on each append.
+    active_wrapped: Vec<String>,
+}
+
+impl StreamingWrap {
+    /// An empty cache (mirrors `wrap_text("", width)` → one empty line).
+    pub(crate) fn new() -> Self {
+        Self {
+            width: 0,
+            text: String::new(),
+            finalized: Vec::new(),
+            active: String::new(),
+            active_wrapped: vec![String::new()],
+        }
+    }
+
+    /// Total wrapped line count.
+    pub(crate) fn len(&self) -> usize {
+        let n = self.finalized.len() + self.active_wrapped.len();
+        if n == 0 && !self.text.is_empty() {
+            1
+        } else {
+            n
+        }
+    }
+
+    /// Whether the owning streaming buffer is currently empty.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    /// Wrapped line `i`. Caller must ensure `i < len()`.
+    pub(crate) fn line(&self, i: usize) -> &str {
+        if self.finalized.is_empty() && self.active_wrapped.is_empty() && !self.text.is_empty() {
+            return &self.text;
+        }
+        if i < self.finalized.len() {
+            &self.finalized[i]
+        } else {
+            &self.active_wrapped[i - self.finalized.len()]
+        }
+    }
+
+    /// Forget all cached state. Used when the owning streaming buffer is
+    /// cleared (`None`).
+    pub(crate) fn reset(&mut self) {
+        self.width = 0;
+        self.text.clear();
+        self.finalized.clear();
+        self.active.clear();
+        self.active_wrapped.clear();
+        self.active_wrapped.push(String::new());
+    }
+
+    /// Replace the cached raw text without wrapping it; forces a lazy rebuild
+    /// on the next read/append. Used when the owning buffer is set externally.
+    pub(crate) fn set_text(&mut self, text: &str) {
+        self.width = 0;
+        self.text.clear();
+        self.text.push_str(text);
+        self.finalized.clear();
+        self.active.clear();
+        self.active_wrapped.clear();
+        self.active_wrapped.push(String::new());
+    }
+
+    /// Rebuild the whole cache from `text` at width `w` (rare: resize or the
+    /// first read after an external buffer replacement).
+    pub(crate) fn rebuild_from(&mut self, text: &str, w: usize) {
+        self.width = w;
+        self.text.clear();
+        self.text.push_str(text);
+        self.finalized.clear();
+        self.active.clear();
+        self.active_wrapped.clear();
+        let segments: Vec<&str> = text.split('\n').collect();
+        let (last, complete) = segments
+            .split_last()
+            .expect("split always yields at least one segment");
+        for seg in complete {
+            self.finalized.extend(wrap_paragraph(seg, w));
+        }
+        self.active.push_str(last);
+        self.active_wrapped = wrap_paragraph(last, w);
+    }
+
+    /// Ensure the cache is wrapped at width `w`, rebuilding from `text` on a
+    /// width change. `text` must be the owning buffer's current contents.
+    pub(crate) fn ensure(&mut self, text: &str, w: usize) {
+        if self.width != w {
+            self.rebuild_from(text, w);
+        }
+    }
+
+    /// Extend the cache with `delta`, wrapping at `w`. Only the paragraphs the
+    /// delta completes, plus the trailing partial paragraph, are (re-)wrapped;
+    /// a width change falls back to a full rebuild.
+    pub(crate) fn append(&mut self, delta: &str, w: usize) {
+        self.text.push_str(delta);
+        if w != self.width {
+            let text = std::mem::take(&mut self.text);
+            self.rebuild_from(&text, w);
+            return;
+        }
+        let segments: Vec<&str> = delta.split('\n').collect();
+        let (last, complete) = segments
+            .split_last()
+            .expect("split always yields at least one segment");
+        for seg in complete {
+            self.active.push_str(seg);
+            self.finalized.extend(wrap_paragraph(&self.active, w));
+            self.active.clear();
+        }
+        self.active.push_str(last);
+        self.active_wrapped = wrap_paragraph(&self.active, w);
+    }
+}
+
+/// Bound a `ToolRunning` block's streamed-output buffer.
+///
+/// `streamed_output` is a pure display buffer (the authoritative full output
+/// arrives via `ToolCallCompleted`), so it is safe to keep only the tail. Once
+/// it exceeds 8 KiB it is trimmed to roughly the last 4 KiB, snapped forward to
+/// a char boundary so no UTF-8 sequence is split.
+fn cap_streamed_output(s: &mut String) {
+    const CAP: usize = 8192;
+    const KEEP: usize = 4096;
+    if s.len() <= CAP {
+        return;
+    }
+    let mut start = s.len() - KEEP;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    s.drain(..start);
+}
+
 // ── TranscriptState ──────────────────────────────────────────────
 
 pub(crate) struct TranscriptState {
@@ -216,6 +378,26 @@ pub(crate) struct TranscriptState {
 
     // ── UI-layer timer for reasoning/thinking blocks ──
     pub(crate) reasoning_started_at: Option<Instant>,
+
+    // ── Incremental streaming wrap caches ──
+    /// Incremental wrap cache for `streaming_assistant`, so the whole stream is
+    /// not re-wrapped on every frame.
+    streaming_assistant_wrap: StreamingWrap,
+    /// Incremental wrap cache for `streaming_reasoning`.
+    streaming_reasoning_wrap: StreamingWrap,
+
+    // ── Committed-block content cache ──
+    /// Per-block memoized wrap of the block's primary text (User/Assistant
+    /// content, Thinking content, ToolDone full_output, System text), indexed to
+    /// match `blocks`. `None` means invalid or wrapped at a stale width.
+    content_cache: Vec<Option<Arc<Vec<String>>>>,
+    /// Width `content_cache` was last valid at; a render-width change refills it.
+    content_cache_width: u16,
+
+    /// call_id → index of the in-flight `ToolRunning` block, so
+    /// `ToolOutputChunk` can locate its block in O(1) instead of a reverse scan
+    /// of `blocks` on every chunk.
+    tool_running_blocks: HashMap<String, usize>,
 }
 
 impl TranscriptState {
@@ -238,6 +420,11 @@ impl TranscriptState {
             compaction_block: None,
             _active_question: None,
             reasoning_started_at: None,
+            streaming_assistant_wrap: StreamingWrap::new(),
+            streaming_reasoning_wrap: StreamingWrap::new(),
+            content_cache: Vec::new(),
+            content_cache_width: 0,
+            tool_running_blocks: HashMap::new(),
         }
     }
 
@@ -259,6 +446,7 @@ impl TranscriptState {
             } => {
                 if role == "user" {
                     self.streaming_assistant = None;
+                    self.streaming_assistant_wrap.reset();
                     // Steering messages get a small dim-style prefix marker so
                     // they are visually distinct from the turn's initial prompt.
                     let content = if *steering {
@@ -270,8 +458,11 @@ impl TranscriptState {
                     self.blocks_pushed();
                 } else if role == "assistant" {
                     self.streaming_assistant = None;
+                    self.streaming_assistant_wrap.reset();
                     // Commit any accumulated reasoning before the assistant text.
-                    if let Some(reasoning) = self.streaming_reasoning.take()
+                    let reasoning = self.streaming_reasoning.take();
+                    self.streaming_reasoning_wrap.reset();
+                    if let Some(reasoning) = reasoning
                         && !reasoning.trim().is_empty()
                     {
                         let duration_ms = self
@@ -293,13 +484,16 @@ impl TranscriptState {
                 self.streaming_assistant
                     .get_or_insert_with(String::new)
                     .push_str(delta);
-                // Streaming text is measured via `streaming_assistant_line_count`
-                // (outside the BlockLineCache), so committed blocks/cached
-                // heights are unaffected. Returning here skips the generation
-                // bump — without this, every token during streaming rebuilds the
-                // entire committed-blocks line-height cache at O(total
-                // transcript text), which is the dominant per-frame cost in long
-                // sessions and starves the input loop.
+                // Mirror the delta into the incremental wrap cache. Streaming
+                // text is measured from the cache (`streaming_assistant_line_
+                // count`), so committed blocks/cached heights are unaffected.
+                // Returning here skips the generation bump — without this,
+                // every token during streaming rebuilds the entire
+                // committed-blocks line-height cache at O(total transcript
+                // text), the dominant per-frame cost in long sessions that
+                // starves the input loop.
+                self.streaming_assistant_wrap
+                    .append(delta, usize::from(self.last_width.max(20)));
                 return TranscriptAction::None;
             }
             AgentEvent::ReasoningStreamed { delta } => {
@@ -309,6 +503,8 @@ impl TranscriptState {
                 if is_start {
                     self.reasoning_started_at = Some(Instant::now());
                 }
+                self.streaming_reasoning_wrap
+                    .append(delta, usize::from(self.last_width.max(20)));
                 // See TokensStreamed: reasoning is measured outside the cache.
                 return TranscriptAction::None;
             }
@@ -325,14 +521,46 @@ impl TranscriptState {
                     streamed_output: String::new(),
                 });
                 self.blocks_pushed();
+                self.tool_running_blocks
+                    .insert(call_id.clone(), self.blocks.len() - 1);
             }
             AgentEvent::ToolOutputChunk { call_id, delta } => {
-                if let Some(DisplayBlock::ToolRunning {
-                    streamed_output, ..
-                }) = self.blocks.iter_mut().rev().find(
-                    |b| matches!(b, DisplayBlock::ToolRunning { call_id: id, .. } if id == call_id),
-                ) {
-                    streamed_output.push_str(delta);
+                // O(1) lookup via the call_id → block-index map; fall back to a
+                // reverse scan only if the map is missing the entry.
+                let idx = self
+                    .tool_running_blocks
+                    .get(call_id)
+                    .copied()
+                    .filter(|&i| {
+                        matches!(
+                            self.blocks.get(i),
+                            Some(DisplayBlock::ToolRunning { call_id: id, .. }) if id == call_id
+                        )
+                    })
+                    .or_else(|| {
+                        self.blocks.iter().rposition(|b| {
+                            matches!(b, DisplayBlock::ToolRunning { call_id: id, .. } if id == call_id)
+                        })
+                    });
+                if let Some(i) = idx {
+                    if let Some(DisplayBlock::ToolRunning {
+                        streamed_output, ..
+                    }) = self.blocks.get_mut(i)
+                    {
+                        streamed_output.push_str(delta);
+                        cap_streamed_output(streamed_output);
+                    }
+                    // Re-measure just this block and patch its cached height in
+                    // place (no generation bump → the cache stays incremental).
+                    // `cap_streamed_output` bounds this re-measure's cost.
+                    if self.line_cache.is_valid(
+                        self.blocks_generation,
+                        self.last_width,
+                        self.blocks.len(),
+                    ) {
+                        let h = block_line_count(&self.blocks[i], usize::from(self.last_width));
+                        self.line_cache.set_height(i, h);
+                    }
                 }
                 // CRITICAL: do NOT bump blocks_generation or return a
                 // cache-invalidating action. Streaming chunks are
@@ -395,6 +623,7 @@ impl TranscriptState {
                     });
                     self.blocks_pushed();
                 }
+                self.tool_running_blocks.remove(call_id);
             }
             AgentEvent::ApprovalRequested {
                 call_id,
@@ -651,6 +880,8 @@ impl TranscriptState {
             let h = block_line_count(block, self.last_width as usize);
             self.line_cache.append_height(h);
         }
+        // Keep the content cache index-aligned with `blocks`.
+        self.content_cache.push(None);
         self.blocks_generation = self.blocks_generation.wrapping_add(1);
         if was_valid {
             self.line_cache.sync_generation(self.blocks_generation);
@@ -672,6 +903,10 @@ impl TranscriptState {
             let h = block_line_count(&self.blocks[idx], self.last_width as usize);
             self.line_cache.set_height(idx, h);
         }
+        // Drop the mutated block's memoized wrapped lines.
+        if idx < self.content_cache.len() {
+            self.content_cache[idx] = None;
+        }
         self.blocks_generation = self.blocks_generation.wrapping_add(1);
         if valid {
             self.line_cache.sync_generation(self.blocks_generation);
@@ -679,7 +914,9 @@ impl TranscriptState {
     }
 
     fn flush_stream_before_tool(&mut self) {
-        if let Some(reasoning) = self.streaming_reasoning.take()
+        let reasoning = self.streaming_reasoning.take();
+        self.streaming_reasoning_wrap.reset();
+        if let Some(reasoning) = reasoning
             && !reasoning.trim().is_empty()
         {
             let duration_ms = self
@@ -693,7 +930,9 @@ impl TranscriptState {
             });
             self.blocks_pushed();
         }
-        if let Some(s) = self.streaming_assistant.take()
+        let assistant = self.streaming_assistant.take();
+        self.streaming_assistant_wrap.reset();
+        if let Some(s) = assistant
             && !s.trim().is_empty()
         {
             self.blocks.push(DisplayBlock::Assistant(s));
@@ -720,16 +959,26 @@ impl TranscriptState {
 
     pub(crate) fn set_streaming_assistant(&mut self, text: Option<String>) {
         self.streaming_assistant = text;
+        self.streaming_assistant_wrap.reset();
+        if let Some(t) = &self.streaming_assistant {
+            self.streaming_assistant_wrap.set_text(t);
+        }
     }
 
     pub(crate) fn set_streaming_reasoning(&mut self, text: Option<String>) {
         self.streaming_reasoning = text;
+        self.streaming_reasoning_wrap.reset();
+        if let Some(t) = &self.streaming_reasoning {
+            self.streaming_reasoning_wrap.set_text(t);
+        }
     }
 
     pub(crate) fn clear(&mut self) {
         self.blocks.clear();
         self.streaming_assistant = None;
         self.streaming_reasoning = None;
+        self.streaming_assistant_wrap.reset();
+        self.streaming_reasoning_wrap.reset();
         self.streaming_reasoning_expanded = false;
         self.scroll_lines = 0;
         self.transcript_follow_tail = true;
@@ -737,7 +986,10 @@ impl TranscriptState {
         self.transcript_dragging = false;
         self.transcript_drag_anchor = None;
         self.child_activity_blocks.clear();
+        self.tool_running_blocks.clear();
         self.compaction_block = None;
+        self.content_cache.clear();
+        self.content_cache_width = 0;
         self.line_cache.reset();
         self.blocks_generation = self.blocks_generation.wrapping_add(1);
     }
@@ -1017,34 +1269,43 @@ impl TranscriptState {
 
     // ── Line counting helpers ───────────────────────────────────
 
-    fn streaming_reasoning_line_count(&self, w: usize) -> usize {
-        if let Some(reasoning) = &self.streaming_reasoning
-            && !reasoning.is_empty()
-        {
-            let all_rl = wrap_text(reasoning, w);
-            let total_rl = all_rl.len();
-            let preview_rl = 5usize;
-            let show_rl = if self.streaming_reasoning_expanded || total_rl <= preview_rl {
-                total_rl
-            } else {
-                preview_rl
-            };
-            let mut rl = 1 + show_rl + 1;
-            if total_rl > preview_rl {
-                rl += 1;
-            }
-            return rl;
+    /// Visible logical line count of the streaming reasoning block at width
+    /// `w`. Reads the incremental wrap cache in O(1), lazily rebuilding it only
+    /// if the render width changed (`&mut self` for that rebuild).
+    fn streaming_reasoning_line_count(&mut self, w: usize) -> usize {
+        let Some(reasoning) = self.streaming_reasoning.as_deref() else {
+            return 0;
+        };
+        if reasoning.is_empty() {
+            return 0;
         }
-        0
+        self.streaming_reasoning_wrap.ensure(reasoning, w);
+        let total_rl = self.streaming_reasoning_wrap.len();
+        let preview_rl = 5usize;
+        let show_rl = if self.streaming_reasoning_expanded || total_rl <= preview_rl {
+            total_rl
+        } else {
+            preview_rl
+        };
+        let mut rl = 1 + show_rl + 1;
+        if total_rl > preview_rl {
+            rl += 1;
+        }
+        rl
     }
 
-    fn streaming_assistant_line_count(&self, w: usize) -> usize {
-        if let Some(stream) = &self.streaming_assistant
-            && !stream.is_empty()
-        {
-            return 2 + wrap_text(stream, w).len();
+    /// Visible logical line count of the streaming assistant block at width
+    /// `w`. O(1) via the incremental wrap cache (see
+    /// `streaming_reasoning_line_count`).
+    fn streaming_assistant_line_count(&mut self, w: usize) -> usize {
+        let Some(stream) = self.streaming_assistant.as_deref() else {
+            return 0;
+        };
+        if stream.is_empty() {
+            return 0;
         }
-        0
+        self.streaming_assistant_wrap.ensure(stream, w);
+        2 + self.streaming_assistant_wrap.len()
     }
 
     pub(crate) fn total_line_count(&mut self, width: u16) -> usize {
@@ -1130,6 +1391,8 @@ impl TranscriptState {
                 block,
                 bi,
                 w,
+                &mut self.content_cache,
+                &mut self.content_cache_width,
                 &mut lines,
                 &mut hits,
                 start.saturating_sub(global_line),
@@ -1141,8 +1404,9 @@ impl TranscriptState {
         // Streaming reasoning
         if srl > 0 && global_line < end {
             emit_streaming_reasoning_lines(
-                self,
-                w,
+                &self.streaming_reasoning_wrap,
+                self.streaming_reasoning_expanded,
+                self.reasoning_started_at,
                 &mut lines,
                 &mut hits,
                 start.saturating_sub(global_line),
@@ -1154,8 +1418,7 @@ impl TranscriptState {
         // Streaming assistant
         if sal > 0 && global_line < end {
             emit_streaming_assistant_lines(
-                self,
-                w,
+                &self.streaming_assistant_wrap,
                 &mut lines,
                 &mut hits,
                 start.saturating_sub(global_line),
@@ -1181,17 +1444,45 @@ impl TranscriptState {
     /// Build ALL lines (for clipboard copy — non-virtualized).
     fn build_all_lines(&mut self, width: u16) -> Vec<Line<'static>> {
         let w = width.max(20) as usize;
+        // Bring the streaming wrap caches up to the current width before the
+        // (unconditional) streaming emission below.
+        let _ = self.streaming_reasoning_line_count(w);
+        let _ = self.streaming_assistant_line_count(w);
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut hits: Vec<LineAnswerHit> = Vec::new();
 
         for (bi, block) in self.blocks.iter().enumerate() {
-            emit_block_lines(block, bi, w, &mut lines, &mut hits, 0, usize::MAX);
+            emit_block_lines(
+                block,
+                bi,
+                w,
+                &mut self.content_cache,
+                &mut self.content_cache_width,
+                &mut lines,
+                &mut hits,
+                0,
+                usize::MAX,
+            );
         }
 
         // Streaming reasoning
-        emit_streaming_reasoning_lines(self, w, &mut lines, &mut hits, 0, usize::MAX);
+        emit_streaming_reasoning_lines(
+            &self.streaming_reasoning_wrap,
+            self.streaming_reasoning_expanded,
+            self.reasoning_started_at,
+            &mut lines,
+            &mut hits,
+            0,
+            usize::MAX,
+        );
         // Streaming assistant
-        emit_streaming_assistant_lines(self, w, &mut lines, &mut hits, 0, usize::MAX);
+        emit_streaming_assistant_lines(
+            &self.streaming_assistant_wrap,
+            &mut lines,
+            &mut hits,
+            0,
+            usize::MAX,
+        );
 
         // Empty fallback
         if lines.is_empty() && self.blocks.is_empty() {
