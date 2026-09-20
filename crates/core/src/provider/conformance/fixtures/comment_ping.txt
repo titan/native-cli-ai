@@ -1,0 +1,16 @@
+: keep-alive
+
+data: {"choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
+
+: ping
+
+data: {"choices":[{"index":0,"delta":{"content":" world"},"finish_reason":null}]}
+
+: keep-alive
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+: bye
+
+data: [DONE]
+

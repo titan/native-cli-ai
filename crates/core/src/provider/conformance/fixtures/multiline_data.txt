@@ -1,0 +1,7 @@
+data: {"choices":[{"index":0,"delta":{"content":"split"
+data: },"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{"content":"kept"},"finish_reason":null}]}
+
+data: [DONE]
+
