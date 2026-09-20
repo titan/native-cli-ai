@@ -1,8 +1,8 @@
 //! Conformance fixtures + pinning harness for the OpenAI-compatible SSE parser.
 //!
 //! Phase 1 covers only the OpenAI `chat.completions` wire format. The
-//! Anthropic side is deliberately deferred until the sibling extraction lane
-//! lands its equivalent core.
+//! Anthropic side is deferred: the extracted `run_anthropic_sse` core now
+//! exists, but no anthropic fixtures have been pinned yet.
 //!
 //! ## Layout
 //!
@@ -16,25 +16,18 @@
 //! The whole module is gated by `#[cfg(test)]` at its declaration site in
 //! `provider.rs`, so it never enters a release build.
 //!
-//! ## Transitional driver (IMPORTANT)
+//! ## Driver
 //!
-//! The production parser lives inside `openai_compat::spawn_openai_stream`,
-//! which is welded to `reqwest::Response` — it has no byte-stream entry point
-//! that a unit test can drive with controlled chunk boundaries. The sibling
-//! lane is lifting the `bytes → StreamChunk` loop into a testable
-//! `pub(crate) async fn run_openai_sse(byte_stream, provider_name) -> Receiver`.
+//! Fixtures are driven through the *production* core
+//! [`openai_compat::run_openai_sse`] — extracted from `spawn_openai_stream` —
+//! with deterministic chunk-boundary splits (no network, no mock server), so
+//! every pinned expectation exercises the shipping parser directly.
 //!
-//! Until that core is available on this branch, [`run_openai_sse`] below is a
-//! **transitional, behavior-faithful port** of the line loop in
-//! `spawn_openai_stream` (the network/timeout branches are intentionally
-//! omitted — a pre-loaded fixture stream never idles or errors). When the real
-//! core lands, delete the mirror and point [`drive`] at it: the fixture bytes
-//! and the expected sequences stay unchanged, only the `use` line moves.
-//!
-//! [`real_parser_agrees_with_reference_on_whole_block`] is the anti-drift
-//! guard: it runs every ASCII fixture through the *real* `spawn_openai_stream`
-//! (via the tiny-http mock server) and asserts the real output equals the
-//! mirror's output, so the two cannot silently diverge.
+//! [`real_parser_agrees_with_reference_on_whole_block`] is the end-to-end
+//! guard: it pushes every ASCII fixture through the full `spawn_openai_stream`
+//! path (tiny-http mock server, reqwest body stream) and asserts the
+//! socket-fed output equals the in-memory reference, so the HTTP shell /
+//! `ByteStreamError` adaptation layer cannot silently diverge from the core.
 //!
 //! ## Known gaps (pinned, not fixed — see the two `gap_*` tests)
 //!
@@ -45,15 +38,11 @@
 //!    assembled, so a chunk boundary that lands mid-UTF-8-sequence corrupts the
 //!    glyph into U+FFFD.
 
-use std::collections::BTreeMap;
-
-use futures_util::StreamExt;
-use futures_util::stream::Stream;
-use nca_common::tool::ToolCall;
 use serde_json::Value;
 
+use crate::provider::openai_compat::run_openai_sse;
 use crate::provider::test_support::collect_chunks;
-use crate::provider::{ProviderError, StreamChunk};
+use crate::provider::{ByteStreamError, StreamChunk};
 
 // ---------------------------------------------------------------------------
 // Fixture manifest
@@ -146,205 +135,16 @@ fn split_bytes(bytes: &[u8], split: Split) -> Vec<Vec<u8>> {
     }
 }
 
-/// Drive the reference parser with `bytes` split per `split`, collecting every
-/// emitted chunk (up to and including `Done`).
+/// Drive the production parser core with `bytes` split per `split`, collecting
+/// every emitted chunk (up to and including `Done`).
 async fn drive(bytes: &str, split: Split) -> Vec<StreamChunk> {
-    let items: Vec<Result<Vec<u8>, ProviderError>> = split_bytes(bytes.as_bytes(), split)
+    let items: Vec<Result<Vec<u8>, ByteStreamError>> = split_bytes(bytes.as_bytes(), split)
         .into_iter()
         .map(Ok)
         .collect();
     let stream = futures_util::stream::iter(items);
-    let rx = run_openai_sse(stream, "conformance").await;
+    let rx = run_openai_sse(stream, "conformance");
     collect_chunks(rx).await
-}
-
-// ---------------------------------------------------------------------------
-// Transitional reference core — mirror of openai_compat::spawn_openai_stream
-// ---------------------------------------------------------------------------
-
-#[derive(Default)]
-struct ToolCallAccumulator {
-    id: String,
-    name: String,
-    arguments: String,
-}
-
-/// Emit accumulated tool calls as `StreamChunk::ToolUse` — the happy path only
-/// (valid accumulated JSON). The production original additionally has
-/// input-repair / raw-passthrough fallbacks; the conformance fixtures all
-/// accumulate to valid JSON, so those branches are out of scope here.
-async fn flush_tool_calls(
-    tx: &tokio::sync::mpsc::Sender<StreamChunk>,
-    accumulators: &mut BTreeMap<u64, ToolCallAccumulator>,
-) {
-    for (index, call) in std::mem::take(accumulators) {
-        if call.name.is_empty() {
-            continue;
-        }
-        let Ok(input) = serde_json::from_str::<Value>(&call.arguments) else {
-            continue;
-        };
-        let _ = tx
-            .send(StreamChunk::ToolUse(ToolCall {
-                id: if call.id.is_empty() {
-                    format!("tool-call-{index}")
-                } else {
-                    call.id
-                },
-                name: call.name,
-                input,
-            }))
-            .await;
-    }
-}
-
-/// Transitional, behavior-faithful port of the SSE line loop inside
-/// `openai_compat::spawn_openai_stream`.
-///
-/// SWAP ME: when `openai_compat::run_openai_sse` lands, delete this function
-/// and import that one instead (`byte_stream` items become `Bytes`, so map with
-/// `.map(|r| r.map(Bytes::from))`). Everything else stays put.
-async fn run_openai_sse(
-    byte_stream: impl Stream<Item = Result<Vec<u8>, ProviderError>>,
-    provider_name: &str,
-) -> tokio::sync::mpsc::Receiver<StreamChunk> {
-    // Only referenced on the (omitted) error path in the production original.
-    let _ = provider_name;
-
-    futures_util::pin_mut!(byte_stream);
-    let (tx, rx) = tokio::sync::mpsc::channel(64);
-
-    let mut buffer = String::new();
-    let mut tool_calls: BTreeMap<u64, ToolCallAccumulator> = BTreeMap::new();
-    let mut finish_reason: Option<String> = None;
-
-    while let Some(item) = byte_stream.next().await {
-        let chunk = match item {
-            Ok(chunk) => chunk,
-            Err(err) => {
-                let _ = tx.send(StreamChunk::Error(err)).await;
-                return rx;
-            }
-        };
-
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-        while let Some(nl) = buffer.find('\n') {
-            let raw = buffer[..nl].to_string();
-            buffer.drain(..=nl);
-            let line = raw.trim_end_matches('\r').trim();
-
-            if line.is_empty() || line.starts_with(':') {
-                continue;
-            }
-            if !line.starts_with("data:") {
-                continue;
-            }
-
-            let data = line["data:".len()..].trim();
-            if data == "[DONE]" {
-                flush_tool_calls(&tx, &mut tool_calls).await;
-                if let Some(reason) = finish_reason.take() {
-                    let _ = tx.send(StreamChunk::Finish { reason }).await;
-                }
-                let _ = tx.send(StreamChunk::Done).await;
-                return rx;
-            }
-
-            let Ok(event) = serde_json::from_str::<Value>(data) else {
-                continue;
-            };
-
-            if let Some(usage) = event.get("usage") {
-                let input_tokens = usage["prompt_tokens"].as_u64().unwrap_or(0);
-                let output_tokens = usage["completion_tokens"].as_u64().unwrap_or(0);
-                let cached_tokens = usage
-                    .get("prompt_tokens_details")
-                    .and_then(|d| d.get("cached_tokens"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let (cache_creation_tokens, cache_read_tokens) = if cached_tokens > 0 {
-                    (0, cached_tokens)
-                } else if let Some(miss) = usage
-                    .get("prompt_cache_miss_tokens")
-                    .and_then(|v| v.as_u64())
-                {
-                    let hit = usage
-                        .get("prompt_cache_hit_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    (miss, hit)
-                } else {
-                    (0, 0)
-                };
-
-                if input_tokens > 0 || output_tokens > 0 {
-                    let _ = tx
-                        .send(StreamChunk::Usage {
-                            input_tokens,
-                            output_tokens,
-                            cache_creation_tokens,
-                            cache_read_tokens,
-                        })
-                        .await;
-                }
-            }
-
-            let Some(choices) = event["choices"].as_array() else {
-                continue;
-            };
-
-            for choice in choices {
-                let delta = &choice["delta"];
-                if let Some(text) = delta["content"].as_str()
-                    && !text.is_empty()
-                {
-                    let _ = tx.send(StreamChunk::TextDelta(text.to_string())).await;
-                }
-
-                if let Some(reasoning) = delta["reasoning_content"].as_str()
-                    && !reasoning.is_empty()
-                {
-                    let _ = tx
-                        .send(StreamChunk::ReasoningDelta(reasoning.to_string()))
-                        .await;
-                }
-
-                if let Some(tool_deltas) = delta["tool_calls"].as_array() {
-                    for tool_delta in tool_deltas {
-                        let index = tool_delta["index"].as_u64().unwrap_or(0);
-                        let entry = tool_calls.entry(index).or_default();
-                        if let Some(id) = tool_delta["id"].as_str() {
-                            entry.id = id.to_string();
-                        }
-                        if let Some(name) = tool_delta["function"]["name"].as_str() {
-                            entry.name.push_str(name);
-                        }
-                        if let Some(arguments) = tool_delta["function"]["arguments"].as_str() {
-                            entry.arguments.push_str(arguments);
-                        }
-                    }
-                }
-
-                if let Some(reason) = choice["finish_reason"].as_str()
-                    && !reason.is_empty()
-                {
-                    finish_reason = Some(reason.to_string());
-                }
-
-                if choice["finish_reason"].as_str() == Some("tool_calls") {
-                    flush_tool_calls(&tx, &mut tool_calls).await;
-                }
-            }
-        }
-    }
-
-    flush_tool_calls(&tx, &mut tool_calls).await;
-    if let Some(reason) = finish_reason.take() {
-        let _ = tx.send(StreamChunk::Finish { reason }).await;
-    }
-    let _ = tx.send(StreamChunk::Done).await;
-    rx
 }
 
 // ---------------------------------------------------------------------------
@@ -614,7 +414,7 @@ async fn gap_utf8_mid_character_split_is_corrupted() {
 }
 
 // ---------------------------------------------------------------------------
-// Anti-drift bridge: real `spawn_openai_stream` vs the transitional mirror
+// End-to-end guard: socket-fed `spawn_openai_stream` vs the in-memory core
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -668,7 +468,7 @@ async fn real_parser_agrees_with_reference_on_whole_block() {
         let reference_seq: Vec<Expect> = reference.iter().map(project).collect();
         assert_eq!(
             real_seq, reference_seq,
-            "real parser diverged from transitional reference for fixture `{name}`"
+            "socket-fed parser diverged from in-memory core for fixture `{name}`"
         );
     }
 }
