@@ -1,7 +1,7 @@
 //! Transcript component — renders DisplayBlock items with virtual scrolling,
 //! text selection, streaming text, and collapsible blocks.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -361,6 +361,18 @@ pub(crate) struct TranscriptState {
     /// width change still invalidates via `is_valid` → full rebuild fallback.
     pub(crate) last_width: u16,
 
+    /// Block indices whose cached height is stale and must be re-measured
+    /// before the next read of `line_cache`.
+    ///
+    /// `ToolOutputChunk` appends to a `ToolRunning` block's streamed output but
+    /// defers the (expensive: `serde_json` parse + `tail_lines` +
+    /// `wrap_text`) re-measure, so a burst of chunks arriving between two
+    /// frames costs one re-measure per affected block instead of one per
+    /// chunk. Drained by [`TranscriptState::flush_dirty_heights`]. Kept in
+    /// `blocks`-index space; cleared whenever the cache is rebuilt (a full
+    /// rebuild re-measures every block) or reset.
+    pub(crate) dirty_heights: HashSet<usize>,
+
     /// child_session_id → index of that child's rolling activity block.
     /// Lets `ChildSessionActivity` update one line in place instead of pushing
     /// a new block per event (which forced O(transcript) cache rebuilds during
@@ -416,6 +428,7 @@ impl TranscriptState {
             line_cache: BlockLineCache::new(),
             last_visible_hits: Vec::new(),
             last_width: 0,
+            dirty_heights: HashSet::new(),
             child_activity_blocks: HashMap::new(),
             compaction_block: None,
             _active_question: None,
@@ -550,16 +563,20 @@ impl TranscriptState {
                         streamed_output.push_str(delta);
                         cap_streamed_output(streamed_output);
                     }
-                    // Re-measure just this block and patch its cached height in
-                    // place (no generation bump → the cache stays incremental).
-                    // `cap_streamed_output` bounds this re-measure's cost.
+                    // Defer the height re-measure: mark this block dirty and let
+                    // `flush_dirty_heights` recompute it once before the height
+                    // cache is next read. A PTY burst delivers many chunks
+                    // between two frames, so re-measuring per chunk (`serde`
+                    // parse + `tail_lines` + `wrap_text`) would be the new hot
+                    // path. When the cache is already invalid the deferral is
+                    // dropped — the next full rebuild re-measures every block
+                    // anyway (no generation bump here, so that stays the case).
                     if self.line_cache.is_valid(
                         self.blocks_generation,
                         self.last_width,
                         self.blocks.len(),
                     ) {
-                        let h = block_line_count(&self.blocks[i], usize::from(self.last_width));
-                        self.line_cache.set_height(i, h);
+                        self.dirty_heights.insert(i);
                     }
                 }
                 // CRITICAL: do NOT bump blocks_generation or return a
@@ -913,6 +930,40 @@ impl TranscriptState {
         }
     }
 
+    /// Apply the height patches deferred by `ToolOutputChunk`.
+    ///
+    /// Each index in `dirty_heights` had its streamed output mutated since the
+    /// cache was last read, so its cached height must be re-measured with
+    /// `block_line_count`. Runs at most once per read of the height cache
+    /// (`build_visible_lines` / `total_line_count`), so a burst of PTY chunks
+    /// between two frames costs one re-measure per affected block instead of
+    /// one per chunk. The patch is integer-only (`set_height` shifts the tail
+    /// of `cum_offsets`) and does not bump `blocks_generation`, so the cache
+    /// stays incremental.
+    ///
+    /// No-op when nothing is dirty, and when the cache is invalid: a pending
+    /// full rebuild re-measures every block, making the dirty set redundant.
+    fn flush_dirty_heights(&mut self) {
+        if self.dirty_heights.is_empty() {
+            return;
+        }
+        let width = self.last_width;
+        if !self
+            .line_cache
+            .is_valid(self.blocks_generation, width, self.blocks.len())
+        {
+            self.dirty_heights.clear();
+            return;
+        }
+        let w = usize::from(width.max(20));
+        for idx in self.dirty_heights.drain() {
+            if idx < self.blocks.len() {
+                let h = block_line_count(&self.blocks[idx], w);
+                self.line_cache.set_height(idx, h);
+            }
+        }
+    }
+
     fn flush_stream_before_tool(&mut self) {
         let reasoning = self.streaming_reasoning.take();
         self.streaming_reasoning_wrap.reset();
@@ -991,6 +1042,7 @@ impl TranscriptState {
         self.content_cache.clear();
         self.content_cache_width = 0;
         self.line_cache.reset();
+        self.dirty_heights.clear();
         self.blocks_generation = self.blocks_generation.wrapping_add(1);
     }
 
@@ -1311,16 +1363,19 @@ impl TranscriptState {
     pub(crate) fn total_line_count(&mut self, width: u16) -> usize {
         self.last_width = width;
         let w = width.max(20) as usize;
-        let mut n = if self
+        // Ensure the cache is valid, then apply any height patches deferred by
+        // `ToolOutputChunk` before the cumulative offsets are read.
+        if !self
             .line_cache
             .is_valid(self.blocks_generation, width, self.blocks.len())
         {
-            self.line_cache.total()
-        } else {
             self.line_cache
                 .rebuild(&self.blocks, self.blocks_generation, width);
-            self.line_cache.total()
-        };
+            // The rebuild measured every block; pending dirty entries are moot.
+            self.dirty_heights.clear();
+        }
+        self.flush_dirty_heights();
+        let mut n = self.line_cache.total();
 
         // Streaming reasoning block
         n += self.streaming_reasoning_line_count(w);
@@ -1352,7 +1407,12 @@ impl TranscriptState {
         {
             self.line_cache
                 .rebuild(&self.blocks, self.blocks_generation, width);
+            // The rebuild measured every block; pending dirty entries are moot.
+            self.dirty_heights.clear();
         }
+        // Apply any height patches deferred by `ToolOutputChunk` before the
+        // cumulative offsets are read.
+        self.flush_dirty_heights();
         let blocks_total = self.line_cache.total();
 
         let srl = self.streaming_reasoning_line_count(w);
@@ -1375,20 +1435,29 @@ impl TranscriptState {
         let cap = (end - start).min(200);
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(cap);
         let mut hits: Vec<LineAnswerHit> = Vec::with_capacity(cap);
-        let mut global_line = 0usize;
 
-        for (bi, block) in self.blocks.iter().enumerate() {
+        // Binary-search the first block that intersects the viewport instead
+        // of scanning from block 0. Block `bi` occupies the line range
+        // `[cum_offsets[bi], cum_offsets[bi + 1])`, so the first block whose
+        // end offset exceeds `start` is the last index at or before the first
+        // `cum_offsets` value strictly greater than `start`:
+        // `partition_point(|o| o <= start) - 1`. The guard above
+        // (`start < total == cum_offsets.last()`) keeps this index in range.
+        let bi_start = self
+            .line_cache
+            .cum_offsets
+            .partition_point(|&o| o <= start)
+            .saturating_sub(1);
+        let mut global_line = self.line_cache.cum_offsets[bi_start];
+
+        for bi in bi_start..self.blocks.len() {
             let bh = self.line_cache.heights[bi];
             let block_end = global_line + bh;
-            if block_end <= start {
-                global_line = block_end;
-                continue;
-            }
             if global_line >= end {
                 break;
             }
             emit_block_lines(
-                block,
+                &self.blocks[bi],
                 bi,
                 w,
                 &mut self.content_cache,
@@ -2675,6 +2744,9 @@ mod tests {
             t.line_cache.is_valid(gen0, 78, t.blocks.len()),
             "the incremental height patch must keep the cache valid"
         );
+        // Heights are patched lazily at flush points (`dirty_heights`), so the
+        // grown height is observable only after a flush (total_line_count).
+        let _ = t.total_line_count(78);
         let h1 = t.line_cache.heights[idx];
         assert!(
             h1 > h0,

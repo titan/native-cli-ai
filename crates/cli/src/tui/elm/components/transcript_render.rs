@@ -306,10 +306,15 @@ pub(super) fn block_line_count(block: &DisplayBlock, width: usize) -> usize {
             n
         }
         DisplayBlock::ApprovalPending(req) => {
+            // Must mirror `emit_block_lines` exactly: header + blank + wrapped
+            // description + blank + "input:" label + preformatted input +
+            // blank + decision prompt + trailing blank = 7 + description +
+            // input lines.
             2 + wrap_text(&req.description, w).len()
                 + 1
                 + 1
                 + wrap_preformatted_lines_count(&req.input, w)
+                + 1
                 + 1
                 + 1
         }
