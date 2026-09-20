@@ -7,7 +7,7 @@ use nca_common::message::{ContentPart, Message, MessageContent, Role};
 use nca_common::tool::{ToolCall, ToolDefinition};
 use serde_json::{Value, json};
 
-use super::{ProviderError, StreamChunk};
+use super::{ByteStreamError, ProviderError, StreamChunk};
 
 /// 单次流式读取的空闲超时（与 `openai_compat::STREAM_IDLE_TIMEOUT` 保持一致）。
 ///
@@ -84,11 +84,41 @@ pub fn anthropic_request_body(
     }))
 }
 
+/// Spawn the Anthropic-compatible SSE parser over a live HTTP response body.
+///
+/// Thin shell: adapts the reqwest body into the testable core's stream
+/// shape (`Result<chunk, ByteStreamError>` — source chain and transport
+/// flags captured eagerly at yield time) and delegates to
+/// [`run_anthropic_sse`].
 pub fn spawn_anthropic_stream(
     response: reqwest::Response,
     provider_name: &'static str,
 ) -> tokio::sync::mpsc::Receiver<StreamChunk> {
-    let mut byte_stream = response.bytes_stream();
+    let byte_stream = response
+        .bytes_stream()
+        .map(|item| item.map_err(ByteStreamError::from));
+    run_anthropic_sse(byte_stream, provider_name)
+}
+
+/// Testable core of the Anthropic-compatible SSE parser: "byte stream →
+/// StreamChunk".
+///
+/// Split out of [`spawn_anthropic_stream`] so conformance tests can feed
+/// fixture byte streams (plain `String`/`Vec<u8>` chunks work — anything
+/// `AsRef<[u8]>`) without real HTTP. Behavior is byte-identical to
+/// the former inline loop — the idle-timeout wrapping, error mapping
+/// (source chain + transport flags), and the `stream_idle_timeout` /
+/// `stream_byte_error` logging all live here.
+pub(crate) fn run_anthropic_sse<B>(
+    mut byte_stream: impl futures_util::Stream<Item = Result<B, ByteStreamError>>
+    + Send
+    + 'static
+    + Unpin,
+    provider_name: &'static str,
+) -> tokio::sync::mpsc::Receiver<StreamChunk>
+where
+    B: AsRef<[u8]> + Send + 'static,
+{
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
     tokio::spawn(async move {
@@ -97,6 +127,10 @@ pub fn spawn_anthropic_stream(
         let mut tool_id = String::new();
         let mut tool_name = String::new();
         let mut tool_input = String::new();
+        // Per-stream ordinal of flushed tool calls — backs the synthetic
+        // `tool-call-{n}` id when a compat endpoint omits the block id
+        // (mirror of openai_compat's `tool-call-{index}`).
+        let mut tool_seq: u64 = 0;
         let mut input_tokens: u64 = 0;
         let mut cache_creation_tokens: u64 = 0;
         let mut cache_read_tokens: u64 = 0;
@@ -136,9 +170,17 @@ pub fn spawn_anthropic_stream(
                 Err(err) => {
                     // The Display message alone (e.g. "error decoding response
                     // body") is too vague to diagnose intermittent stream
-                    // disruptions. Walk the full source chain and include any
-                    // buffered response data for diagnostics.
-                    let chain = super::format_error_chain(&err);
+                    // disruptions. The adapter captured the full source chain
+                    // and transport flags at yield time; include any buffered
+                    // response data for diagnostics.
+                    let ByteStreamError {
+                        display: error_display,
+                        chain,
+                        is_timeout,
+                        is_connect,
+                        is_request,
+                        is_body,
+                    } = err;
                     let buffer_preview = if buffer.is_empty() {
                         String::from("(none)")
                     } else {
@@ -147,12 +189,12 @@ pub fn spawn_anthropic_stream(
 
                     tracing::error!(
                         provider = provider_name,
-                        error = %err,
+                        error = %error_display,
                         error_chain = %chain,
-                        is_timeout = err.is_timeout(),
-                        is_connect = err.is_connect(),
-                        is_request = err.is_request(),
-                        is_body = err.is_body(),
+                        is_timeout,
+                        is_connect,
+                        is_request,
+                        is_body,
                         buffer_preview = %buffer_preview,
                         "stream_byte_error"
                     );
@@ -166,7 +208,7 @@ pub fn spawn_anthropic_stream(
                 }
             };
 
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            buffer.push_str(&String::from_utf8_lossy(chunk.as_ref()));
 
             while let Some(nl) = buffer.find('\n') {
                 let raw = buffer[..nl].to_string();
@@ -247,6 +289,7 @@ pub fn spawn_anthropic_stream(
                             &mut tool_id,
                             &mut tool_name,
                             &mut tool_input,
+                            &mut tool_seq,
                         )
                         .await;
                     }
@@ -271,7 +314,14 @@ pub fn spawn_anthropic_stream(
             }
         }
 
-        flush_anthropic_tool_call(&tx, &mut tool_id, &mut tool_name, &mut tool_input).await;
+        flush_anthropic_tool_call(
+            &tx,
+            &mut tool_id,
+            &mut tool_name,
+            &mut tool_input,
+            &mut tool_seq,
+        )
+        .await;
         let _ = tx.send(StreamChunk::Done).await;
     });
 
@@ -300,17 +350,76 @@ async fn flush_anthropic_tool_call(
     tool_id: &mut String,
     tool_name: &mut String,
     tool_input: &mut String,
+    tool_seq: &mut u64,
 ) {
+    use super::openai_compat::truncate_bytes_safe;
+    use crate::tools::input_repair;
+
     if tool_name.is_empty() {
         return;
     }
 
+    // Mirror of openai_compat's `tool-call-{index}`: Anthropic streams carry
+    // no index, so synthesize from the per-stream tool-call ordinal.
+    let seq = *tool_seq;
+    *tool_seq += 1;
+
     if let Ok(input) = serde_json::from_str(tool_input) {
         let _ = tx
             .send(StreamChunk::ToolUse(ToolCall {
-                id: tool_id.clone(),
+                id: if tool_id.is_empty() {
+                    format!("tool-call-{seq}")
+                } else {
+                    tool_id.clone()
+                },
                 name: tool_name.clone(),
                 input,
+            }))
+            .await;
+    } else if let Some(input) = input_repair::repair_json_string(tool_input) {
+        // Repaired from stream-level JSON issue (truncation, trailing comma, etc.)
+        tracing::warn!(
+            tool = %tool_name,
+            call_id = %tool_id,
+            seq,
+            "tool_input_stream_repaired"
+        );
+        let _ = tx
+            .send(StreamChunk::ToolUse(ToolCall {
+                id: if tool_id.is_empty() {
+                    format!("tool-call-{seq}")
+                } else {
+                    tool_id.clone()
+                },
+                name: tool_name.clone(),
+                input,
+            }))
+            .await;
+    } else {
+        // Even stream-level repair failed — emit a tool call with the raw
+        // string so the model gets an error it can recover from, rather
+        // than having the call silently vanish.
+        tracing::warn!(
+            tool = %tool_name,
+            call_id = %tool_id,
+            seq,
+            arguments_preview = %truncate_bytes_safe(tool_input, 500),
+            "tool_input_unparseable"
+        );
+        let _ = tx
+            .send(StreamChunk::ToolUse(ToolCall {
+                id: if tool_id.is_empty() {
+                    format!("tool-call-{seq}")
+                } else {
+                    tool_id.clone()
+                },
+                name: tool_name.clone(),
+                input: json!({
+                    "_error": format!(
+                        "Failed to parse tool arguments as JSON. Raw input: {}",
+                        truncate_bytes_safe(tool_input, 500)
+                    )
+                }),
             }))
             .await;
     }
@@ -475,6 +584,88 @@ mod tests {
     use base64::{Engine, engine::general_purpose::STANDARD as B64};
     use nca_common::message::{ContentPart, Message};
     use tempfile::tempdir;
+
+    /// Drive `flush_anthropic_tool_call` once and collect what it emitted.
+    async fn flush_chunks(tool_id: &str, tool_name: &str, tool_input: &str) -> Vec<StreamChunk> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut id = tool_id.to_string();
+        let mut name = tool_name.to_string();
+        let mut input = tool_input.to_string();
+        let mut seq = 0u64;
+        flush_anthropic_tool_call(&tx, &mut id, &mut name, &mut input, &mut seq).await;
+        drop(tx);
+        let mut chunks = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            chunks.push(chunk);
+        }
+        chunks
+    }
+
+    #[tokio::test]
+    async fn anthropic_flush_repairs_stream_broken_tool_input_instead_of_dropping() {
+        // Trailing comma: invalid JSON as-streamed, but stream-level repair
+        // recovers it — same policy as the openai compat parser.
+        let chunks = flush_chunks("toolu_1", "lookup", r#"{"path":"src/main.rs",}"#).await;
+        assert!(matches!(
+            &chunks[..],
+            [StreamChunk::ToolUse(call)] if call.id == "toolu_1"
+                && call.name == "lookup"
+                && call.input == json!({"path": "src/main.rs"})
+        ));
+    }
+
+    #[tokio::test]
+    async fn anthropic_flush_unparseable_tool_input_fails_loudly_not_silently() {
+        // Truncated mid-value and irreparable: the ToolUse must still be
+        // emitted with an `_error` payload — never silently dropped.
+        let chunks = flush_chunks("toolu_2", "write_file", r#"{"path":"src"#).await;
+        assert!(matches!(
+            &chunks[..],
+            [StreamChunk::ToolUse(call)] if call.id == "toolu_2"
+                && call.name == "write_file"
+                && call.input.get("_error").is_some()
+        ));
+    }
+
+    #[tokio::test]
+    async fn anthropic_flush_synthesizes_id_when_missing() {
+        // Anthropic always sends a block id, but compat endpoints may not —
+        // mirror openai's `tool-call-{index}` with a per-stream ordinal.
+        let chunks = flush_chunks("", "lookup", r#"{"path":"src"}"#).await;
+        assert!(matches!(
+            &chunks[..],
+            [StreamChunk::ToolUse(call)] if call.id == "tool-call-0" && call.name == "lookup"
+        ));
+    }
+
+    #[tokio::test]
+    async fn run_anthropic_sse_parses_frames_from_in_memory_bytes() {
+        // The extracted core runs without HTTP: feed SSE bytes directly.
+        let frames = concat!(
+            "event: content_block_start\n",
+            "data: {\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_9\",\"name\":\"lookup\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"src\\\"}\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {}\n\n"
+        )
+        .to_string();
+        let byte_stream = futures_util::stream::iter(vec![Ok::<
+            String,
+            crate::provider::ByteStreamError,
+        >(frames)]);
+        let mut rx = run_anthropic_sse(byte_stream, "test-anthropic");
+        let mut chunks = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            chunks.push(chunk);
+        }
+        assert!(matches!(
+            &chunks[..],
+            [StreamChunk::ToolUse(call), StreamChunk::Done] if call.id == "toolu_9"
+                && call.name == "lookup"
+                && call.input == json!({"path": "src"})
+        ));
+    }
 
     #[test]
     fn user_multimodal_message_serializes_image_base64_block() {

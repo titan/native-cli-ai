@@ -1,4 +1,4 @@
-use super::{Provider, ProviderError, StreamChunk};
+use super::{ByteStreamError, Provider, ProviderError, StreamChunk};
 use crate::cache_keepalive::{KeepaliveSnapshot, PingUsage};
 
 use std::collections::BTreeMap;
@@ -59,11 +59,38 @@ pub fn openai_request_body(
     Ok(body)
 }
 
+/// Spawn the OpenAI-compatible SSE parser over a live HTTP response body.
+///
+/// Thin shell: adapts the reqwest body into the testable core's stream shape
+/// and delegates to [`run_openai_sse`].
 pub fn spawn_openai_stream(
     response: reqwest::Response,
     provider_name: &'static str,
 ) -> tokio::sync::mpsc::Receiver<StreamChunk> {
-    let mut byte_stream = response.bytes_stream();
+    let byte_stream = response
+        .bytes_stream()
+        .map(|item| item.map_err(ByteStreamError::from));
+    run_openai_sse(byte_stream, provider_name)
+}
+
+/// Testable core of the OpenAI-compatible SSE parser: "byte stream →
+/// StreamChunk".
+///
+/// Split out of [`spawn_openai_stream`] so conformance tests can feed
+/// fixture byte streams without real HTTP. Behavior is byte-identical to
+/// the former inline loop — the idle-timeout wrapping, error mapping
+/// (source chain + transport flags), and the `stream_idle_timeout` /
+/// `stream_byte_error` logging all live here.
+pub(crate) fn run_openai_sse<B>(
+    mut byte_stream: impl futures_util::Stream<Item = Result<B, ByteStreamError>>
+    + Send
+    + 'static
+    + Unpin,
+    provider_name: &'static str,
+) -> tokio::sync::mpsc::Receiver<StreamChunk>
+where
+    B: AsRef<[u8]> + Send + 'static,
+{
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
     tokio::spawn(async move {
@@ -110,9 +137,17 @@ pub fn spawn_openai_stream(
                 Err(err) => {
                     // The Display message alone (e.g. "error decoding response
                     // body") is too vague to diagnose intermittent stream
-                    // disruptions. Walk the full source chain and include any
-                    // buffered response data for diagnostics.
-                    let chain = super::format_error_chain(&err);
+                    // disruptions. The adapter captured the full source chain
+                    // and transport flags at yield time; include any buffered
+                    // response data for diagnostics.
+                    let ByteStreamError {
+                        display: error_display,
+                        chain,
+                        is_timeout,
+                        is_connect,
+                        is_request,
+                        is_body,
+                    } = err;
                     let buffer_preview = if buffer.is_empty() {
                         String::from("(none)")
                     } else {
@@ -121,12 +156,12 @@ pub fn spawn_openai_stream(
 
                     tracing::error!(
                         provider = provider_name,
-                        error = %err,
+                        error = %error_display,
                         error_chain = %chain,
-                        is_timeout = err.is_timeout(),
-                        is_connect = err.is_connect(),
-                        is_request = err.is_request(),
-                        is_body = err.is_body(),
+                        is_timeout,
+                        is_connect,
+                        is_request,
+                        is_body,
                         buffer_preview = %buffer_preview,
                         "stream_byte_error"
                     );
@@ -140,7 +175,7 @@ pub fn spawn_openai_stream(
                 }
             };
 
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            buffer.push_str(&String::from_utf8_lossy(chunk.as_ref()));
 
             while let Some(nl) = buffer.find('\n') {
                 let raw = buffer[..nl].to_string();
@@ -809,6 +844,29 @@ impl Provider for OpenAiCompatProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn run_openai_sse_parses_frames_from_in_memory_bytes() {
+        // The extracted core runs without HTTP: feed SSE bytes directly.
+        let frames = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"index\":0}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .to_string();
+        let byte_stream = futures_util::stream::iter(vec![Ok::<
+            String,
+            crate::provider::ByteStreamError,
+        >(frames)]);
+        let mut rx = run_openai_sse(byte_stream, "test-openai");
+        let mut chunks = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            chunks.push(chunk);
+        }
+        assert!(matches!(
+            &chunks[..],
+            [StreamChunk::TextDelta(text), StreamChunk::Done] if text == "hi"
+        ));
+    }
 
     #[test]
     fn reasoning_content_is_serialized_by_default() {
