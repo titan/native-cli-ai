@@ -454,3 +454,93 @@ async fn revive_with_unloadable_session_fails_and_registry_stays_terminal() {
     assert_eq!(entry.state, ChildSessionState::Completed);
     assert_eq!(entry.generation, 0, "no generation bump on failed resume");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revive_reads_live_config_at_request_time_not_wiring_snapshot() {
+    // Regression for the consumer wiring: `subagent_control_consumer` used to
+    // capture an owned `NcaConfig` SNAPSHOT at wiring time. A revive issued
+    // after an in-session `/provider` (or `/model`, or agent) switch therefore
+    // rebuilt the child on the stale snapshot. It now read-clone-releases the
+    // SHARED live config on every request — this test flips the live config to
+    // a provider with no credentials and asserts the revive fails with the
+    // NEW provider's build error (the stale deepseek + test-key snapshot would
+    // have built fine and run a full turn).
+    let ws = git_workspace();
+    let registry = Arc::new(SubagentRegistry::new());
+    let (event_tx, _event_rx) = mpsc::channel(256);
+    let provider = ScriptedProvider::new("first answer");
+    let (control_tx, live_config) =
+        wire_control_consumer(ws.path(), registry.clone(), Some(event_tx.clone()));
+
+    // Child 1: gated mid-turn, then cancelled through the real consumer so its
+    // registry entry lands terminal — the precondition for a revive.
+    let (child_task, child_id) = spawn_gated_child(
+        ws.path(),
+        registry.clone(),
+        event_tx.clone(),
+        provider.clone(),
+        &provider,
+        Some("fixer-livecfg"),
+    )
+    .await;
+    let (reply_tx, reply_rx) = oneshot::channel();
+    control_tx
+        .send(SubagentControlRequest::Cancel {
+            session_id: child_id.clone(),
+            reason: Some("wrong branch".into()),
+            reply: reply_tx,
+        })
+        .await
+        .expect("control channel live");
+    let cancel_reply = reply_rx.await.expect("cancel reply");
+    assert!(cancel_reply.ok, "{cancel_reply:?}");
+    let result = tokio::time::timeout(Duration::from_secs(30), child_task)
+        .await
+        .expect("cancelled child must finish")
+        .expect("no panic")
+        .expect("session completes");
+    assert_eq!(result.status, "cancelled");
+    assert_eq!(
+        registry.get(&child_id).map(|e| e.state),
+        Some(ChildSessionState::Cancelled),
+        "revive target must be terminal before the revive"
+    );
+
+    // Simulate an in-session `/provider` switch: flip the SHARED live config
+    // to OpenAI, which `offline_config` left without a key. Building this
+    // provider fails loudly at construction (`missing OpenAI API key`).
+    live_config.write().unwrap().provider.default = nca_common::config::ProviderKind::OpenAi;
+
+    // Revive through the real consumer: it must read the REFRESHED config.
+    let (reply_tx, reply_rx) = oneshot::channel();
+    control_tx
+        .send(SubagentControlRequest::Revive {
+            session_id: child_id.clone(),
+            prompt: "run the second turn".into(),
+            reply: reply_tx,
+        })
+        .await
+        .expect("control channel live");
+    let resp = reply_rx.await.expect("revive reply");
+
+    assert!(
+        !resp.ok,
+        "revive on a keyless provider must fail, not run a stale-config turn: {resp:?}"
+    );
+    let error = resp.error_message.as_deref().expect("error message");
+    assert!(
+        error.contains("failed to resume child session"),
+        "error must surface the resume failure: {error}"
+    );
+    assert!(
+        error.contains("missing OpenAI API key"),
+        "the revived child must be built from the REFRESHED config (OpenAI, \
+         keyless), not the wiring-time snapshot (deepseek + test-key): {error}"
+    );
+
+    // No zombie Running entry: the failed resume left the registry terminal at
+    // generation 0 — `record_revive` never ran.
+    let entry = registry.get(&child_id).expect("entry");
+    assert_eq!(entry.state, ChildSessionState::Cancelled);
+    assert_eq!(entry.generation, 0, "no generation bump on failed resume");
+}
