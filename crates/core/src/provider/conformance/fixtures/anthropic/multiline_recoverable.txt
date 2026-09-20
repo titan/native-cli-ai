@@ -1,0 +1,10 @@
+event: content_block_delta
+data: {"type":"content_block_delta",
+data: "index":0,"delta":{"type":"text_delta","text":"recovered"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"kept"}}
+
+event: message_stop
+data: {"type":"message_stop"}
+

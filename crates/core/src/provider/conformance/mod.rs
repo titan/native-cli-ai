@@ -28,14 +28,25 @@
 //! socket-fed output equals the in-memory reference, so the HTTP shell /
 //! `ByteStreamError` adaptation layer cannot silently diverge from the core.
 //!
-//! ## Known gaps (pinned, not fixed — see the two `gap_*` tests)
+//! ## Spec conformance (formerly pinned gaps — both fixed)
 //!
-//! 1. Multi-line `data:` payloads are **not** re-joined per the SSE spec: each
-//!    physical `data:` line is parsed as standalone JSON, so a continuation
-//!    line is dropped silently.
-//! 2. `String::from_utf8_lossy` is applied per network chunk *before* lines are
-//!    assembled, so a chunk boundary that lands mid-UTF-8-sequence corrupts the
-//!    glyph into U+FFFD.
+//! 1. Multi-line `data:` payloads ARE re-joined per the SSE spec: an event's
+//!    `data:` field may span multiple physical lines; the values are joined
+//!    with `\n` and dispatched as ONE event when the terminating blank line
+//!    arrives (an event still incomplete at EOF is discarded). When the join
+//!    lands between JSON tokens the payload parses and the event is recovered
+//!    (`fixture_multiline_recoverable`); when it lands inside an open JSON
+//!    string literal the payload stays invalid JSON and the event is dropped
+//!    (`fixture_multiline_data`).
+//! 2. Lines are assembled in a raw byte buffer and each COMPLETE line is
+//!    UTF-8 decoded separately (`0x0A` can never appear inside a multi-byte
+//!    UTF-8 sequence, so slicing at `\n` bytes never splits a code point), so
+//!    a network chunk boundary landing mid-UTF-8-sequence no longer corrupts
+//!    the glyph into U+FFFD (`utf8_mid_character_split_roundtrips`).
+//!
+//! The remaining deliberate exclusion — `stop_reason` /
+//! [`StreamChunk::Finish`] is not surfaced on the anthropic path — is
+//! documented in the [`anthropic`] module docs.
 
 use serde_json::Value;
 
@@ -51,6 +62,7 @@ use crate::provider::{ByteStreamError, StreamChunk};
 
 const SIMPLE_TEXT_DONE: &str = include_str!("fixtures/simple_text_done.txt");
 const MULTILINE_DATA: &str = include_str!("fixtures/multiline_data.txt");
+const MULTILINE_RECOVERABLE: &str = include_str!("fixtures/multiline_recoverable.txt");
 const CRLF_ENDINGS: &str = include_str!("fixtures/crlf_endings.txt");
 const COMMENT_PING: &str = include_str!("fixtures/comment_ping.txt");
 const UTF8_MULTIBYTE_DELTA: &str = include_str!("fixtures/utf8_multibyte_delta.txt");
@@ -65,6 +77,7 @@ const USAGE_IN_FINAL: &str = include_str!("fixtures/usage_in_final.txt");
 pub(crate) const OPENAI_FIXTURES: &[(&str, &str)] = &[
     ("simple_text_done", SIMPLE_TEXT_DONE),
     ("multiline_data", MULTILINE_DATA),
+    ("multiline_recoverable", MULTILINE_RECOVERABLE),
     ("crlf_endings", CRLF_ENDINGS),
     ("comment_ping", COMMENT_PING),
     ("utf8_multibyte_delta", UTF8_MULTIBYTE_DELTA),
@@ -285,9 +298,13 @@ async fn fixture_comment_ping() {
 
 #[tokio::test]
 async fn fixture_multiline_data() {
-    // GAP #1 (pinned): a payload split across physical `data:` lines is NOT
-    // re-joined. Both fragments fail standalone JSON parsing and vanish; only
-    // the subsequent complete event survives.
+    // Per the SSE spec the two `data:` values ARE re-joined with a raw `\n`
+    // — but here the join lands INSIDE the open JSON string literal
+    // (`..."content":"split` + `\n` + `ted"}}]}`), and a raw control
+    // character inside a JSON string is still invalid JSON, so the
+    // reassembled event is dropped. Only the subsequent complete event
+    // survives. The recoverable variant (newline between JSON tokens) is
+    // pinned by `fixture_multiline_recoverable`.
     let expected = [Expect::text("kept"), Expect::Done];
     for split in [
         Split::Whole,
@@ -297,6 +314,27 @@ async fn fixture_multiline_data() {
     ] {
         let chunks = drive(MULTILINE_DATA, split).await;
         assert_sequence("multiline_data", split, &chunks, &expected);
+    }
+}
+
+#[tokio::test]
+async fn fixture_multiline_recoverable() {
+    // Fixed-behavior pin: when the SSE-spec `\n` join lands BETWEEN JSON
+    // tokens (legal JSON whitespace), the reassembled payload parses and a
+    // `data:` field split across physical lines dispatches as ONE event.
+    let expected = [
+        Expect::text("recovered"),
+        Expect::text("kept"),
+        Expect::Done,
+    ];
+    for split in [
+        Split::Whole,
+        Split::PerLine,
+        Split::ByteEvery,
+        Split::Windows(4),
+    ] {
+        let chunks = drive(MULTILINE_RECOVERABLE, split).await;
+        assert_sequence("multiline_recoverable", split, &chunks, &expected);
     }
 }
 
@@ -315,6 +353,29 @@ async fn fixture_utf8_multibyte_delta() {
         let chunks = drive(UTF8_MULTIBYTE_DELTA, split).await;
         assert_sequence("utf8_multibyte_delta", split, &chunks, &expected);
     }
+}
+
+#[tokio::test]
+async fn utf8_mid_character_split_roundtrips() {
+    // Fixed-behavior pin: lines are assembled in a raw byte buffer and each
+    // COMPLETE line is UTF-8 decoded separately (`0x0A` can never appear
+    // inside a multi-byte UTF-8 sequence, so slicing at `\n` bytes never
+    // splits a code point). A chunk boundary landing mid-UTF-8-sequence
+    // therefore round-trips exactly — no U+FFFD replacement chars even under
+    // worst-case byte-per-chunk fragmentation.
+    let chunks = drive(UTF8_MULTIBYTE_DELTA, Split::ByteEvery).await;
+    let text: String = chunks
+        .iter()
+        .filter_map(|chunk| match chunk {
+            StreamChunk::TextDelta(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        text, "你好，世界 🚀🎉",
+        "byte-level splitting must round-trip the multibyte text exactly"
+    );
 }
 
 #[tokio::test]
@@ -389,32 +450,6 @@ async fn fixture_usage_in_final() {
 }
 
 // ---------------------------------------------------------------------------
-// Pinned gaps (behavior recorded, src NOT changed)
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn gap_utf8_mid_character_split_is_corrupted() {
-    // GAP #2 (pinned): `spawn_openai_stream` decodes each network chunk with
-    // `String::from_utf8_lossy` BEFORE assembling lines. A chunk boundary that
-    // lands inside a multi-byte UTF-8 sequence replaces the partial bytes with
-    // U+FFFD, so the reassembled text is corrupted. Reported, not fixed.
-    let chunks = drive(UTF8_MULTIBYTE_DELTA, Split::ByteEvery).await;
-    let text: String = chunks
-        .iter()
-        .filter_map(|chunk| match chunk {
-            StreamChunk::TextDelta(t) => Some(t.as_str()),
-            _ => None,
-        })
-        .collect();
-
-    assert!(
-        text.contains('\u{FFFD}'),
-        "expected lossy replacement chars under byte-level splitting, got {text:?}"
-    );
-    assert_ne!(text, "你好，世界 🚀🎉");
-}
-
-// ---------------------------------------------------------------------------
 // End-to-end guard: socket-fed `spawn_openai_stream` vs the in-memory core
 // ---------------------------------------------------------------------------
 
@@ -439,7 +474,7 @@ async fn real_parser_agrees_with_reference_on_whole_block() {
         // The UTF-8 fixture is excluded: over a real socket the kernel/hyper may
         // split the body mid-character non-deterministically, which would make
         // this comparison flaky. That behavior is pinned deterministically by
-        // `gap_utf8_mid_character_split_is_corrupted` instead.
+        // `utf8_mid_character_split_roundtrips` instead.
         if *name == "utf8_multibyte_delta" {
             continue;
         }

@@ -14,19 +14,21 @@
 //! * [`ANTHROPIC_FIXTURES`] — the manifest; every entry is consumed by at least
 //!   one test.
 //!
-//! ## Known exclusions / gaps (pinned, not fixed)
+//! ## Exclusions / spec-conformance notes
 //!
 //! * `stop_reason` / [`StreamChunk::Finish`] is deliberately ignored on the
 //!   anthropic path (known exclusion, out of scope). Pinned as the *absence* of
 //!   any `Finish` chunk in `fixture_anthropic_simple_text_done`.
-//! * GAP: multi-line `data:` payloads are not re-joined per the SSE spec — each
-//!   physical `data:` line is parsed as standalone JSON, so both fragments of a
-//!   split event are dropped silently
-//!   (`fixture_anthropic_multiline_data`).
-//! * GAP: `String::from_utf8_lossy` is applied per network chunk *before* lines
-//!   are assembled, so a chunk boundary that lands mid-UTF-8-sequence corrupts
-//!   the glyph into U+FFFD
-//!   (`gap_anthropic_utf8_mid_character_split_is_corrupted`).
+//! * Multi-line `data:` payloads ARE re-joined per the SSE spec (values joined
+//!   with `\n`, dispatched as one event on the blank line; an event still
+//!   incomplete at EOF is discarded). A join landing inside an open JSON
+//!   string literal stays invalid JSON and drops the event
+//!   (`fixture_anthropic_multiline_data`); a join between JSON tokens is
+//!   recovered (`fixture_anthropic_multiline_recoverable`).
+//! * Lines are assembled as raw bytes and each COMPLETE line is UTF-8 decoded
+//!   separately, so a chunk boundary landing mid-UTF-8-sequence round-trips
+//!   exactly instead of corrupting the glyph into U+FFFD
+//!   (`fixture_anthropic_utf8_mid_character_split_roundtrips`).
 
 use serde_json::json;
 
@@ -47,6 +49,7 @@ const THINKING_DELTA: &str = include_str!("fixtures/anthropic/thinking_delta.txt
 const USAGE_CACHE_TOKENS: &str = include_str!("fixtures/anthropic/usage_cache_tokens.txt");
 const CRLF_ENDINGS: &str = include_str!("fixtures/anthropic/crlf_endings.txt");
 const MULTILINE_DATA: &str = include_str!("fixtures/anthropic/multiline_data.txt");
+const MULTILINE_RECOVERABLE: &str = include_str!("fixtures/anthropic/multiline_recoverable.txt");
 const UTF8_MULTIBYTE_DELTA: &str = include_str!("fixtures/anthropic/utf8_multibyte_delta.txt");
 const ERROR_EVENT_IGNORED: &str = include_str!("fixtures/anthropic/error_event_ignored.txt");
 const SYNTHETIC_TOOL_ID: &str = include_str!("fixtures/anthropic/synthetic_tool_id.txt");
@@ -65,6 +68,7 @@ pub(crate) const ANTHROPIC_FIXTURES: &[(&str, &str)] = &[
     ("usage_cache_tokens", USAGE_CACHE_TOKENS),
     ("crlf_endings", CRLF_ENDINGS),
     ("multiline_data", MULTILINE_DATA),
+    ("multiline_recoverable", MULTILINE_RECOVERABLE),
     ("utf8_multibyte_delta", UTF8_MULTIBYTE_DELTA),
     ("error_event_ignored", ERROR_EVENT_IGNORED),
     ("synthetic_tool_id", SYNTHETIC_TOOL_ID),
@@ -359,17 +363,19 @@ async fn fixture_anthropic_synthetic_tool_id() {
 }
 
 // ---------------------------------------------------------------------------
-// Pinned gaps (behavior recorded, src NOT changed)
+// Multi-line `data:` reassembly (SSE spec)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn fixture_anthropic_multiline_data() {
-    // GAP (pinned): a payload split across physical `data:` lines is NOT
-    // re-joined per the SSE spec. Each physical `data:` line is parsed as
-    // standalone JSON, so BOTH fragments (`{"type":...,"text":"split` and
-    // `ted"}}`) fail to parse and are dropped silently; only the subsequent
-    // complete event survives. Structurally identical to the OpenAI-side
-    // `fixture_multiline_data` gap.
+    // Per the SSE spec the two `data:` values ARE re-joined with a raw `\n`
+    // — but here the join lands INSIDE the open JSON string literal
+    // (`..."text":"split` + `\n` + `ted"}}`), and a raw control character
+    // inside a JSON string is still invalid JSON, so the reassembled event is
+    // dropped; only the subsequent complete event survives. The recoverable
+    // variant (newline between JSON tokens) is pinned by
+    // `fixture_anthropic_multiline_recoverable`. Mirrors the OpenAI-side
+    // `fixture_multiline_data`.
     let expected = [Expect::text("kept"), Expect::Done];
     for split in [
         Split::Whole,
@@ -381,6 +387,33 @@ async fn fixture_anthropic_multiline_data() {
         assert_sequence("anthropic/multiline_data", split, &chunks, &expected);
     }
 }
+
+#[tokio::test]
+async fn fixture_anthropic_multiline_recoverable() {
+    // Fixed-behavior pin: when the SSE-spec `\n` join lands BETWEEN JSON
+    // tokens (legal JSON whitespace), the reassembled payload parses and a
+    // `data:` field split across physical lines dispatches as ONE event.
+    // No `Expect::Finish` appears — the anthropic path deliberately surfaces
+    // no finish chunk.
+    let expected = [
+        Expect::text("recovered"),
+        Expect::text("kept"),
+        Expect::Done,
+    ];
+    for split in [
+        Split::Whole,
+        Split::PerLine,
+        Split::ByteEvery,
+        Split::Windows(4),
+    ] {
+        let chunks = drive_anthropic(MULTILINE_RECOVERABLE, split).await;
+        assert_sequence("anthropic/multiline_recoverable", split, &chunks, &expected);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pinned gap (behavior recorded, src NOT changed)
+// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn fixture_anthropic_error_event_ignored() {
@@ -408,6 +441,10 @@ async fn fixture_anthropic_error_event_ignored() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// UTF-8 chunk-boundary robustness
+// ---------------------------------------------------------------------------
+
 #[tokio::test]
 async fn fixture_anthropic_utf8_events_roundtrip() {
     // Content split across *events* (every event boundary is on a UTF-8
@@ -426,12 +463,14 @@ async fn fixture_anthropic_utf8_events_roundtrip() {
 }
 
 #[tokio::test]
-async fn gap_anthropic_utf8_mid_character_split_is_corrupted() {
-    // GAP (pinned): `run_anthropic_sse` decodes each network chunk with
-    // `String::from_utf8_lossy` BEFORE assembling lines. A chunk boundary that
-    // lands inside a multi-byte UTF-8 sequence replaces the partial bytes with
-    // U+FFFD, so the reassembled text is corrupted. Mirror of the OpenAI-side
-    // `gap_utf8_mid_character_split_is_corrupted`. Reported, not fixed.
+async fn fixture_anthropic_utf8_mid_character_split_roundtrips() {
+    // Fixed-behavior pin: lines are assembled as raw bytes and each COMPLETE
+    // line is UTF-8 decoded separately (`0x0A` can never appear inside a
+    // multi-byte UTF-8 sequence, so slicing at `\n` bytes never splits a code
+    // point). A chunk boundary landing mid-UTF-8-sequence therefore
+    // round-trips exactly — no U+FFFD replacement chars even under worst-case
+    // byte-per-chunk fragmentation. Mirror of the OpenAI-side
+    // `utf8_mid_character_split_roundtrips`.
     let chunks = drive_anthropic(UTF8_MULTIBYTE_DELTA, Split::ByteEvery).await;
     let text: String = chunks
         .iter()
@@ -441,9 +480,8 @@ async fn gap_anthropic_utf8_mid_character_split_is_corrupted() {
         })
         .collect();
 
-    assert!(
-        text.contains('\u{FFFD}'),
-        "expected lossy replacement chars under byte-level splitting, got {text:?}"
+    assert_eq!(
+        text, "你好，世界 🚀🎉",
+        "byte-level splitting must round-trip the multibyte text exactly"
     );
-    assert_ne!(text, "你好，世界 🚀🎉");
 }
