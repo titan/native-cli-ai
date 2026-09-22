@@ -4495,4 +4495,169 @@ host_xdg_runtime = true
             "unmounted path must not linger in config file: {raw}"
         );
     }
+
+    // === named model plans: parse, layer merge, serialization ===
+
+    #[test]
+    fn plans_parse_from_toml_with_root_active_plan() {
+        // Root scalar `active_plan` must precede any [table] header, exactly
+        // like a real config.toml.
+        let raw = r#"
+active_plan = "economy"
+
+[plans.economy.oracle]
+provider = "kimi"
+model = "k3"
+
+[plans.economy.fixer]
+model = "glm-5.2"
+
+[plans.premium.oracle]
+provider = "zhipuai"
+"#;
+        let partial: PartialNcaConfig = toml::from_str(raw).expect("parse");
+        let mut config = NcaConfig::default();
+        config.merge(partial);
+
+        assert_eq!(config.active_plan.as_deref(), Some("economy"));
+
+        let economy = config.plans.get("economy").expect("economy plan");
+        let oracle = economy.get("oracle").expect("oracle entry");
+        assert_eq!(oracle.provider, Some(ProviderKind::Kimi));
+        assert_eq!(oracle.model.as_deref(), Some("k3"));
+        let fixer = economy.get("fixer").expect("fixer entry");
+        assert_eq!(fixer.provider, None);
+        assert_eq!(fixer.model.as_deref(), Some("glm-5.2"));
+
+        let premium = config.plans.get("premium").expect("premium plan");
+        assert_eq!(
+            premium.get("oracle").unwrap().provider,
+            Some(ProviderKind::ZhipuAI)
+        );
+        assert_eq!(premium.get("oracle").unwrap().model, None);
+    }
+
+    #[test]
+    fn plan_layers_merge_per_entry_and_workspace_overrides_active_plan() {
+        // Global layer: define the whole economy plan + select it.
+        let global: PartialNcaConfig = toml::from_str(
+            r#"
+active_plan = "economy"
+
+[plans.economy.oracle]
+provider = "kimi"
+model = "k3"
+
+[plans.economy.fixer]
+model = "glm-5.3"
+"#,
+        )
+        .expect("parse global");
+        let mut config = NcaConfig::default();
+        config.merge(global);
+        assert_eq!(config.active_plan.as_deref(), Some("economy"));
+        assert_eq!(
+            config.plans["economy"]["fixer"].model.as_deref(),
+            Some("glm-5.3")
+        );
+
+        // Workspace layer: override one route (per (plan, agent) key) and
+        // re-point active_plan.
+        let workspace: PartialNcaConfig = toml::from_str(
+            r#"
+active_plan = "premium"
+
+[plans.economy.fixer]
+provider = "openai"
+model = "gpt-4o"
+
+[plans.premium.fixer]
+model = "gpt-4o-mini"
+"#,
+        )
+        .expect("parse workspace");
+        config.merge(workspace);
+
+        // Overridden entry replaced…
+        assert_eq!(
+            config.plans["economy"]["fixer"].provider,
+            Some(ProviderKind::OpenAi)
+        );
+        assert_eq!(
+            config.plans["economy"]["fixer"].model.as_deref(),
+            Some("gpt-4o")
+        );
+        // …untouched sibling route preserved.
+        assert_eq!(
+            config.plans["economy"]["oracle"].model.as_deref(),
+            Some("k3"),
+            "sibling route must survive a partial override"
+        );
+        // New plan added by the workspace layer.
+        assert_eq!(
+            config.plans["premium"]["fixer"].model.as_deref(),
+            Some("gpt-4o-mini")
+        );
+        // Workspace active_plan overrides the global one.
+        assert_eq!(config.active_plan.as_deref(), Some("premium"));
+    }
+
+    #[test]
+    fn plans_serialize_roundtrip_and_skip_when_empty() {
+        // Empty plans + no active plan → neither key is emitted.
+        let empty = NcaConfig::default();
+        let empty_toml = toml::to_string_pretty(&empty).expect("serialize default");
+        assert!(
+            !empty_toml.contains("plans"),
+            "empty plans must be skipped: {empty_toml}"
+        );
+        assert!(
+            !empty_toml.contains("active_plan"),
+            "None active_plan must be skipped: {empty_toml}"
+        );
+
+        // Populated config survives a TOML roundtrip.
+        let mut config = NcaConfig::default();
+        config.plans.insert(
+            "economy".into(),
+            BTreeMap::from([
+                (
+                    "oracle".into(),
+                    PlanEntry {
+                        provider: Some(ProviderKind::Kimi),
+                        model: Some("k3".into()),
+                    },
+                ),
+                (
+                    "fixer".into(),
+                    PlanEntry {
+                        provider: None,
+                        model: Some("glm-5.2".into()),
+                    },
+                ),
+            ]),
+        );
+        config.active_plan = Some("economy".into());
+
+        let toml_str = toml::to_string_pretty(&config).expect("serialize populated");
+        let back: NcaConfig = toml::from_str(&toml_str).expect("deserialize");
+        assert_eq!(back.plans, config.plans);
+        assert_eq!(back.active_plan, config.active_plan);
+    }
+
+    #[test]
+    fn plan_entry_serialization_skips_none_fields() {
+        // provider-only entry: no `model` key emitted.
+        let provider_only = PlanEntry {
+            provider: Some(ProviderKind::Kimi),
+            model: None,
+        };
+        let s = toml::to_string(&provider_only).expect("serialize provider-only");
+        assert!(s.contains("provider"), "provider pin must serialize: {s}");
+        assert!(!s.contains("model"), "None model must be skipped: {s}");
+
+        // An all-None entry serializes to nothing.
+        let empty = PlanEntry::default();
+        assert_eq!(toml::to_string(&empty).expect("serialize empty"), "");
+    }
 }
