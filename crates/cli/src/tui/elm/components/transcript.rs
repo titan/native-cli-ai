@@ -774,11 +774,50 @@ impl TranscriptState {
                 status,
                 ..
             } => {
+                // WHY in place: the terminal state should read in context next
+                // to the spawn/activity line so the user can tell WHICH
+                // subagent finished, and in-place replacement preserves the
+                // incremental-cache idiom (same as the rolling
+                // `ChildSessionActivity` update above) instead of forcing a
+                // bottom push. Only unknown/stale registrations fall back to
+                // the legacy bottom push.
                 let short = short_session_prefix(child_session_id);
-                self.blocks.push(DisplayBlock::System(format!(
-                    "Sub-agent {short}… done: {status}"
-                )));
-                self.blocks_pushed();
+                let activity_marker = format!("↳ {short}… ·");
+                let spawn_marker = format!("Sub-agent {short}… —");
+
+                let in_place: Option<(usize, String)> = self
+                    .child_activity_blocks
+                    .get(child_session_id)
+                    .copied()
+                    .filter(|&idx| idx < self.blocks.len())
+                    .and_then(|idx| match &self.blocks[idx] {
+                        // Case A: rolling activity block → replace with the
+                        // terminal line at the same index.
+                        DisplayBlock::System(s) if s.starts_with(&activity_marker) => {
+                            Some((idx, format!("↳ {short}… · done: {status}")))
+                        }
+                        // Case B: spawn banner only (child never emitted
+                        // activity) → append the terminal note so the task
+                        // description stays visible.
+                        DisplayBlock::System(s) if s.starts_with(&spawn_marker) => {
+                            Some((idx, format!("{s} · done: {status}")))
+                        }
+                        // Case C: stale or no-longer-matching block → fallback.
+                        _ => None,
+                    });
+
+                match in_place {
+                    Some((idx, text)) => {
+                        self.blocks[idx] = DisplayBlock::System(text);
+                        self.block_mutated_at(idx);
+                    }
+                    None => {
+                        self.blocks.push(DisplayBlock::System(format!(
+                            "Sub-agent {short}… done: {status}"
+                        )));
+                        self.blocks_pushed();
+                    }
+                }
                 self.child_activity_blocks.remove(child_session_id);
             }
             AgentEvent::TurnCompleted { duration_ms, .. } => {
@@ -2090,6 +2129,216 @@ mod tests {
             t.blocks.len(),
             3,
             "seed message + spawn banner + one rolling block"
+        );
+    }
+
+    // ── Child completion rendered in place ──
+
+    #[test]
+    fn child_completion_replaces_rolling_block_in_place() {
+        let mut t = TranscriptState::new();
+        spawn_child(&mut t, "child-a-0001");
+        t.apply_event(&AgentEvent::ChildSessionActivity {
+            child_session_id: "child-a-0001".into(),
+            phase: "read".into(),
+            detail: "reading files".into(),
+        });
+        assert_eq!(t.blocks.len(), 2, "spawn banner + one rolling block");
+
+        t.apply_event(&AgentEvent::ChildSessionCompleted {
+            parent_session_id: "parent".into(),
+            child_session_id: "child-a-0001".into(),
+            status: "completed".into(),
+        });
+
+        assert_eq!(
+            t.blocks.len(),
+            2,
+            "completion must replace the rolling block in place, not push at the bottom"
+        );
+        assert!(
+            matches!(&t.blocks[1], DisplayBlock::System(s) if s == "↳ child-a-… · done: completed"),
+            "rolling block must become the terminal line at the SAME index, got {:?}",
+            t.blocks[1]
+        );
+        assert!(
+            matches!(&t.blocks[0], DisplayBlock::System(s) if s.starts_with("Sub-agent child-a-… —")),
+            "spawn banner must stay untouched"
+        );
+        assert!(
+            !t.child_activity_blocks.contains_key("child-a-0001"),
+            "completion must remove the map entry"
+        );
+    }
+
+    #[test]
+    fn child_completion_without_activity_appends_to_spawn_banner() {
+        let mut t = TranscriptState::new();
+        spawn_child(&mut t, "child-a-0001");
+        assert_eq!(t.blocks.len(), 1);
+
+        t.apply_event(&AgentEvent::ChildSessionCompleted {
+            parent_session_id: "parent".into(),
+            child_session_id: "child-a-0001".into(),
+            status: "completed".into(),
+        });
+
+        assert_eq!(
+            t.blocks.len(),
+            1,
+            "completion must update the spawn banner in place, not push a new block"
+        );
+        assert!(
+            matches!(&t.blocks[0], DisplayBlock::System(s) if s == "Sub-agent child-a-… — some task · done: completed"),
+            "spawn banner must keep the task description and gain the terminal note, got {:?}",
+            t.blocks[0]
+        );
+        assert!(!t.child_activity_blocks.contains_key("child-a-0001"));
+    }
+
+    #[test]
+    fn child_completion_unknown_child_falls_back_to_bottom_push() {
+        let mut t = TranscriptState::new();
+        t.apply_event(&AgentEvent::MessageReceived {
+            role: "assistant".into(),
+            content: "seed".into(),
+            steering: false,
+        });
+        spawn_child(&mut t, "child-a-0001");
+        let before = t.blocks.len();
+
+        // Completed for a child that never spawned in this transcript.
+        t.apply_event(&AgentEvent::ChildSessionCompleted {
+            parent_session_id: "parent".into(),
+            child_session_id: "child-z-9999".into(),
+            status: "completed".into(),
+        });
+
+        assert_eq!(
+            t.blocks.len(),
+            before + 1,
+            "unknown child must fall back to a bottom push"
+        );
+        assert!(
+            matches!(t.blocks.last(), Some(DisplayBlock::System(s)) if s == "Sub-agent child-z-… done: completed"),
+            "fallback line must use the legacy format, got {:?}",
+            t.blocks.last()
+        );
+        // The unrelated child's registration must survive.
+        assert!(t.child_activity_blocks.contains_key("child-a-0001"));
+    }
+
+    #[test]
+    fn child_completion_stale_index_falls_back_to_bottom_push() {
+        let mut t = TranscriptState::new();
+        spawn_child(&mut t, "child-a-0001");
+        // Forge a stale registration: point at an index whose block no longer
+        // matches either marker (the completion fallback must not corrupt it).
+        t.apply_event(&AgentEvent::MessageReceived {
+            role: "assistant".into(),
+            content: "unrelated block".into(),
+            steering: false,
+        });
+        t.child_activity_blocks.insert("child-a-0001".into(), 1);
+
+        t.apply_event(&AgentEvent::ChildSessionCompleted {
+            parent_session_id: "parent".into(),
+            child_session_id: "child-a-0001".into(),
+            status: "failed".into(),
+        });
+
+        assert_eq!(
+            t.blocks.len(),
+            3,
+            "stale registration must fall back to a bottom push"
+        );
+        assert!(
+            matches!(t.blocks.last(), Some(DisplayBlock::System(s)) if s == "Sub-agent child-a-… done: failed")
+        );
+        assert!(
+            matches!(&t.blocks[1], DisplayBlock::Assistant(s) if s == "unrelated block"),
+            "the block the stale index pointed at must be untouched"
+        );
+        assert!(!t.child_activity_blocks.contains_key("child-a-0001"));
+    }
+
+    #[test]
+    fn interleaved_child_completions_mutate_only_the_finishing_child() {
+        let mut t = TranscriptState::new();
+        spawn_child(&mut t, "child-a-0001");
+        spawn_child(&mut t, "child-b-0002");
+        t.apply_event(&AgentEvent::ChildSessionActivity {
+            child_session_id: "child-a-0001".into(),
+            phase: "plan-a".into(),
+            detail: String::new(),
+        });
+        t.apply_event(&AgentEvent::ChildSessionActivity {
+            child_session_id: "child-b-0002".into(),
+            phase: "plan-b".into(),
+            detail: String::new(),
+        });
+        // Layout: 0 = spawn A, 1 = spawn B, 2 = rolling A, 3 = rolling B.
+        let b_idx = t.child_activity_blocks["child-b-0002"];
+        assert_eq!(b_idx, 3);
+
+        t.apply_event(&AgentEvent::ChildSessionCompleted {
+            parent_session_id: "parent".into(),
+            child_session_id: "child-a-0001".into(),
+            status: "completed".into(),
+        });
+
+        assert_eq!(
+            t.blocks.len(),
+            4,
+            "completing A must not push any new block"
+        );
+        assert!(
+            matches!(&t.blocks[2], DisplayBlock::System(s) if s == "↳ child-a-… · done: completed"),
+            "A's rolling block must become the terminal line in place, got {:?}",
+            t.blocks[2]
+        );
+        assert!(
+            matches!(&t.blocks[b_idx], DisplayBlock::System(s) if s == "↳ child-b-… · plan-b · "),
+            "B's rolling block must be untouched at its own index, got {:?}",
+            t.blocks[b_idx]
+        );
+        assert!(
+            !t.child_activity_blocks.contains_key("child-a-0001"),
+            "A's entry must be removed"
+        );
+        assert_eq!(
+            t.child_activity_blocks.get("child-b-0002"),
+            Some(&b_idx),
+            "B's registration must survive untouched"
+        );
+    }
+
+    #[test]
+    fn child_completion_in_place_no_cache_rebuild() {
+        let mut t = TranscriptState::new();
+        t.apply_event(&AgentEvent::MessageReceived {
+            role: "assistant".into(),
+            content: "seed".into(),
+            steering: false,
+        });
+        spawn_child(&mut t, "child-a-0001");
+        t.apply_event(&AgentEvent::ChildSessionActivity {
+            child_session_id: "child-a-0001".into(),
+            phase: "read".into(),
+            detail: "files".into(),
+        });
+        t.total_line_count(78); // builds the line cache
+        let rebuilt = t.line_cache.rebuild_count;
+
+        t.apply_event(&AgentEvent::ChildSessionCompleted {
+            parent_session_id: "parent".into(),
+            child_session_id: "child-a-0001".into(),
+            status: "completed".into(),
+        });
+        t.total_line_count(78);
+        assert_eq!(
+            t.line_cache.rebuild_count, rebuilt,
+            "in-place completion must stay fully incremental (no full rebuild)"
         );
     }
 
