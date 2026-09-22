@@ -166,6 +166,7 @@ post_tool_failure = []
 approval_requested = []
 subagent_start = []
 subagent_stop = []
+turn_complete = []
 ```
 
 Each hook is an object with:
@@ -176,6 +177,10 @@ command = "echo 'session started'"
 matcher = ""        # Optional regex to match on
 blocking = false    # If true, waits for completion
 ```
+
+Hook payloads are delivered on stdin and as the `NCA_HOOK_PAYLOAD`
+environment variable (same JSON). Multi-field scripts should read the env
+var — stdin can only be consumed once.
 
 ### `[web]` — Web Request Settings
 

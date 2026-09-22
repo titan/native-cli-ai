@@ -163,6 +163,7 @@ Hooks let you run shell commands at various points in the session lifecycle.
 | `approval_requested` | When user approval is needed |
 | `subagent_start` | When a sub-agent is spawned |
 | `subagent_stop` | When a sub-agent completes |
+| `turn_complete` | When an agent turn finishes with a final response |
 
 ### Configuration
 
@@ -189,10 +190,26 @@ blocking = false
 | `matcher` | string | `""` | Regex pattern to filter when the hook fires |
 | `blocking` | bool | `false` | Whether to wait for the hook to complete |
 
-All hook payloads are JSON objects delivered on the hook script's stdin and
-include a top-level `workspace` string — the session's workspace root path.
-This lets one shared script identify which directory an event came from, e.g.
-`jq -r '.workspace | split("/") | last'` yields the directory name.
+All hook payloads are JSON objects delivered **twice**: on the hook script's
+stdin, and in the `NCA_HOOK_PAYLOAD` environment variable (identical bytes).
+Every payload includes a top-level `workspace` string — the session's
+workspace root path — so one shared script can identify which directory an
+event came from.
+
+Prefer `NCA_HOOK_PAYLOAD` when a script reads more than one field: stdin can
+only be consumed **once** (the first `jq`/`cat` drains it; later readers see
+EOF and silently get empty strings), while the env var can be read any number
+of times:
+
+```sh
+# ❌ second/third jq read EOF → dir is always empty
+tool=$(jq -r .tool)
+dir=$(jq -r '.workspace | split("/") | last')
+
+# ✅ env var survives any number of reads
+tool=$(printf '%s' "$NCA_HOOK_PAYLOAD" | jq -r .tool)
+dir=$(printf '%s' "$NCA_HOOK_PAYLOAD" | jq -r '.workspace | split("/") | last')
+```
 
 ---
 
