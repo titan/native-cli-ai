@@ -7,7 +7,7 @@
 # ── Provider ──────────────────────────────────────────────────────
 
 [provider]
-# 默认 provider: "minimax" | "openai" | "anthropic" | "openrouter" | "zhipuai" | "deepseek"
+# 默认 provider: "minimax" | "openai" | "anthropic" | "openrouter" | "zhipuai" | "deepseek" | "mimo"
 default = "minimax"
 
 # MiniMax (默认, Anthropic 兼容端点)
@@ -53,6 +53,13 @@ default = "minimax"
 # api_key = ""
 # base_url = "https://api.deepseek.com"
 # model = "deepseek-flash"
+# temperature = 0.7
+
+# 小米 MiMo (OpenAI 兼容端点)
+# [provider.mimo]
+# api_key = ""                     # 也可通过 MIMO_API_KEY 环境变量设置
+# base_url = "https://api.xiaomimimo.com/v1"
+# model = "mimo-v2.6-pro"          # 其余: mimo-v2.6-flash, mimo-v2.6-pro-ultraspeed
 # temperature = 0.7
 
 # ── Model ────────────────────────────────────────────────────────

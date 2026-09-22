@@ -52,6 +52,12 @@ pub const CONNECT_CATALOG: &[CatalogEntry] = &[
         subtitle: "V4 Flash / V4 Pro (API key)",
     },
     CatalogEntry {
+        section: ConnectSection::Popular,
+        kind: ProviderKind::Mimo,
+        title: "MiMo",
+        subtitle: "MiMo-V2.6-Pro (API key)",
+    },
+    CatalogEntry {
         section: ConnectSection::Other,
         kind: ProviderKind::OpenRouter,
         title: "OpenRouter",

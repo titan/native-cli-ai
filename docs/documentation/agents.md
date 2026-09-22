@@ -78,7 +78,7 @@ permission_mode = "accept-edits"            # Can edit files
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `provider` | string | LLM provider: `"minimax"`, `"openai"`, `"anthropic"`, `"openrouter"`, `"zhipuai"`, `"deepseek"` |
+| `provider` | string | LLM provider: `"minimax"`, `"openai"`, `"anthropic"`, `"openrouter"`, `"zhipuai"`, `"deepseek"`, `"mimo"` |
 | `model` | string | Model name on that provider (e.g. `"gpt-4o"`, `"claude-3-7-sonnet-latest"`) |
 | `permission_mode` | string | `"default"`, `"plan"`, `"accept-edits"`, `"dont-ask"`, `"bypass-permissions"` |
 | `system_prompt_append` | string | Extra text appended to the system prompt when this agent is active |
@@ -130,7 +130,7 @@ to the session default after the skill completes.
 
 | Key | Values |
 |-----|--------|
-| `provider` | `"minimax"`, `"openai"`, `"anthropic"`, `"openrouter"`, `"zhipuai"`, `"deepseek"` |
+| `provider` | `"minimax"`, `"openai"`, `"anthropic"`, `"openrouter"`, `"zhipuai"`, `"deepseek"`, `"mimo"` |
 | `model` | Any model string |
 | `permission_mode` | `"default"`, `"plan"`, `"accept-edits"`, `"dont-ask"`, `"bypass-permissions"` |
 | `context` | `"inline"` (default), `"fork"` |
@@ -203,6 +203,7 @@ Valid `provider` values and their required config sections:
 | OpenRouter | `"openrouter"` | `[provider.openrouter]` | `openai/gpt-4o` |
 | ZhipuAI | `"zhipuai"` | `[provider.zhipuai]` | `glm-5.3` |
 | DeepSeek | `"deepseek"` | `[provider.deepseek]` | `deepseek-flash` |
+| MiMo | `"mimo"` | `[provider.mimo]` | `mimo-v2.6-pro` |
 
 You must have the corresponding API key configured (via `[provider.<name>].api_key` or
 environment variable). If the target provider has no credentials, the switch will fail

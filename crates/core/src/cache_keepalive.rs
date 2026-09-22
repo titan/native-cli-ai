@@ -164,6 +164,7 @@ pub fn default_profile(kind: ProviderKind) -> KeepaliveProfile {
         | ProviderKind::OpenRouter
         | ProviderKind::ZhipuAI
         | ProviderKind::Kimi
+        | ProviderKind::Mimo
         | ProviderKind::Custom => KeepaliveProfile::disabled(),
     }
 }

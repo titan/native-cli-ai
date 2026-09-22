@@ -36,6 +36,12 @@ const DEEPSEEK_PROFILE: CompatProfile = CompatProfile {
     strip_reasoning: true,
 };
 
+const MIMO_PROFILE: CompatProfile = CompatProfile {
+    name: "MiMo",
+    endpoint_suffix: "chat/completions",
+    strip_reasoning: true,
+};
+
 /// Build the configured provider for the current workspace (uses `config.provider.default`).
 ///
 /// Equivalent to [`build_provider_with_events`] with no event channel:
@@ -190,6 +196,37 @@ pub fn build_provider_for(
             )?))
         }
         ProviderKind::Kimi => Ok(Arc::new(KimiProvider::from_config(config)?)),
+        ProviderKind::Mimo => {
+            let extra = HeaderMap::new();
+            // Check both model strings that can reach the request body.
+            let models = format!(
+                "{} {}",
+                config.provider.mimo.model, config.model.default_model
+            )
+            .to_ascii_lowercase();
+            let max_tokens = mimo_effective_max_tokens(
+                &models,
+                config.model.max_tokens,
+                config.model.enable_thinking,
+            );
+            // MiMo accepts both thinking states (no GLM-style lock); honor
+            // enable_thinking. The official quickstart sends "disabled" by
+            // default, matching nca's enable_thinking = false default.
+            let thinking_type = if config.model.enable_thinking {
+                "enabled"
+            } else {
+                "disabled"
+            };
+            Ok(Arc::new(
+                OpenAiCompatProvider::from_config(
+                    &config.provider.mimo,
+                    max_tokens,
+                    MIMO_PROFILE,
+                    extra,
+                )?
+                .with_thinking(json!({ "type": thinking_type })),
+            ))
+        }
         ProviderKind::Custom => Ok(Arc::new(super::custom::CustomProvider::from_config(
             config,
         )?)),
@@ -239,6 +276,40 @@ fn zhipuai_effective_max_tokens(models: &str, configured: u32, enable_thinking: 
              values are always raised)"
         );
         return THINKING_LOCKED_FLOOR;
+    }
+    configured
+}
+
+/// Effective `max_tokens` for the MiMo provider.
+///
+/// MiMo's thinking budget shares the output cap (the same mid-reasoning
+/// truncation trap as GLM-5.x): when thinking is enabled, the model can
+/// exhaust the cap mid-reasoning and return an empty `content` with
+/// `finish_reason: "length"`, which surfaces as a hard "empty response"
+/// failure.
+///
+/// Unlike GLM there is no thinking lock — MiMo accepts both
+/// `thinking.type: "enabled"` and `"disabled"` — so the floor keys on the
+/// `enable_thinking` toggle alone (no version lock). The floor equals the
+/// documented MiMo v2.6 output window: 131072 tokens (128K), consistent with
+/// `model_limits.rs`. Explicitly larger values pass through untouched;
+/// thinking off keeps the configured value as-is.
+fn mimo_effective_max_tokens(models: &str, configured: u32, enable_thinking: bool) -> u32 {
+    const THINKING_FLOOR: u32 = 131_072;
+    // Key on every model string that can end up in the request body (see
+    // `zhipuai_effective_max_tokens` for the divergence rationale).
+    let lowered = models.to_ascii_lowercase();
+    if enable_thinking && lowered.contains("mimo") && configured < THINKING_FLOOR {
+        tracing::warn!(
+            models = %lowered,
+            configured,
+            floor = THINKING_FLOOR,
+            enable_thinking,
+            "mimo model spends max_tokens on reasoning; raising max_tokens to avoid \
+             mid-reasoning truncation (values >= the floor pass through; lower \
+             values are always raised)"
+        );
+        return THINKING_FLOOR;
     }
     configured
 }
@@ -321,6 +392,9 @@ mod tests {
                 }
                 ProviderKind::Kimi => {
                     config.provider.kimi.api_key = Some("kimi-key".into());
+                }
+                ProviderKind::Mimo => {
+                    config.provider.mimo.api_key = Some("mimo-key".into());
                 }
                 ProviderKind::Custom => {
                     config.provider.custom.api_key = Some("custom-key".into());
@@ -643,6 +717,57 @@ mod tests {
         assert_eq!(
             zhipuai_effective_max_tokens("glm-5.2 glm-4.7-flash", 8_192, false),
             8_192
+        );
+    }
+
+    #[test]
+    fn mimo_max_tokens_floored_when_thinking_enabled() {
+        // Default 8192 would truncate MiMo mid-reasoning when thinking is on.
+        assert_eq!(
+            mimo_effective_max_tokens("mimo-v2.6-pro", 8_192, true),
+            131_072
+        );
+        assert_eq!(
+            mimo_effective_max_tokens("MIMO-V2.6-FLASH", 4_096, true),
+            131_072
+        );
+        // The floor keys on either model string that can reach the wire.
+        assert_eq!(
+            mimo_effective_max_tokens("other-model mimo-v2.6-pro-ultraspeed", 8_192, true),
+            131_072
+        );
+    }
+
+    #[test]
+    fn mimo_max_tokens_passthrough_when_thinking_disabled() {
+        // No thinking lock: with thinking off the configured value stands
+        // (the capability clamp in chat() may still raise it on the wire —
+        // mimo-v2.6 is a 128K-class model — but the factory passes it through).
+        assert_eq!(
+            mimo_effective_max_tokens("mimo-v2.6-pro", 8_192, false),
+            8_192
+        );
+        assert_eq!(
+            mimo_effective_max_tokens("mimo-v2.6-flash", 98_304, false),
+            98_304
+        );
+    }
+
+    #[test]
+    fn mimo_floor_ignores_non_mimo_models_and_respects_larger_values() {
+        // A non-mimo model string never triggers the MiMo floor, even with
+        // thinking on.
+        assert_eq!(mimo_effective_max_tokens("glm-5.3", 8_192, true), 8_192);
+        assert_eq!(mimo_effective_max_tokens("", 8_192, true), 8_192);
+        // Boundary: configured == floor passes through untouched; larger
+        // values win.
+        assert_eq!(
+            mimo_effective_max_tokens("mimo-v2.6-pro", 131_072, true),
+            131_072
+        );
+        assert_eq!(
+            mimo_effective_max_tokens("mimo-v2.6-pro", 262_144, true),
+            262_144
         );
     }
 }

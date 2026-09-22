@@ -56,6 +56,12 @@ fn build_connect_rows(search: &str) -> Vec<ConnectRow> {
             "V4 Flash / V4 Pro (API key)",
         ),
         (
+            "Popular",
+            ProviderKind::Mimo,
+            "MiMo",
+            "MiMo-V2.6-Pro (API key)",
+        ),
+        (
             "Other",
             ProviderKind::OpenRouter,
             "OpenRouter",

@@ -174,6 +174,56 @@ max_tokens = 65536   # or higher; glm-5.3 supports up to 131072 output tokens
 Note: `--max-tokens` on the CLI overrides the config value; when omitted, the
 config value applies.
 
+## Xiaomi MiMo
+
+Xiaomi's MiMo models via the OpenAI-compatible chat completions endpoint
+(`https://api.xiaomimimo.com/v1/chat/completions`).
+
+### Setup
+
+```bash
+export MIMO_API_KEY="your-mimo-key"
+```
+
+```toml
+[provider]
+default = "mimo"
+
+[provider.mimo]
+api_key_env = "MIMO_API_KEY"
+base_url = "https://api.xiaomimimo.com/v1"
+model = "mimo-v2.6-pro"
+```
+
+### Models
+
+All three models share a 1M-token context window, a 131072-token output cap,
+omnimodal input (text/image/video/audio), tool calling, streaming, structured
+output, and context caching:
+
+| Model | Notes |
+|-------|-------|
+| `mimo-v2.6-pro` | Flagship (default). |
+| `mimo-v2.6-flash` | Efficient tier. |
+| `mimo-v2.6-pro-ultraspeed` | 20× output speed variant. |
+
+### Thinking Toggle and `max_tokens`
+
+MiMo supports DeepSeek-style `reasoning_content` in streaming deltas — a
+response-only signal that nca strips before re-uploading (same as DeepSeek).
+
+Thinking is toggled with a `thinking: {"type": "enabled" | "disabled"}` field in
+the request body. MiMo accepts **both** states (unlike GLM-5.3, there is no
+lock): nca sends `"disabled"` when `[model] enable_thinking = false` (the
+default, matching MiMo's own quickstart) and `"enabled"` when it is true.
+
+Like GLM, thinking shares the `max_tokens` output budget. When
+`enable_thinking = true`, nca floors `max_tokens` to 131072 (the documented
+output window) so the model cannot exhaust the cap mid-reasoning and return an
+empty `content` with `finish_reason: "length"`. With thinking off the configured
+value stands (though the 128K-class capability clamp may still raise it on the
+wire, since all MiMo v2.6 models have a 131072-token output window).
+
 ## Switching Providers
 
 ### Via CLI Flag

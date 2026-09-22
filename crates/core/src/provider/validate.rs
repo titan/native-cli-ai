@@ -36,7 +36,8 @@ pub async fn validate_api_key(
         ProviderKind::OpenAi
         | ProviderKind::OpenRouter
         | ProviderKind::ZhipuAI
-        | ProviderKind::DeepSeek => {
+        | ProviderKind::DeepSeek
+        | ProviderKind::Mimo => {
             let url = format!("{}/models", base_url.trim_end_matches('/'));
             client
                 .get(&url)

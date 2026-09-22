@@ -137,6 +137,13 @@ pub const MODEL_CONTEXT_LIMITS: &[ModelContextLimits] = &[
         context_window: 200_000,
         max_output_tokens: 128_000,
     },
+    // Xiaomi MiMo v2.6 family (pro / flash / pro-ultraspeed): 1M context,
+    // 131K output, omnimodal input, deep thinking.
+    ModelContextLimits {
+        pattern: "mimo-v2.6",
+        context_window: 1_000_000,
+        max_output_tokens: 131_072,
+    },
     // Gemini 1.5 Pro
     ModelContextLimits {
         pattern: "gemini-1.5-pro",
@@ -377,6 +384,22 @@ mod tests {
         assert_eq!(detect_context_window("glm-5.2"), 1_000_000);
         assert_eq!(detect_context_window("glm-5-turbo"), 200_000);
         assert_eq!(detect_max_output_tokens("glm-5-turbo"), 128_000);
+    }
+
+    #[test]
+    fn test_detect_mimo() {
+        // All three v2.6 ids share the 1M context / 128K output envelope.
+        assert_eq!(detect_context_window("mimo-v2.6-pro"), 1_000_000);
+        assert_eq!(detect_max_output_tokens("mimo-v2.6-pro"), 131_072);
+        assert_eq!(detect_context_window("mimo-v2.6-flash"), 1_000_000);
+        assert_eq!(detect_max_output_tokens("mimo-v2.6-flash"), 131_072);
+        assert_eq!(detect_context_window("mimo-v2.6-pro-ultraspeed"), 1_000_000);
+        assert_eq!(
+            detect_max_output_tokens("mimo-v2.6-pro-ultraspeed"),
+            131_072
+        );
+        // 128K-class floor applies via clamp_max_tokens.
+        assert_eq!(clamp_max_tokens("mimo-v2.6-pro", 8_192), 131_072);
     }
 
     #[test]

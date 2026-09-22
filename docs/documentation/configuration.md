@@ -17,7 +17,7 @@ Settings merge in order: **defaults → global → workspace → environment var
 
 ```toml
 [provider]
-default = "minimax"   # "minimax" | "openrouter" | "anthropic" | "openai"
+default = "minimax"   # "minimax" | "openrouter" | "anthropic" | "openai" | "zhipuai" | "deepseek" | "kimi" | "mimo"
 
 [provider.minimax]
 api_key_env = "MINIMAX_API_KEY"     # Environment variable to read
@@ -45,6 +45,12 @@ model = "openai/gpt-4o-mini"
 temperature = 0.7
 site_url = ""       # Optional referrer URL
 app_name = ""       # Optional app name header
+
+[provider.mimo]
+api_key_env = "MIMO_API_KEY"
+base_url = "https://api.xiaomimimo.com/v1"
+model = "mimo-v2.6-pro"
+temperature = 0.7
 ```
 
 ### `[model]` — Model Settings
@@ -225,7 +231,7 @@ Environment variables override config file values.
 
 | Variable | Description |
 |----------|-------------|
-| `NCA_DEFAULT_PROVIDER` | Override default provider (`minimax`, `openrouter`, `anthropic`, `openai`) |
+| `NCA_DEFAULT_PROVIDER` | Override default provider (`minimax`, `openrouter`, `anthropic`, `openai`, `zhipuai`, `deepseek`, `kimi`, `mimo`) |
 | `NCA_MODEL` | Override the active model |
 | `MINIMAX_API_KEY` | MiniMax API key |
 | `MINIMAX_BASE_URL` | MiniMax API base URL |
@@ -241,6 +247,9 @@ Environment variables override config file values.
 | `OPENROUTER_MODEL` | OpenRouter model name |
 | `OPENROUTER_SITE_URL` | OpenRouter site URL header |
 | `OPENROUTER_APP_NAME` | OpenRouter app name header |
+| `MIMO_API_KEY` | Xiaomi MiMo API key |
+| `MIMO_BASE_URL` | Xiaomi MiMo API base URL |
+| `MIMO_MODEL` | Xiaomi MiMo model name |
 
 ### Runtime Behavior
 

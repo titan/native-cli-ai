@@ -7,6 +7,7 @@ pub mod deepseek;
 pub mod factory;
 pub mod fallback;
 pub mod kimi;
+pub mod mimo;
 pub mod minimax;
 pub mod minimax_vlm;
 pub mod openai;

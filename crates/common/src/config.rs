@@ -333,6 +333,18 @@ impl NcaConfig {
             self.provider.kimi.model = model;
         }
 
+        if let Ok(api_key) = env::var("MIMO_API_KEY") {
+            self.provider.mimo.api_key = Some(api_key);
+        }
+
+        if let Ok(base_url) = env::var("MIMO_BASE_URL") {
+            self.provider.mimo.base_url = base_url;
+        }
+
+        if let Ok(model) = env::var("MIMO_MODEL") {
+            self.provider.mimo.model = model;
+        }
+
         if let Ok(memory_path) = env::var("NCA_MEMORY_PATH") {
             self.memory.file_path = PathBuf::from(memory_path);
         }
@@ -372,6 +384,9 @@ impl NcaConfig {
             "openrouter" => Some(ProviderKind::OpenRouter),
             "zhipuai" | "glm" | "glm5" | "glm-5.2" | "glm-5.3" | "glm-5.3-flash" => {
                 Some(ProviderKind::ZhipuAI)
+            }
+            "mimo" | "xiaomi" | "mimo-pro" | "mimo-flash" | "mimo-ultraspeed" => {
+                Some(ProviderKind::Mimo)
             }
             "default"
             | "deepseek"
@@ -418,6 +433,7 @@ impl NcaConfig {
             ProviderKind::ZhipuAI => self.provider.zhipuai.api_key = Some(key),
             ProviderKind::DeepSeek => self.provider.deepseek.api_key = Some(key),
             ProviderKind::Kimi => self.provider.kimi.api_key = Some(key),
+            ProviderKind::Mimo => self.provider.mimo.api_key = Some(key),
             ProviderKind::Custom => self.provider.custom.api_key = Some(key),
         }
     }
@@ -1023,6 +1039,7 @@ pub struct ProviderConfig {
     pub zhipuai: ZhipuAIConfig,
     pub deepseek: DeepSeekConfig,
     pub kimi: KimiConfig,
+    pub mimo: MimoConfig,
     #[serde(default)]
     pub custom: CustomProviderConfig,
 }
@@ -1038,6 +1055,7 @@ impl Default for ProviderConfig {
             zhipuai: ZhipuAIConfig::default(),
             deepseek: DeepSeekConfig::default(),
             kimi: KimiConfig::default(),
+            mimo: MimoConfig::default(),
             custom: CustomProviderConfig::default(),
         }
     }
@@ -1070,6 +1088,9 @@ impl ProviderConfig {
         if let Some(kimi) = partial.kimi {
             self.kimi.merge(kimi);
         }
+        if let Some(mimo) = partial.mimo {
+            self.mimo.merge(mimo);
+        }
         if let Some(custom) = partial.custom {
             self.custom.merge(custom);
         }
@@ -1084,6 +1105,7 @@ impl ProviderConfig {
             ProviderKind::ZhipuAI => &self.zhipuai.model,
             ProviderKind::DeepSeek => &self.deepseek.model,
             ProviderKind::Kimi => &self.kimi.model,
+            ProviderKind::Mimo => &self.mimo.model,
             ProviderKind::Custom => &self.custom.model,
         }
     }
@@ -1102,6 +1124,7 @@ impl ProviderConfig {
             ProviderKind::ZhipuAI => self.zhipuai.model = model,
             ProviderKind::DeepSeek => self.deepseek.model = model,
             ProviderKind::Kimi => self.kimi.model = model,
+            ProviderKind::Mimo => self.mimo.model = model,
             ProviderKind::Custom => self.custom.model = model,
         }
     }
@@ -1115,6 +1138,7 @@ impl ProviderConfig {
             ProviderKind::ZhipuAI => &self.zhipuai.model,
             ProviderKind::DeepSeek => &self.deepseek.model,
             ProviderKind::Kimi => &self.kimi.model,
+            ProviderKind::Mimo => &self.mimo.model,
             ProviderKind::Custom => &self.custom.model,
         }
     }
@@ -1128,6 +1152,7 @@ impl ProviderConfig {
             ProviderKind::ZhipuAI => &self.zhipuai.base_url,
             ProviderKind::DeepSeek => &self.deepseek.base_url,
             ProviderKind::Kimi => &self.kimi.base_url,
+            ProviderKind::Mimo => &self.mimo.base_url,
             ProviderKind::Custom => &self.custom.base_url,
         }
     }
@@ -1141,6 +1166,7 @@ impl ProviderConfig {
             ProviderKind::ZhipuAI => &self.zhipuai.api_key_env,
             ProviderKind::DeepSeek => &self.deepseek.api_key_env,
             ProviderKind::Kimi => &self.kimi.api_key_env,
+            ProviderKind::Mimo => &self.mimo.api_key_env,
             ProviderKind::Custom => &self.custom.api_key_env,
         }
     }
@@ -1154,6 +1180,7 @@ impl ProviderConfig {
             ProviderKind::ZhipuAI => self.zhipuai.resolve_api_key().is_some(),
             ProviderKind::DeepSeek => self.deepseek.resolve_api_key().is_some(),
             ProviderKind::Kimi => self.kimi.resolve_api_key().is_some(),
+            ProviderKind::Mimo => self.mimo.resolve_api_key().is_some(),
             ProviderKind::Custom => self.custom.resolve_api_key().is_some(),
         }
     }
@@ -1201,11 +1228,12 @@ pub enum ProviderKind {
     ZhipuAI,
     DeepSeek,
     Kimi,
+    Mimo,
     Custom,
 }
 
 impl ProviderKind {
-    pub const ALL: [ProviderKind; 8] = [
+    pub const ALL: [ProviderKind; 9] = [
         ProviderKind::MiniMax,
         ProviderKind::OpenAi,
         ProviderKind::Anthropic,
@@ -1213,6 +1241,7 @@ impl ProviderKind {
         ProviderKind::ZhipuAI,
         ProviderKind::DeepSeek,
         ProviderKind::Kimi,
+        ProviderKind::Mimo,
         ProviderKind::Custom,
     ];
 
@@ -1228,6 +1257,7 @@ impl ProviderKind {
             }
             "deepseek" => Some(Self::DeepSeek),
             "kimi" | "k3" | "kimi-k3" => Some(Self::Kimi),
+            "mimo" | "xiaomi" => Some(Self::Mimo),
             "custom" => Some(Self::Custom),
             _ => None,
         }
@@ -1241,6 +1271,7 @@ impl ProviderKind {
             "zhipuai" | "zhipu" | "glm" => Self::ZhipuAI,
             "deepseek" => Self::DeepSeek,
             "kimi" => Self::Kimi,
+            "mimo" | "xiaomi" => Self::Mimo,
             "custom" => Self::Custom,
             _ => Self::MiniMax,
         }
@@ -1255,6 +1286,7 @@ impl ProviderKind {
             ProviderKind::ZhipuAI => "ZhipuAI",
             ProviderKind::DeepSeek => "DeepSeek",
             ProviderKind::Kimi => "Kimi",
+            ProviderKind::Mimo => "MiMo",
             ProviderKind::Custom => "Custom",
         }
     }
@@ -1602,6 +1634,55 @@ impl KimiConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MimoConfig {
+    pub api_key_env: String,
+    pub api_key: Option<String>,
+    pub base_url: String,
+    pub model: String,
+    pub temperature: f32,
+}
+
+impl Default for MimoConfig {
+    fn default() -> Self {
+        Self {
+            api_key_env: "MIMO_API_KEY".into(),
+            api_key: None,
+            // Xiaomi MiMo serves an OpenAI-compatible API.
+            // Endpoint is `{base_url}/chat/completions`
+            // → https://api.xiaomimimo.com/v1/chat/completions
+            base_url: "https://api.xiaomimimo.com/v1".into(),
+            // MiMo flagship: 1M context, 131K output, omnimodal, deep thinking.
+            model: "mimo-v2.6-pro".into(),
+            temperature: 0.7,
+        }
+    }
+}
+
+impl MimoConfig {
+    pub fn resolve_api_key(&self) -> Option<String> {
+        resolve_api_key_value(&self.api_key, &self.api_key_env)
+    }
+
+    fn merge(&mut self, partial: PartialMimoConfig) {
+        if let Some(api_key_env) = partial.api_key_env {
+            self.api_key_env = api_key_env;
+        }
+        if let Some(api_key) = partial.api_key {
+            self.api_key = Some(api_key);
+        }
+        if let Some(base_url) = partial.base_url {
+            self.base_url = base_url;
+        }
+        if let Some(model) = partial.model {
+            self.model = model;
+        }
+        if let Some(temperature) = partial.temperature {
+            self.temperature = temperature;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CustomProviderConfig {
     pub api_key_env: String,
     pub api_key: Option<String>,
@@ -1652,7 +1733,8 @@ impl CustomProviderConfig {
 }
 
 /// Common interface for OpenAI-compatible provider configs.
-/// Shared by OpenAiConfig, OpenRouterConfig, ZhipuAIConfig, DeepSeekConfig.
+/// Shared by OpenAiConfig, OpenRouterConfig, ZhipuAIConfig, DeepSeekConfig,
+/// and MimoConfig.
 pub trait OpenAiCompatConfig {
     fn resolve_api_key(&self) -> Option<String>;
     fn api_key_env(&self) -> &str;
@@ -1716,6 +1798,24 @@ impl OpenAiCompatConfig for ZhipuAIConfig {
 }
 
 impl OpenAiCompatConfig for DeepSeekConfig {
+    fn resolve_api_key(&self) -> Option<String> {
+        self.resolve_api_key()
+    }
+    fn api_key_env(&self) -> &str {
+        &self.api_key_env
+    }
+    fn base_url(&self) -> &str {
+        &self.base_url
+    }
+    fn model(&self) -> &str {
+        &self.model
+    }
+    fn temperature(&self) -> f32 {
+        self.temperature
+    }
+}
+
+impl OpenAiCompatConfig for MimoConfig {
     fn resolve_api_key(&self) -> Option<String> {
         self.resolve_api_key()
     }
@@ -2540,6 +2640,7 @@ struct PartialProviderConfig {
     zhipuai: Option<PartialZhipuAIConfig>,
     deepseek: Option<PartialDeepSeekConfig>,
     kimi: Option<PartialKimiConfig>,
+    mimo: Option<PartialMimoConfig>,
     custom: Option<PartialCustomProviderConfig>,
 }
 
@@ -2601,6 +2702,15 @@ struct PartialDeepSeekConfig {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 struct PartialKimiConfig {
+    api_key_env: Option<String>,
+    api_key: Option<String>,
+    base_url: Option<String>,
+    model: Option<String>,
+    temperature: Option<f32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PartialMimoConfig {
     api_key_env: Option<String>,
     api_key: Option<String>,
     base_url: Option<String>,
@@ -2810,6 +2920,11 @@ fn default_model_aliases() -> BTreeMap<String, String> {
         ("moonshot".into(), "k3".into()),
         ("k3".into(), "k3".into()),
         ("kimi-k3".into(), "k3".into()),
+        // Xiaomi MiMo
+        ("mimo".into(), "mimo-v2.6-pro".into()),
+        ("mimo-pro".into(), "mimo-v2.6-pro".into()),
+        ("mimo-flash".into(), "mimo-v2.6-flash".into()),
+        ("mimo-ultraspeed".into(), "mimo-v2.6-pro-ultraspeed".into()),
         // OpenAI
         ("openai".into(), "gpt-4o-mini".into()),
         ("gpt4o".into(), "gpt-4o".into()),

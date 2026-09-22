@@ -2058,6 +2058,7 @@ fn classify_exit_code(error: &anyhow::Error) -> ExitCode {
         || combined.contains("missing anthropic api key")
         || combined.contains("missing openrouter api key")
         || combined.contains("missing zhipuai api key")
+        || combined.contains("missing mimo api key")
         || combined.contains("failed to parse config file")
         || combined.contains("unable to determine the home directory")
         || combined.contains("invalid workspace root")

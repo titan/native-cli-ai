@@ -59,6 +59,9 @@ pub fn model_accepts_native_images(kind: ProviderKind, model: &str) -> bool {
         // accepts native image blocks (anthropic_compat serializes them directly;
         // no coding_plan/vlm sidecar needed).
         ProviderKind::Kimi => !m.is_empty(),
+        // Xiaomi MiMo v2.6 models are omnimodal (text/image/video/audio input)
+        // on the OpenAI-compatible chat completions endpoint.
+        ProviderKind::Mimo => m.contains("mimo"),
         // ponytail: custom endpoints vary; assume no native image input until configured otherwise
         ProviderKind::Custom => false,
     }
@@ -128,6 +131,26 @@ mod tests {
             ProviderKind::ZhipuAI,
             "glm-4v-flash"
         ));
+    }
+
+    #[test]
+    fn mimo_v2_6_family_accepts_native_images() {
+        // All MiMo v2.6 models are omnimodal.
+        assert!(model_accepts_native_images(
+            ProviderKind::Mimo,
+            "mimo-v2.6-pro"
+        ));
+        assert!(model_accepts_native_images(
+            ProviderKind::Mimo,
+            "mimo-v2.6-flash"
+        ));
+        assert!(model_accepts_native_images(
+            ProviderKind::Mimo,
+            "mimo-v2.6-pro-ultraspeed"
+        ));
+        // Empty / non-mimo strings stay conservative.
+        assert!(!model_accepts_native_images(ProviderKind::Mimo, ""));
+        assert!(!model_accepts_native_images(ProviderKind::Mimo, "other"));
     }
 
     #[test]
