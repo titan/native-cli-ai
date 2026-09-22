@@ -259,6 +259,33 @@ impl SessionRuntime {
         Ok(effective_model)
     }
 
+    /// Apply a `/model`-style change to the ACTIVE persona: with a specialist
+    /// profile active the model is pinned into that profile's
+    /// `[agents.<name>]` entry (surviving switches/resumes/spawns); otherwise
+    /// the base-config default-provider flow. Returns the updated profile
+    /// name, or `None` for the base flow.
+    pub fn apply_model_for_active_agent(
+        &mut self,
+        model: &str,
+    ) -> Result<Option<String>, ProviderError> {
+        self.supervisor.set_model_for_active_agent(model)
+    }
+
+    /// `/provider`-style switch routed to the active persona (see
+    /// [`SessionRuntime::apply_model_for_active_agent`]).
+    pub fn apply_provider_for_active_agent(
+        &mut self,
+        provider: ProviderKind,
+    ) -> Result<Option<String>, ProviderError> {
+        self.supervisor.set_provider_for_active_agent(provider)
+    }
+
+    /// Provider kind the active persona routes to (profile override or the
+    /// config default) — for pickers marking/fetching the live provider.
+    pub fn active_provider(&self) -> ProviderKind {
+        self.supervisor.active_provider()
+    }
+
     pub fn request_cancel(&self) {
         self.supervisor.request_cancel();
     }

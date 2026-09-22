@@ -19,7 +19,7 @@ use crate::pty::PtyManager;
 use crate::session_store::SessionStore;
 use crate::subagent_registry::{SubagentRegistry, subagent_control_consumer};
 use chrono::Utc;
-use nca_common::config::{AgentProfileConfig, NcaConfig};
+use nca_common::config::{AgentProfileConfig, NcaConfig, ProviderKind};
 use nca_common::event::{AgentEvent, EndReason, EventEnvelope};
 use nca_common::message::{ContentPart, Message, MessageContent, Role};
 use nca_common::session::{
@@ -2023,6 +2023,91 @@ impl Supervisor {
         // from now on must route against it, not the wiring-time snapshot.
         self.refresh_live_config();
         Ok(applied)
+    }
+
+    /// Base-config `/model` flow shared by the persona-aware wrappers below.
+    fn set_model_for_base(&mut self, raw_model: &str) -> Result<(), ProviderError> {
+        let mut config = self.config.clone();
+        config.apply_model_override(raw_model);
+        self.apply_nca_config(config)
+    }
+
+    /// Route a `/model`-style change to the ACTIVE persona.
+    ///
+    /// With a specialist profile active, the resolved model is written into
+    /// that profile's `[agents.<name>]` entry (both config layers) and the
+    /// profile re-applied — so the change survives agent switches and
+    /// resumes, and specialist subagent spawns (`apply_child_routing`, which
+    /// reads the profile from the live config) inherit it. Writing only the
+    /// base provider slot (the old behavior) made profile pins silently snap
+    /// back on the next switch: only the default persona's model was durably
+    /// changeable. Provider alias hints switch the profile's provider,
+    /// mirroring the base flow. Returns the updated profile name, or `None`
+    /// when the change went to the base config (default persona or an
+    /// unresolvable profile name).
+    pub fn set_model_for_active_agent(
+        &mut self,
+        raw_model: &str,
+    ) -> Result<Option<String>, ProviderError> {
+        self.config
+            .model
+            .track_recent_model(&self.config.model.resolve_alias(raw_model));
+        let Some(name) = self.active_agent_name.clone() else {
+            return self.set_model_for_base(raw_model).map(|_| None);
+        };
+        if !self.config.agents.contains_key(&name) {
+            return self.set_model_for_base(raw_model).map(|_| None);
+        }
+        let resolved = self.config.model.resolve_alias(raw_model);
+        let hint = NcaConfig::provider_hint_for_alias(raw_model);
+        let profile = self.config.agents.get_mut(&name).expect("checked above");
+        if let Some(provider) = hint {
+            profile.provider = Some(provider);
+        }
+        profile.model = Some(resolved);
+        self.base_config.agents = self.config.agents.clone();
+        self.base_config.model = self.config.model.clone();
+        self.apply_agent_profile(Some(&name))
+    }
+
+    /// Route a `/provider`-style switch to the ACTIVE persona (same contract
+    /// as [`Self::set_model_for_active_agent`]). On a profile this retargets
+    /// the profile's provider and clears its model pin — the old model name
+    /// belongs to the old provider's namespace — so the profile inherits the
+    /// new provider's configured default model.
+    pub fn set_provider_for_active_agent(
+        &mut self,
+        provider: ProviderKind,
+    ) -> Result<Option<String>, ProviderError> {
+        let Some(name) = self.active_agent_name.clone() else {
+            return self.set_provider_for_base(provider).map(|_| None);
+        };
+        if !self.config.agents.contains_key(&name) {
+            return self.set_provider_for_base(provider).map(|_| None);
+        }
+        let profile = self.config.agents.get_mut(&name).expect("checked above");
+        profile.provider = Some(provider);
+        profile.model = None;
+        self.base_config.agents = self.config.agents.clone();
+        self.apply_agent_profile(Some(&name))
+    }
+
+    /// Base-config `/provider` flow (see [`Self::set_model_for_base`]).
+    fn set_provider_for_base(&mut self, provider: ProviderKind) -> Result<(), ProviderError> {
+        let mut config = self.config.clone();
+        config.set_default_provider(provider);
+        self.apply_nca_config(config)
+    }
+
+    /// Provider kind the ACTIVE persona routes to (profile override or the
+    /// config default). UI pickers use this to mark/fetch the live provider,
+    /// which differs from `config.provider.default` while a specialist
+    /// profile with a provider pin is active.
+    pub fn active_provider(&self) -> ProviderKind {
+        self.agent_profile
+            .as_ref()
+            .and_then(|p| p.resolve_provider())
+            .unwrap_or(self.config.provider.default)
     }
 
     /// Reset for a fresh session: new ID, rebuild system prompt, clear lineage and cost.

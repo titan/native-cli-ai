@@ -446,6 +446,13 @@ fn openai_context_from_catalog(value: &serde_json::Value, model: &str) -> Option
 /// Fetch available model IDs from the active provider's API.
 /// Returns a sorted list of model ID strings. Uses the same cache as context-window lookups.
 pub async fn fetch_provider_model_ids(config: &NcaConfig) -> Vec<String> {
+    fetch_model_ids_for(config, config.provider.default).await
+}
+
+/// Fetch model IDs for an explicit provider kind — e.g. the ACTIVE persona's
+/// provider, which differs from the config default while a specialist
+/// profile with a provider pin is active.
+pub async fn fetch_model_ids_for(config: &NcaConfig, kind: ProviderKind) -> Vec<String> {
     if !config.memory.context.query_provider_models_api {
         return Vec::new();
     }
@@ -456,7 +463,7 @@ pub async fn fetch_provider_model_ids(config: &NcaConfig) -> Vec<String> {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
-    match config.provider.default {
+    match kind {
         ProviderKind::OpenRouter => fetch_openrouter_model_ids(&client, config).await,
         ProviderKind::Anthropic => fetch_anthropic_model_ids(&client, config).await,
         ProviderKind::OpenAi => fetch_openai_model_ids(&client, config).await,

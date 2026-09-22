@@ -381,10 +381,8 @@ impl Repl {
         p: ProviderKind,
         out: ReplOutput<'_>,
     ) -> anyhow::Result<()> {
-        let mut cfg = self.runtime.config().clone();
-        cfg.set_default_provider(p);
-        match self.runtime.apply_nca_config(cfg) {
-            Ok(()) => {
+        match self.runtime.apply_provider_for_active_agent(p) {
+            Ok(profile) => {
                 if let ReplOutput::Tui(st) = &out {
                     st.set_model(self.runtime.model().to_string());
                 }
@@ -393,11 +391,14 @@ impl Repl {
                     .config()
                     .save_workspace_file(self.runtime.workspace_root())
                 {
-                    Ok(()) => out.println(&format!(
-                        "[provider] {} — model {} — saved .nca/config.local.toml",
-                        p.display_name(),
-                        self.runtime.model()
-                    )),
+                    Ok(()) => {
+                        let who = profile.map(|n| format!("@{n} → ")).unwrap_or_default();
+                        out.println(&format!(
+                            "[provider] {who}{} — model {} — saved .nca/config.local.toml",
+                            p.display_name(),
+                            self.runtime.model()
+                        ))
+                    }
                     Err(e) => out.eprintln(&format!(
                         "[provider] applied but workspace save failed: {e}"
                     )),
@@ -680,11 +681,8 @@ impl Repl {
             }
             "/model" => {
                 if let Some(model) = parts.next() {
-                    let mut cfg = self.runtime.config().clone();
-                    cfg.apply_model_override(model);
-                    cfg.model.track_recent_model(&self.runtime.config().model.resolve_alias(model));
-                    match self.runtime.apply_nca_config(cfg) {
-                        Ok(()) => {
+                    match self.runtime.apply_model_for_active_agent(model) {
+                        Ok(profile) => {
                             if let Err(e) = self
                                 .runtime
                                 .config()
@@ -694,10 +692,16 @@ impl Repl {
                                     "[model] session updated; workspace save failed: {e}"
                                 ));
                             } else {
-                                out.println(&format!(
-                                    "model set to {} (saved .nca/config.local.toml)",
-                                    self.runtime.model()
-                                ));
+                                match profile {
+                                    Some(name) => out.println(&format!(
+                                        "@{name} model set to {} (saved .nca/config.local.toml)",
+                                        self.runtime.model()
+                                    )),
+                                    None => out.println(&format!(
+                                        "model set to {} (saved .nca/config.local.toml)",
+                                        self.runtime.model()
+                                    )),
+                                }
                             }
                             if let ReplOutput::Tui(st) = out {
                                 st.set_model(self.runtime.model().to_string());
@@ -706,8 +710,16 @@ impl Repl {
                         Err(e) => out.eprintln(&format!("[model] {e}")),
                     }
                 } else if let ReplOutput::Tui(st) = &out {
-                    let provider_models = nca_runtime::model_limits_api::fetch_provider_model_ids(self.runtime.config()).await;
-                    let entries = build_model_picker_entries(self.runtime.config(), &provider_models);
+                    let provider_models = nca_runtime::model_limits_api::fetch_model_ids_for(
+                        self.runtime.config(),
+                        self.runtime.active_provider(),
+                    )
+                    .await;
+                    let entries = build_model_picker_entries(
+                        self.runtime.config(),
+                        &provider_models,
+                        self.runtime.active_provider(),
+                    );
                     st.open_model_picker(entries);
                 } else {
                     out.println(&format!("active model: {}", self.runtime.model()));
@@ -911,8 +923,16 @@ impl Repl {
             }
             "/models" => {
                 if let ReplOutput::Tui(st) = &out {
-                    let provider_models = nca_runtime::model_limits_api::fetch_provider_model_ids(self.runtime.config()).await;
-                    let entries = build_model_picker_entries(self.runtime.config(), &provider_models);
+                    let provider_models = nca_runtime::model_limits_api::fetch_model_ids_for(
+                        self.runtime.config(),
+                        self.runtime.active_provider(),
+                    )
+                    .await;
+                    let entries = build_model_picker_entries(
+                        self.runtime.config(),
+                        &provider_models,
+                        self.runtime.active_provider(),
+                    );
                     st.open_model_picker(entries);
                 } else {
                     let provider = self.runtime.config().provider.default;
@@ -1901,13 +1921,8 @@ impl Repl {
                         }
                     }
                     TuiCmd::ApplyModel(model_name) => {
-                        let mut cfg = self.runtime.config().clone();
-                        cfg.apply_model_override(&model_name);
-                        cfg.model.track_recent_model(
-                            &self.runtime.config().model.resolve_alias(&model_name),
-                        );
-                        match self.runtime.apply_nca_config(cfg) {
-                            Ok(()) => {
+                        match self.runtime.apply_model_for_active_agent(&model_name) {
+                            Ok(profile) => {
                                 if let Err(e) = self
                                     .runtime
                                     .config()
@@ -1917,8 +1932,10 @@ impl Repl {
                                         .push_error(format!("[model] workspace save failed: {e}"));
                                 } else {
                                     tui_feedback.set_model(self.runtime.model().to_string());
+                                    let who =
+                                        profile.map(|n| format!("@{n} → ")).unwrap_or_default();
                                     tui_feedback.push_system(format!(
-                                        "[model] switched to {} (saved)",
+                                        "[model] {who}switched to {} (saved)",
                                         self.runtime.model()
                                     ));
                                 }
@@ -2037,16 +2054,17 @@ impl Repl {
                                 pos.checked_sub(1).unwrap_or(recent.len() - 1)
                             };
                             let next_model = recent[next_pos].clone();
-                            let mut cfg = self.runtime.config().clone();
-                            cfg.apply_model_override(&next_model);
-                            if let Ok(()) = self.runtime.apply_nca_config(cfg) {
+                            if let Ok(profile) =
+                                self.runtime.apply_model_for_active_agent(&next_model)
+                            {
                                 let _ = self
                                     .runtime
                                     .config()
                                     .save_workspace_file(self.runtime.workspace_root());
                                 tui_feedback.set_model(self.runtime.model().to_string());
+                                let who = profile.map(|n| format!("@{n} → ")).unwrap_or_default();
                                 tui_feedback.push_system(format!(
-                                    "[F2] switched to {}",
+                                    "[F2] {who}switched to {}",
                                     self.runtime.model()
                                 ));
                             }
@@ -2359,6 +2377,7 @@ fn format_restart_ghost_wake(ghosts: &[nca_runtime::supervisor::RestartGhost]) -
 fn build_model_picker_entries(
     config: &nca_common::config::NcaConfig,
     provider_models: &[String],
+    active: ProviderKind,
 ) -> Vec<ModelPickerEntry> {
     let mut entries = Vec::new();
     entries.push(ModelPickerEntry {
@@ -2374,11 +2393,7 @@ fn build_model_picker_entries(
         } else {
             "no key"
         };
-        let selected = if p == config.provider.default {
-            " [active]"
-        } else {
-            ""
-        };
+        let selected = if p == active { " [active]" } else { "" };
         entries.push(ModelPickerEntry {
             label: format!("{}{}", p.display_name(), selected),
             detail: format!("{model} ({key_status})"),
@@ -2389,7 +2404,7 @@ fn build_model_picker_entries(
 
     if !provider_models.is_empty() {
         entries.push(ModelPickerEntry {
-            label: format!("{} models", config.provider.default.display_name()),
+            label: format!("{} models", active.display_name()),
             detail: String::new(),
             action: ModelPickerAction::ApplyModel(String::new()),
             is_header: true,
