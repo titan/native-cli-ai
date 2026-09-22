@@ -1,5 +1,5 @@
 use crate::ipc_pending::{ApprovalPendingMap, QuestionPendingMap};
-use nca_common::config::{NcaConfig, PermissionMode, ProviderKind};
+use nca_common::config::{NcaConfig, PermissionMode, PlanEntry, ProviderKind};
 use nca_common::event::{AgentEvent, EndReason, QuestionSelection};
 use nca_common::session::{OrchestrationContext, SessionSnapshot};
 use nca_core::agent_driver::InboxItem;
@@ -7,7 +7,8 @@ use nca_core::approval::{ApprovalHandler, ApprovalVerdict};
 use nca_core::provider::ProviderError;
 use nca_core::tools::spawn_subagent::SpawnRequest;
 use nca_runtime::ipc::IpcHandle;
-use nca_runtime::supervisor::{Supervisor, SupervisorConfig, SupervisorHandle};
+use nca_runtime::supervisor::{PlanApplyOutcome, Supervisor, SupervisorConfig, SupervisorHandle};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -278,6 +279,23 @@ impl SessionRuntime {
         provider: ProviderKind,
     ) -> Result<Option<String>, ProviderError> {
         self.supervisor.set_provider_for_active_agent(provider)
+    }
+
+    /// Apply a named model plan (`/plan <name>`): pins each covered agent's
+    /// provider/model into `[agents.<name>]` and hot-swaps the active
+    /// persona when covered. See [`Supervisor::apply_plan`].
+    pub fn apply_plan(&mut self, name: &str) -> Result<PlanApplyOutcome, ProviderError> {
+        self.supervisor.apply_plan(name)
+    }
+
+    /// Configured model plans (`[plans.<name>]`), plan name → agent entries.
+    pub fn plans(&self) -> &BTreeMap<String, BTreeMap<String, PlanEntry>> {
+        self.supervisor.plans()
+    }
+
+    /// Name of the currently applied model plan, if any.
+    pub fn active_plan(&self) -> Option<&str> {
+        self.supervisor.active_plan()
     }
 
     /// Provider kind the active persona routes to (profile override or the

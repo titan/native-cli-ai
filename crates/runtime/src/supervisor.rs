@@ -19,7 +19,7 @@ use crate::pty::PtyManager;
 use crate::session_store::SessionStore;
 use crate::subagent_registry::{SubagentRegistry, subagent_control_consumer};
 use chrono::Utc;
-use nca_common::config::{AgentProfileConfig, NcaConfig, ProviderKind};
+use nca_common::config::{AgentProfileConfig, NcaConfig, PlanEntry, ProviderKind};
 use nca_common::event::{AgentEvent, EndReason, EventEnvelope};
 use nca_common::message::{ContentPart, Message, MessageContent, Role};
 use nca_common::session::{
@@ -50,7 +50,7 @@ use nca_core::tools::subagent_control::{
 use nca_core::tools::{TodoStore, UpdateTodosTool};
 use nca_core::workspace_fs::{RealFs, WorkspaceFs};
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -563,12 +563,42 @@ impl Drop for TurnInFlightGuard {
     }
 }
 
-/// Fence refusal shared by [`Supervisor::apply_agent_profile`] and
-/// [`Supervisor::apply_nca_config`]: provider/config rebuilds are deferred
-/// while a turn is running. Classification is `Configuration` — the session
-/// is in a transient state the caller (UI, IPC) can retry once idle.
+/// Fence refusal shared by [`Supervisor::apply_agent_profile`],
+/// [`Supervisor::apply_nca_config`], and [`Supervisor::apply_plan`]:
+/// provider/config rebuilds are deferred while a turn is running.
+/// Classification is `Configuration` — the session is in a transient state
+/// the caller (UI, IPC) can retry once idle.
 fn turn_in_flight_err() -> ProviderError {
     ProviderError::Configuration("agent switch deferred: turn in flight".into())
+}
+
+/// One agent's routing after a plan was applied: the resulting provider and
+/// model pins written into `[agents.<name>]` (`None` = inherit the config
+/// default / provider default model at spawn time).
+#[derive(Debug, Clone)]
+pub struct PlanRouteChange {
+    /// Agent (profile) name the entry was applied to.
+    pub agent: String,
+    /// Resulting provider pin, `None` when the agent inherits the default.
+    pub provider: Option<ProviderKind>,
+    /// Resulting model pin, `None` when the agent inherits the provider's
+    /// default model.
+    pub model: Option<String>,
+}
+
+/// Summary of a successful [`Supervisor::apply_plan`], consumed by the CLI
+/// (`/plan <name>`) to print per-agent changes and refresh the TUI model
+/// display when the active persona was hot-swapped.
+#[derive(Debug, Clone)]
+pub struct PlanApplyOutcome {
+    /// Name of the applied plan.
+    pub plan: String,
+    /// One entry per agent covered by the plan, in plan (sorted) order.
+    pub changes: Vec<PlanRouteChange>,
+    /// `(agent, resolved model)` when the ACTIVE persona was covered by the
+    /// plan and hot-swapped; the resolved model is what the session routes
+    /// to right now (for TUI `set_model`).
+    pub active_agent_swapped: Option<(String, String)>,
 }
 
 impl Supervisor {
@@ -2097,6 +2127,97 @@ impl Supervisor {
         let mut config = self.config.clone();
         config.set_default_provider(provider);
         self.apply_nca_config(config)
+    }
+
+    /// Apply a named model plan (`/plan <name>`): pin each covered agent's
+    /// provider/model into its `[agents.<name>]` entry (both config layers,
+    /// so the routing survives switches, resumes, and subagent spawns), set
+    /// `active_plan`, and hot-swap the ACTIVE persona when the plan covers
+    /// it. Agents not listed in the plan keep their current routing — plans
+    /// are partial overrides, not full resets. Model aliases resolve at
+    /// apply time; a provider-only entry clears the agent's model pin so it
+    /// inherits the new provider's default (mirroring
+    /// [`Self::set_provider_for_active_agent`]).
+    ///
+    /// Unknown plans fail with an error listing the available plan names.
+    /// Turn fence: refused while a turn is in flight (same contract as
+    /// [`Self::apply_agent_profile`]) so the multi-agent mutation is
+    /// all-or-nothing, never half-applied.
+    pub fn apply_plan(&mut self, name: &str) -> Result<PlanApplyOutcome, ProviderError> {
+        if self.is_turn_in_flight() {
+            return Err(turn_in_flight_err());
+        }
+        let Some(entries) = self.config.plans.get(name).cloned() else {
+            let available = if self.config.plans.is_empty() {
+                "none configured".to_string()
+            } else {
+                self.config
+                    .plans
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            return Err(ProviderError::Configuration(format!(
+                "unknown plan '{name}' — available: {available}; define [plans.{name}] in config.toml"
+            )));
+        };
+
+        let mut changes = Vec::with_capacity(entries.len());
+        for (agent, entry) in &entries {
+            let profile = self.config.agents.entry(agent.clone()).or_default();
+            if let Some(provider) = entry.provider {
+                profile.provider = Some(provider);
+            }
+            match &entry.model {
+                Some(model) => {
+                    profile.model = Some(self.config.model.resolve_alias(model));
+                }
+                // Provider-only entry: the old model name belongs to the old
+                // provider's namespace — clear the pin (see
+                // `set_provider_for_active_agent`).
+                None if entry.provider.is_some() => profile.model = None,
+                None => {}
+            }
+            changes.push(PlanRouteChange {
+                agent: agent.clone(),
+                provider: profile.provider,
+                model: profile.model.clone(),
+            });
+        }
+
+        self.config.active_plan = Some(name.to_string());
+        self.base_config.agents = self.config.agents.clone();
+        self.base_config.plans = self.config.plans.clone();
+        self.base_config.active_plan = self.config.active_plan.clone();
+
+        // Hot-swap the active persona when the plan covers it; otherwise just
+        // refresh the spawn-time config so children route against the new pins.
+        let active_agent_swapped = if let Some(active) = self.active_agent_name.clone()
+            && entries.contains_key(&active)
+        {
+            self.apply_agent_profile(Some(&active))?;
+            Some((active, self.model.clone()))
+        } else {
+            self.refresh_live_config();
+            None
+        };
+
+        Ok(PlanApplyOutcome {
+            plan: name.to_string(),
+            changes,
+            active_agent_swapped,
+        })
+    }
+
+    /// Configured model plans (`[plans.<name>]`), plan name → agent entries.
+    pub fn plans(&self) -> &BTreeMap<String, BTreeMap<String, PlanEntry>> {
+        &self.config.plans
+    }
+
+    /// Name of the currently applied model plan, if any.
+    pub fn active_plan(&self) -> Option<&str> {
+        self.config.active_plan.as_deref()
     }
 
     /// Provider kind the ACTIVE persona routes to (profile override or the

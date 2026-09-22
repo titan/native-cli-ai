@@ -11,12 +11,13 @@ use crate::tui::{
     ModelPickerAction, ModelPickerEntry, TuiCmd, git_create_branch, git_current_branch,
     git_list_branches, git_switch_branch, replay_events_to_feedback, spawn_tui_bridge,
 };
-use nca_common::config::{PermissionMode, ProviderKind};
+use nca_common::config::{NcaConfig, PermissionMode, PlanEntry, ProviderKind};
 use nca_common::event::{EndReason, QuestionSelection};
 use nca_core::skills::SkillCatalog;
 use nca_core::tools::WaitForUserTool;
 use nca_core::tools::wait_for_user::PauseHook;
 use nca_runtime::memory_store::MemoryStore;
+use nca_runtime::supervisor::PlanRouteChange;
 use nca_runtime::wake_scheduler::{WakeScheduler, WakeTrigger};
 use reedline::{
     Emacs, FileBackedHistory, Hinter, KeyCode, KeyModifiers, Reedline, ReedlineEvent, Signal, Vi,
@@ -510,7 +511,8 @@ impl Repl {
                     "  /help              Show this help".into(),
                     "  /status            Session status".into(),
                     "  /agent [name]     Show or switch agent (OMO specialists)".into(),
-                    "  /plan <task>       Planning-oriented turn".into(),
+                    "  /plan [name]      Model plan for this project".into(),
+                    "  /plan-task <task>  Planning-oriented turn".into(),
                     "  /review <task>     Code review turn".into(),
                     "  /fix <task>        Bug-fix turn".into(),
                     "  /test <task>       Validation turn".into(),
@@ -648,6 +650,65 @@ impl Repl {
                 }
             }
             "/plan" => {
+                let name = rest.trim();
+                if name.is_empty() {
+                    let plans = self.runtime.plans();
+                    if plans.is_empty() {
+                        out.println("no plans configured — define [plans.<name>] in config.toml");
+                    } else {
+                        let active = self.runtime.active_plan();
+                        match active {
+                            Some(a) => out.println(&format!("active: {a}")),
+                            None => out.println("active: (none)"),
+                        }
+                        for (plan, entries) in plans {
+                            let marker = if Some(plan.as_str()) == active { " *" } else { "" };
+                            let summary = entries
+                                .iter()
+                                .map(|(agent, entry)| {
+                                    format!("{agent}→{}", plan_entry_summary(entry))
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            out.println(&format!("  {plan}{marker}  {summary}"));
+                        }
+                    }
+                } else {
+                    match self.runtime.apply_plan(name) {
+                        Ok(outcome) => {
+                            match self
+                                .runtime
+                                .config()
+                                .save_workspace_file(self.runtime.workspace_root())
+                            {
+                                Ok(()) => out.println(&format!(
+                                    "[plan] {} applied ({} agents) — saved .nca/config.local.toml",
+                                    outcome.plan,
+                                    outcome.changes.len()
+                                )),
+                                Err(e) => out.eprintln(&format!(
+                                    "[plan] {} applied; workspace save failed: {e}",
+                                    outcome.plan
+                                )),
+                            }
+                            for change in &outcome.changes {
+                                out.println(&format!(
+                                    "  {} → {}",
+                                    change.agent,
+                                    plan_change_summary(self.runtime.config(), change)
+                                ));
+                            }
+                            if let (ReplOutput::Tui(st), Some((_, model))) =
+                                (&out, outcome.active_agent_swapped.as_ref())
+                            {
+                                st.set_model(model.clone());
+                            }
+                        }
+                        Err(e) => out.eprintln(&format!("[plan] {e}")),
+                    }
+                }
+            }
+            "/plan-task" => {
                 self.run_preset(
                     "Create a short implementation plan before coding. Focus on steps, risks, and validation.\n\nTask:\n",
                     rest,
@@ -1201,6 +1262,7 @@ impl Repl {
                     "  /provider [name]   Default LLM provider".into(),
                     "  /apikey <p> <key>  Store API key for a provider".into(),
                     "  /model [name]      Model for the active provider".into(),
+                    "  /plan [name]       Model plan for this project".into(),
                     "  /editor [seed]     Open external editor".into(),
                     "  /set-editor <cmd>  Persist editor command".into(),
                 ];
@@ -2372,6 +2434,31 @@ fn format_restart_ghost_wake(ghosts: &[nca_runtime::supervisor::RestartGhost]) -
         ghosts.len(),
         items.join(", ")
     )
+}
+
+/// Render a plan-listing entry as `provider/model`, omitting unset parts
+/// sensibly: a provider-only entry inherits that provider's default model
+/// (shown as just the provider), a model-only entry keeps the agent's
+/// existing provider pin (shown as just the model).
+fn plan_entry_summary(entry: &PlanEntry) -> String {
+    match (entry.provider, entry.model.as_deref()) {
+        (Some(p), Some(m)) => format!("{}/{}", p.display_name().to_lowercase(), m),
+        (Some(p), None) => p.display_name().to_lowercase(),
+        (None, Some(m)) => m.to_string(),
+        (None, None) => "(inherit)".to_string(),
+    }
+}
+
+/// Render an applied plan change as `provider/model`, resolving `None`
+/// pins the way spawn-time routing does: provider falls back to the config
+/// default, model to that provider's configured default model.
+fn plan_change_summary(config: &NcaConfig, change: &PlanRouteChange) -> String {
+    let provider = change.provider.unwrap_or(config.provider.default);
+    let model = change
+        .model
+        .clone()
+        .unwrap_or_else(|| config.provider.model_for(provider).to_string());
+    format!("{}/{}", provider.display_name().to_lowercase(), model)
 }
 
 fn build_model_picker_entries(

@@ -40,6 +40,17 @@ pub struct NcaConfig {
     /// `[plugins]` — out-of-process plugin RPC tuning.
     #[serde(default)]
     pub plugins: PluginConfig,
+    /// Named model plans (`[plans.<plan-name>.<agent-name>]`): each plan is a
+    /// routing table applied atomically to the agent profiles via `/plan
+    /// <name>` (provider-quota failover — swap every agent off a cooling
+    /// account in one command).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub plans: BTreeMap<String, BTreeMap<String, PlanEntry>>,
+    /// Name of the currently applied model plan. Informational marker (set by
+    /// `/plan <name>` and persisted with the workspace config) so plan
+    /// listings can mark the active plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_plan: Option<String>,
 }
 
 impl NcaConfig {
@@ -220,6 +231,12 @@ impl NcaConfig {
         }
         if let Some(plugins) = partial.plugins {
             self.plugins.merge(plugins);
+        }
+        if let Some(plans) = partial.plans {
+            self.merge_plans(plans);
+        }
+        if let Some(active_plan) = partial.active_plan {
+            self.active_plan = Some(active_plan);
         }
 
         if let Some(extra_paths) = partial.extra_paths {
@@ -477,6 +494,19 @@ impl NcaConfig {
         }
     }
 
+    /// Merge partial plan tables into the existing `plans` map. Entries
+    /// replace per `(plan, agent)` key, so a later layer (workspace over
+    /// global) can override individual routes of a plan without redefining
+    /// the whole table.
+    fn merge_plans(&mut self, partials: BTreeMap<String, BTreeMap<String, PlanEntry>>) {
+        for (plan, entries) in partials {
+            let existing = self.plans.entry(plan).or_default();
+            for (agent, entry) in entries {
+                existing.insert(agent, entry);
+            }
+        }
+    }
+
     /// Look up a named agent profile by name.
     pub fn agent_profile(&self, name: &str) -> Option<&AgentProfileConfig> {
         self.agents.get(name)
@@ -613,6 +643,21 @@ struct PartialAgentProfileConfig {
     skills: Option<Vec<String>>,
     skills_add: Option<Vec<String>>,
     skills_remove: Option<Vec<String>>,
+}
+
+/// One agent's route inside a model plan (`[plans.<plan>.<agent>]`):
+/// an optional provider and/or model override. `None` fields mean "leave
+/// that dimension untouched" — a provider-only entry clears the agent's
+/// model pin (it inherits the new provider's default model), a model-only
+/// entry keeps the agent's provider pin.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanEntry {
+    /// Provider override for this agent inside the plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderKind>,
+    /// Model override (aliases like `dsv4` resolve at apply time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2603,6 +2648,8 @@ struct PartialNcaConfig {
     middleware: Option<PartialMiddlewareConfig>,
     fallback: Option<PartialFallbackConfig>,
     agents: Option<BTreeMap<String, PartialAgentProfileConfig>>,
+    plans: Option<BTreeMap<String, BTreeMap<String, PlanEntry>>>,
+    active_plan: Option<String>,
     extra_paths: Option<Vec<PathBuf>>,
     subagent: Option<PartialSubagentConfig>,
     plugins: Option<PartialPluginConfig>,
