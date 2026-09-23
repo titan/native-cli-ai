@@ -405,3 +405,85 @@ async fn plans_and_active_plan_getters_reflect_state() {
         Some(ProviderKind::Kimi)
     );
 }
+
+/// The reserved "orchestrator" plan key retargets the BASE routing
+/// (`[provider.default]` + provider model) — the main conversation model —
+/// without creating a bogus `[agents.orchestrator]` profile, and hot-swaps
+/// the default persona when it is active.
+#[tokio::test(flavor = "multi_thread")]
+async fn orchestrator_entry_routes_base_not_profile() {
+    let (_env, ws) = env_and_ws();
+    let mut config = base_config();
+    config.plans.insert(
+        "power-b".into(),
+        BTreeMap::from([
+            (
+                "orchestrator".into(),
+                entry(Some(ProviderKind::Kimi), Some("k3")),
+            ),
+            ("fixer".into(), entry(None, Some("glm-5.2"))),
+        ]),
+    );
+    let mut sup = sup(ws.path(), config).await;
+
+    let outcome = sup.apply_plan("power-b").expect("apply");
+
+    let outcome = sup.apply_plan("power-b").expect("apply");
+
+    // Base routing retargeted; no [agents.orchestrator] profile created.
+    assert!(!sup.config().agents.contains_key("orchestrator"));
+    assert_eq!(sup.config().provider.default, ProviderKind::Kimi);
+    assert_eq!(sup.model, "k3", "default persona hot-swapped");
+
+    // Deterministic order (BTreeMap): fixer < orchestrator.
+    assert_eq!(outcome.changes.len(), 2);
+    assert_eq!(outcome.changes[1].agent, "orchestrator");
+    assert_eq!(outcome.changes[1].provider, Some(ProviderKind::Kimi));
+    assert_eq!(outcome.changes[1].model.as_deref(), Some("k3"));
+    assert_eq!(
+        outcome.active_agent_swapped,
+        Some(("orchestrator".to_string(), "k3".to_string()))
+    );
+
+    // base_config carries the retarget: a persona switch (which rebuilds
+    // self.config from base_config) must not revert the base routing.
+    sup.apply_agent_profile(Some("fixer"))
+        .expect("switch to fixer");
+    sup.apply_agent_profile(None)
+        .expect("switch back to default");
+    assert_eq!(
+        sup.config().provider.default,
+        ProviderKind::Kimi,
+        "base routing must survive persona switches"
+    );
+}
+
+/// With a SPECIALIST active, an orchestrator-only plan still updates the base
+/// routing durably (mirrored into base_config) but performs no hot-swap.
+#[tokio::test(flavor = "multi_thread")]
+async fn orchestrator_entry_with_specialist_active_updates_base_only() {
+    let (_env, ws) = env_and_ws();
+    let mut config = base_config();
+    config.plans.insert(
+        "power-b".into(),
+        BTreeMap::from([("orchestrator".into(), entry(Some(ProviderKind::Kimi), None))]),
+    );
+    let mut sup = sup(ws.path(), config).await;
+
+    sup.apply_agent_profile(Some("fixer"))
+        .expect("activate fixer");
+    assert_eq!(sup.model, "glm-5.3");
+
+    let outcome = sup.apply_plan("power-b").expect("apply");
+    assert_eq!(
+        outcome.active_agent_swapped, None,
+        "fixer is active, not the base persona"
+    );
+    assert_eq!(sup.model, "glm-5.3", "active specialist stays put");
+
+    // Durable: switching personas rebuilds from base_config, which must carry
+    // the retargeted provider (kimi, provider-only entry → its section model).
+    sup.apply_agent_profile(None).expect("switch to default");
+    assert_eq!(sup.config().provider.default, ProviderKind::Kimi);
+    assert!(!sup.config().agents.contains_key("orchestrator"));
+}

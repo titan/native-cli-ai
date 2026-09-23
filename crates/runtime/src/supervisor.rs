@@ -2165,6 +2165,32 @@ impl Supervisor {
 
         let mut changes = Vec::with_capacity(entries.len());
         for (agent, entry) in &entries {
+            // The default persona is not a profile: the reserved "orchestrator"
+            // key retargets the BASE routing (`[provider.default]` + the
+            // provider's model) so `/plan` also switches the main
+            // conversation, without creating a bogus `[agents.orchestrator]`
+            // profile entry.
+            if agent == "orchestrator" {
+                if let Some(provider) = entry.provider {
+                    self.config.set_default_provider(provider);
+                }
+                if let Some(model) = &entry.model {
+                    let resolved = self.config.model.resolve_alias(model);
+                    self.config.apply_model_override(&resolved);
+                }
+                // Mirror into base_config even when the default persona is
+                // not active: profile rebuilds start from base_config, so an
+                // un-mirrored base routing would silently revert on the next
+                // persona switch.
+                self.base_config.provider = self.config.provider.clone();
+                self.base_config.model = self.config.model.clone();
+                changes.push(PlanRouteChange {
+                    agent: agent.clone(),
+                    provider: Some(self.config.provider.default),
+                    model: Some(self.config.provider.active_model().to_string()),
+                });
+                continue;
+            }
             let profile = self.config.agents.entry(agent.clone()).or_default();
             if let Some(provider) = entry.provider {
                 profile.provider = Some(provider);
@@ -2198,6 +2224,13 @@ impl Supervisor {
         {
             self.apply_agent_profile(Some(&active))?;
             Some((active, self.model.clone()))
+        } else if self.active_agent_name.is_none() && entries.contains_key("orchestrator") {
+            // Default persona active and the plan retargets it: rebuild the
+            // base provider now (mirror `set_model_for_base`; `apply_nca_config`
+            // syncs `base_config` so the change survives persona switches).
+            let config = self.config.clone();
+            self.apply_nca_config(config)?;
+            Some(("orchestrator".to_string(), self.model.clone()))
         } else {
             self.refresh_live_config();
             None
