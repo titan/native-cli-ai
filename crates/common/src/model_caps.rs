@@ -41,19 +41,25 @@ pub fn model_accepts_native_images(kind: ProviderKind, model: &str) -> bool {
             let text_only = m.contains("glm-5.3") && !m.contains("glm-5.3-flash");
             (m.contains("glm-5") && !text_only) || m.contains("glm-4v") || m.contains("glm-4")
         }
-        // DeepSeek V4 and later accept native image inputs (OpenAI-style
-        // `image_url` blocks on /chat/completions); v3.x and r1 generations
-        // are text-only. The rolling aliases `deepseek-chat`,
-        // `deepseek-reasoner`, and `deepseek-flash` (the V4.1 Flash API id)
-        // track the current generation, so they count as multimodal; unknown
-        // explicit names stay conservative (the run_turn_with_images gate
-        // names the model when it rejects).
+        // Official API (2026-09): exactly two models — `deepseek-flash`
+        // (DeepSeek-V4.1-Flash, vision ✓ per the Vision guide) and
+        // `deepseek-v4-pro` (vision explicitly "Not supported" in the
+        // pricing table). Legacy `deepseek-v4-flash` and
+        // `deepseek-v4-flash-vision-exp` are retired but still accepted,
+        // both served by (multimodal) V4.1-Flash. The old V3-era aliases
+        // `deepseek-chat`/`deepseek-reasoner` are no longer documented;
+        // if they still resolve server-side they land on the current
+        // generation, so they count as multimodal (unknown explicit names
+        // stay conservative — the run_turn_with_images gate names the
+        // model when it rejects).
         ProviderKind::DeepSeek => {
-            m.contains("chat")
-                || m.contains("reasoner")
-                || m.contains("vl")
-                || m.contains("flash")
-                || deepseek_generation(&m).is_some_and(|v| v >= 4)
+            let v4_pro_text_only = m.contains("v4-pro") || m.contains("v4.1-pro");
+            !v4_pro_text_only
+                && (m.contains("chat")
+                    || m.contains("reasoner")
+                    || m.contains("vl")
+                    || m.contains("flash")
+                    || deepseek_generation(&m).is_some_and(|v| v >= 4))
         }
         // Kimi for Coding serves k3 on the Anthropic-compatible endpoint, which
         // accepts native image blocks (anthropic_compat serializes them directly;
@@ -176,6 +182,32 @@ mod tests {
         assert!(model_accepts_native_images(
             ProviderKind::DeepSeek,
             "deepseek-reasoner"
+        ));
+    }
+
+    #[test]
+    fn deepseek_v4_pro_is_text_only() {
+        // Official pricing table: vision "Not supported" for deepseek-v4-pro.
+        assert!(!model_accepts_native_images(
+            ProviderKind::DeepSeek,
+            "deepseek-v4-pro"
+        ));
+        assert!(!model_accepts_native_images(
+            ProviderKind::DeepSeek,
+            "deepseek-v4.1-pro"
+        ));
+    }
+
+    #[test]
+    fn deepseek_retired_legacy_ids_still_multimodal() {
+        // Retired but accepted; served by multimodal V4.1-Flash.
+        assert!(model_accepts_native_images(
+            ProviderKind::DeepSeek,
+            "deepseek-v4-flash"
+        ));
+        assert!(model_accepts_native_images(
+            ProviderKind::DeepSeek,
+            "deepseek-v4-flash-vision-exp"
         ));
     }
 
