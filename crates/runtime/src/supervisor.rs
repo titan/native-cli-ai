@@ -2137,7 +2137,11 @@ impl Supervisor {
     /// are partial overrides, not full resets. Model aliases resolve at
     /// apply time; a provider-only entry clears the agent's model pin so it
     /// inherits the new provider's default (mirroring
-    /// [`Self::set_provider_for_active_agent`]).
+    /// [`Self::set_provider_for_active_agent`]). The reserved
+    /// `orchestrator` key retargets base routing only and evicts any stale
+    /// `[agents.orchestrator]` profile left by an older apply — such a
+    /// shadow would keep serving the old model to the main conversation.
+    ///
     ///
     /// Unknown plans fail with an error listing the available plan names.
     /// Turn fence: refused while a turn is in flight (same contract as
@@ -2169,7 +2173,8 @@ impl Supervisor {
             // key retargets the BASE routing (`[provider.default]` + the
             // provider's model) so `/plan` also switches the main
             // conversation, without creating a bogus `[agents.orchestrator]`
-            // profile entry.
+            // profile entry — and evicting any stale one a previous apply
+            // left behind.
             if agent == "orchestrator" {
                 if let Some(provider) = entry.provider {
                     self.config.set_default_provider(provider);
@@ -2177,6 +2182,20 @@ impl Supervisor {
                 if let Some(model) = &entry.model {
                     let resolved = self.config.model.resolve_alias(model);
                     self.config.apply_model_override(&resolved);
+                }
+                // Reserved-name hygiene: an older `/plan` wrote the
+                // orchestrator pin as a real `[agents.orchestrator]` profile.
+                // Such a stale entry shadows this base retarget forever —
+                // both the hot-swap below (`entries.contains_key(active)` →
+                // `apply_agent_profile`) and resume re-resolve the profile
+                // pin instead of the retargeted base, so the main
+                // conversation keeps serving the old model. Evict it.
+                if let Some(stale) = self.config.agents.remove("orchestrator") {
+                    tracing::warn!(
+                        stale_model = ?stale.model,
+                        "evicted stale [agents.orchestrator] profile (reserved name); \
+                         base routing now owns the main conversation"
+                    );
                 }
                 // Mirror into base_config even when the default persona is
                 // not active: profile rebuilds start from base_config, so an

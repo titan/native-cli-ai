@@ -428,8 +428,6 @@ async fn orchestrator_entry_routes_base_not_profile() {
 
     let outcome = sup.apply_plan("power-b").expect("apply");
 
-    let outcome = sup.apply_plan("power-b").expect("apply");
-
     // Base routing retargeted; no [agents.orchestrator] profile created.
     assert!(!sup.config().agents.contains_key("orchestrator"));
     assert_eq!(sup.config().provider.default, ProviderKind::Kimi);
@@ -455,6 +453,59 @@ async fn orchestrator_entry_routes_base_not_profile() {
         sup.config().provider.default,
         ProviderKind::Kimi,
         "base routing must survive persona switches"
+    );
+}
+
+/// Regression: a stale `[agents.orchestrator]` profile — written by an
+/// older `/plan` that pinned the reserved name like any other agent —
+/// shadowed the base retarget forever: the active named persona kept
+/// serving the old model even though the plan switched the provider's
+/// model. Applying an orchestrator-covering plan must evict the bogus
+/// profile so the persona falls back to the retargeted base routing.
+#[tokio::test(flavor = "multi_thread")]
+async fn orchestrator_entry_evicts_stale_profile_pin() {
+    let (_env, ws) = env_and_ws();
+    let mut config = base_config();
+    // Stale strong-plan pin, as found in a real .nca/config.local.toml.
+    config.agents.insert(
+        "orchestrator".into(),
+        AgentProfileConfig {
+            provider: Some(ProviderKind::ZhipuAI),
+            model: Some("glm-5.3".into()),
+            ..Default::default()
+        },
+    );
+    config.plans.insert(
+        "eco".into(),
+        BTreeMap::from([(
+            "orchestrator".into(),
+            entry(Some(ProviderKind::ZhipuAI), Some("glm-5.3-flash")),
+        )]),
+    );
+    let mut sup = sup(ws.path(), config).await;
+
+    // The bug's live state: the named "orchestrator" persona is active
+    // (Tab-cycled onto the stale profile), serving the old model.
+    sup.apply_agent_profile(Some("orchestrator"))
+        .expect("activate stale persona");
+    assert_eq!(sup.model, "glm-5.3");
+
+    let outcome = sup.apply_plan("eco").expect("apply");
+
+    // The bogus profile is gone from the config and live routing table.
+    assert!(!sup.config().agents.contains_key("orchestrator"));
+    {
+        let live = sup.live_config();
+        let live = live.read().unwrap();
+        assert!(!live.agents.contains_key("orchestrator"));
+    }
+    // Base routing retargeted...
+    assert_eq!(sup.config().provider.zhipuai.model, "glm-5.3-flash");
+    // ...and the active persona now serves the plan's model, not the pin.
+    assert_eq!(sup.model, "glm-5.3-flash");
+    assert_eq!(
+        outcome.active_agent_swapped,
+        Some(("orchestrator".to_string(), "glm-5.3-flash".to_string()))
     );
 }
 
