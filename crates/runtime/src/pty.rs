@@ -103,6 +103,16 @@ impl PtyManager {
         *self.host_env.lock().expect("host_env lock poisoned") = sandbox::host_session_env(&cfg);
     }
 
+    /// Whether subsequent `exec_streaming` commands run Landlock-confined.
+    /// `false` = the policy is unset (`None`) or resolved to unconfined
+    /// (mode off / auto-degraded / required-but-unavailable).
+    pub fn sandbox_confined(&self) -> bool {
+        self.sandbox
+            .lock()
+            .expect("sandbox lock poisoned")
+            .is_some()
+    }
+
     pub fn workspace_root(&self) -> std::path::PathBuf {
         self.workspace_root
             .lock()

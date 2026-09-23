@@ -2007,6 +2007,24 @@ pub enum SandboxMode {
     Off,
 }
 
+/// Parse a sandbox mode from CLI / slash-command text (`auto` | `required` |
+/// `off`), case-insensitive with surrounding whitespace tolerated. Anything
+/// else is rejected with the list of accepted values.
+impl std::str::FromStr for SandboxMode {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(SandboxMode::Auto),
+            "required" => Ok(SandboxMode::Required),
+            "off" => Ok(SandboxMode::Off),
+            _ => Err(format!(
+                "unknown sandbox mode: {raw}; expected one of: auto, required, off"
+            )),
+        }
+    }
+}
+
 /// Sandboxing configuration under `[permissions.sandbox]`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxConfig {
