@@ -3550,6 +3550,10 @@ mod tests {
     // === per-agent skill gate wiring (create init + apply_agent_profile) ===
 
     async fn gated_supervisor(root: &Path) -> Supervisor {
+        // Same serialization as `sandbox_supervisor`: both tests below create
+        // a supervisor with the SAME fixed session id, and two concurrent
+        // creates race on the IPC socket bind (Address already in use).
+        let _create = SUPERVISOR_CREATE_LOCK.lock().await;
         for command in ["alpha", "beta"] {
             let skill_dir = root.join(format!(".nca/skills/{command}"));
             std::fs::create_dir_all(&skill_dir).expect("mkdir");
