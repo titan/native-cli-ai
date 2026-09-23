@@ -19,7 +19,9 @@ use crate::pty::PtyManager;
 use crate::session_store::SessionStore;
 use crate::subagent_registry::{SubagentRegistry, subagent_control_consumer};
 use chrono::Utc;
-use nca_common::config::{AgentProfileConfig, NcaConfig, PlanEntry, ProviderKind};
+use nca_common::config::{
+    AgentProfileConfig, NcaConfig, PlanEntry, ProviderKind, SandboxConfig, SandboxMode,
+};
 use nca_common::event::{AgentEvent, EndReason, EventEnvelope};
 use nca_common::message::{ContentPart, Message, MessageContent, Role};
 use nca_common::session::{
@@ -96,6 +98,13 @@ pub struct Supervisor {
     /// Config snapshot without agent-profile overrides applied. Used as the
     /// base when switching agents at runtime via [`apply_agent_profile`].
     base_config: NcaConfig,
+    /// Session-level sandbox mode override (`/sandbox`). Folded into
+    /// [`Self::effective_sandbox_config`] and the live spawn-time config
+    /// snapshot, but deliberately NEVER written into
+    /// `config.permissions.sandbox.mode` — a whole-config save would
+    /// otherwise persist the session toggle into `.nca/config.local.toml`.
+    /// `None` = follow the configured mode.
+    sandbox_override: Option<SandboxMode>,
     /// Active agent profile (if any). Stored so `reset_for_new_session` can
     /// rebuild the system prompt with the same specialist persona.
     agent_profile: Option<AgentProfileConfig>,
@@ -601,6 +610,25 @@ pub struct PlanApplyOutcome {
     pub active_agent_swapped: Option<(String, String)>,
 }
 
+/// Snapshot of the live Landlock sandbox state for `/sandbox status` and
+/// `/config`: whether the kernel backend is usable, which mode the config
+/// requests, whether a session-level `/sandbox` override is active, and
+/// whether PTY shell commands are currently confined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SandboxStatus {
+    /// `true` when the running kernel supports the Landlock backend.
+    pub backend_supported: bool,
+    /// Mode configured via `[permissions.sandbox] mode`.
+    pub configured_mode: SandboxMode,
+    /// Session-level `/sandbox` override, if any (`None` = follow the
+    /// configured mode).
+    pub override_mode: Option<SandboxMode>,
+    /// `true` when subsequent shell commands run Landlock-confined.
+    pub confined: bool,
+    /// Number of currently mounted extra paths (`/mount`).
+    pub mounted_paths: usize,
+}
+
 impl Supervisor {
     /// Create a new supervised session. This sets up the agent loop, IPC server,
     /// event channels, and persists initial session metadata.
@@ -978,6 +1006,7 @@ impl Supervisor {
             orchestration: cfg.orchestration_context,
             config,
             base_config,
+            sandbox_override: None,
             agent_profile,
             active_agent_name: requested_agent_name,
             hooks: hook_runner,
@@ -1328,11 +1357,16 @@ impl Supervisor {
     /// panicking consumer clone never poisons this lock in practice, and
     /// stale-but-readable beats unwritable.
     fn refresh_live_config(&self) {
+        // Snapshot = current config, with the session-level sandbox override
+        // folded in: subagent spawns read this config and must inherit the
+        // session's live sandbox state, not the stale configured mode.
+        let mut snapshot = self.config.clone();
+        snapshot.permissions.sandbox.mode = self.effective_sandbox_config().mode;
         let mut guard = self
             .live_config
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *guard = self.config.clone();
+        *guard = snapshot;
     }
 
     pub async fn run_turn(&mut self, prompt: &str) -> Result<String, ProviderError> {
@@ -2407,6 +2441,45 @@ impl Supervisor {
 
     // ── Mount management ─────────────────────────────────────────────
 
+    /// Sandbox config with the session-level override (if any) folded in.
+    /// `config.permissions.sandbox` is never mutated — the override only
+    /// exists on the supervisor.
+    fn effective_sandbox_config(&self) -> SandboxConfig {
+        let mut cfg = self.config.permissions.sandbox.clone();
+        if let Some(mode) = self.sandbox_override {
+            cfg.mode = mode;
+        }
+        cfg
+    }
+
+    /// Set the session-level sandbox mode override (`/sandbox`).
+    ///
+    /// `Some(mode)` forces the given Landlock enforcement mode for the rest
+    /// of this session; `None` clears the override and restores the
+    /// `[permissions.sandbox] mode` semantics. Session-only by design: this
+    /// never writes `self.config.permissions.sandbox.mode` (whole-config
+    /// saves keep the file authoritative) and `apply_nca_config` does not
+    /// clear it either. Takes effect immediately — refreshes the PTY
+    /// confinement policy and the live spawn-time config snapshot (child
+    /// sessions inherit the override).
+    pub fn set_sandbox_override(&mut self, mode: Option<SandboxMode>) {
+        self.sandbox_override = mode;
+        self.refresh_sandbox_policy();
+        self.refresh_live_config();
+    }
+
+    /// Live sandbox state for `/sandbox status` and `/config` (see
+    /// [`SandboxStatus`]).
+    pub fn sandbox_status(&self) -> SandboxStatus {
+        SandboxStatus {
+            backend_supported: crate::sandbox::backend_supported(),
+            configured_mode: self.config.permissions.sandbox.mode,
+            override_mode: self.sandbox_override,
+            confined: self.pty.sandbox_confined(),
+            mounted_paths: self.fs.mounted_paths().len(),
+        }
+    }
+
     /// Rebuild the PTY sandbox policy from the current config and live
     /// mounts. Called at `create` (after restoring persisted mounts) and after
     /// every `/mount` + `/unmount`, so shell-command visibility tracks
@@ -2414,7 +2487,7 @@ impl Supervisor {
     /// `[permissions.sandbox] inherit_mounts` (default on).
     fn refresh_sandbox_policy(&self) {
         self.pty.set_sandbox_config(
-            self.config.permissions.sandbox.clone(),
+            self.effective_sandbox_config(),
             &self.fs.mounted_paths(),
             &SkillCatalog::discovery_roots(
                 &self.workspace_root,

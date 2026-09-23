@@ -11,7 +11,7 @@ use crate::tui::{
     ModelPickerAction, ModelPickerEntry, TuiCmd, git_create_branch, git_current_branch,
     git_list_branches, git_switch_branch, replay_events_to_feedback, spawn_tui_bridge,
 };
-use nca_common::config::{NcaConfig, PermissionMode, PlanEntry, ProviderKind};
+use nca_common::config::{NcaConfig, PermissionMode, PlanEntry, ProviderKind, SandboxMode};
 use nca_common::event::{EndReason, QuestionSelection};
 use nca_core::skills::SkillCatalog;
 use nca_core::tools::WaitForUserTool;
@@ -83,6 +83,42 @@ const INPUT_PREFIXES: &[&str] = &[
     "@",  // File reference - fuzzy file search
     "\\", // Multiline continuation
 ];
+
+/// What the user asked `/sandbox` to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SandboxAction {
+    /// Show the effective sandbox state.
+    Status,
+    /// Clear the session override and restore the configured
+    /// `[permissions.sandbox]` mode.
+    On,
+    /// Disable Landlock confinement for the rest of this session.
+    Off,
+    /// Flip between Off and the configured mode.
+    Toggle,
+    /// Force a specific enforcement mode for this session.
+    Mode(SandboxMode),
+}
+
+/// Parse the `/sandbox` argument (case-insensitive, surrounding whitespace
+/// tolerated). Empty input defaults to [`SandboxAction::Status`]; anything
+/// unlisted is an `Err` carrying the usage line.
+pub(crate) fn parse_sandbox_arg(arg: &str) -> Result<SandboxAction, String> {
+    match arg.trim().to_ascii_lowercase().as_str() {
+        "" | "status" => Ok(SandboxAction::Status),
+        "on" | "enable" => Ok(SandboxAction::On),
+        "off" | "disable" => Ok(SandboxAction::Off),
+        "toggle" => Ok(SandboxAction::Toggle),
+        "auto" => Ok(SandboxAction::Mode(SandboxMode::Auto)),
+        "required" => Ok(SandboxAction::Mode(SandboxMode::Required)),
+        _ => Err("usage: /sandbox [status|on|off|toggle|auto|required]".to_string()),
+    }
+}
+
+/// Lowercase display label for a sandbox mode (`auto` / `required` / `off`).
+fn sandbox_mode_label(mode: SandboxMode) -> String {
+    format!("{mode:?}").to_ascii_lowercase()
+}
 
 /// Session state for REPL
 pub struct Repl {
@@ -912,6 +948,99 @@ impl Repl {
                     out.println("(shortcut: /permissions bypass toggles bypass ↔ default)");
                 }
             }
+            "/sandbox" => {
+                let action = match parse_sandbox_arg(rest) {
+                    Ok(a) => a,
+                    Err(usage) => {
+                        out.println(&usage);
+                        return Ok(true);
+                    }
+                };
+                let status = self.runtime.sandbox_status();
+                // Toggle resolves against the live override before anything
+                // is applied, so the apply arms below only ever see concrete
+                // On / Off / Mode targets.
+                let action = match action {
+                    SandboxAction::Toggle if status.override_mode == Some(SandboxMode::Off) => {
+                        SandboxAction::On
+                    }
+                    SandboxAction::Toggle => SandboxAction::Off,
+                    other => other,
+                };
+                match action {
+                    SandboxAction::Status => {
+                        let state = if status.confined {
+                            "confined"
+                        } else {
+                            "unconfined"
+                        };
+                        let mut lines = vec![
+                            format!(
+                                "Sandbox: {state} ({})",
+                                match status.override_mode {
+                                    Some(m) => format!("session override: {}", sandbox_mode_label(m)),
+                                    None => "no session override".to_string(),
+                                }
+                            ),
+                            format!(
+                                "Configured mode: {}",
+                                sandbox_mode_label(status.configured_mode)
+                            ),
+                            format!(
+                                "Backend: {}",
+                                if status.backend_supported {
+                                    "landlock supported"
+                                } else {
+                                    "landlock unsupported"
+                                }
+                            ),
+                            format!("Mounted paths: {}", status.mounted_paths),
+                        ];
+                        if !status.confined {
+                            lines.push(String::new());
+                            lines.push(
+                                "Note: shell commands run unconfined; file-tool boundaries (workspace + mounts) are unchanged."
+                                    .into(),
+                            );
+                        }
+                        if let ReplOutput::Tui(st) = &out {
+                            st.open_info_modal("sandbox".to_string(), lines);
+                        } else {
+                            for l in &lines {
+                                out.println(l);
+                            }
+                        }
+                    }
+                    SandboxAction::On => {
+                        self.runtime.set_sandbox_mode(None);
+                        out.println(&format!(
+                            "[sandbox] restored config mode: {}",
+                            sandbox_mode_label(status.configured_mode)
+                        ));
+                    }
+                    SandboxAction::Off => {
+                        self.runtime.set_sandbox_mode(Some(SandboxMode::Off));
+                        out.println(
+                            "[sandbox] OFF for this session — shell commands run unconfined; file-tool boundaries unchanged",
+                        );
+                    }
+                    SandboxAction::Mode(m) => {
+                        self.runtime.set_sandbox_mode(Some(m));
+                        out.println(&format!(
+                            "[sandbox] session override: {} (configured: {})",
+                            sandbox_mode_label(m),
+                            sandbox_mode_label(status.configured_mode)
+                        ));
+                        if m == SandboxMode::Required && !status.backend_supported {
+                            out.println(
+                                "[sandbox] WARNING: Landlock backend unsupported — the sandbox will degrade to unconfined",
+                            );
+                        }
+                    }
+                    // Resolved to On/Off above before this match.
+                    SandboxAction::Toggle => {}
+                }
+            }
             "/skills" => {
                 let skills = SkillCatalog::discover(
                     self.runtime.workspace_root(),
@@ -1202,10 +1331,21 @@ impl Repl {
             }
             "/config" => {
                 let config = self.runtime.config();
+                let sandbox_status = self.runtime.sandbox_status();
+                let sandbox_state = if sandbox_status.confined {
+                    "confined"
+                } else {
+                    "unconfined"
+                };
+                let sandbox_desc = match sandbox_status.override_mode {
+                    Some(m) => format!("{sandbox_state} (override: {})", sandbox_mode_label(m)),
+                    None => sandbox_state.to_string(),
+                };
                 let lines = vec![
                     format!("Provider:    {}", config.provider.default.display_name()),
                     format!("Model:       {}", self.runtime.model()),
                     format!("Permission:  {:?}", self.runtime.permission_mode()),
+                    format!("Sandbox:     {sandbox_desc}"),
                     format!("Memory:      {}", self.runtime.memory_store_path().display()),
                     format!("Editor:      {}", config.effective_editor_command()),
                     format!("Thinking:    {} (budget: {})", config.model.enable_thinking, config.model.thinking_budget),

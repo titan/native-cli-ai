@@ -1,5 +1,5 @@
 use crate::ipc_pending::{ApprovalPendingMap, QuestionPendingMap};
-use nca_common::config::{NcaConfig, PermissionMode, PlanEntry, ProviderKind};
+use nca_common::config::{NcaConfig, PermissionMode, PlanEntry, ProviderKind, SandboxMode};
 use nca_common::event::{AgentEvent, EndReason, QuestionSelection};
 use nca_common::session::{OrchestrationContext, SessionSnapshot};
 use nca_core::agent_driver::InboxItem;
@@ -451,6 +451,20 @@ impl SessionRuntime {
     /// List currently mounted extra paths.
     pub fn mounted_paths(&self) -> Vec<std::path::PathBuf> {
         self.supervisor.mounted_paths()
+    }
+
+    /// Session-level sandbox mode override (`/sandbox`): `Some(mode)` forces
+    /// the given Landlock enforcement mode for this session, `None` restores
+    /// the configured `[permissions.sandbox]` mode. Applies immediately and
+    /// never touches the persisted config. See
+    /// [`nca_runtime::supervisor::Supervisor::set_sandbox_override`].
+    pub fn set_sandbox_mode(&mut self, mode: Option<SandboxMode>) {
+        self.supervisor.set_sandbox_override(mode);
+    }
+
+    /// Live sandbox state for `/sandbox status` and `/config`.
+    pub fn sandbox_status(&self) -> nca_runtime::supervisor::SandboxStatus {
+        self.supervisor.sandbox_status()
     }
 
     /// Return the live filesystem adapter (for propagating runtime mounts to subagents).

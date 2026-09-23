@@ -207,6 +207,7 @@ Useful interactive behaviors:
 - `/auto-answer` accepts the suggested answer for a pending `ask_question`.
 - `/mount <path>` mounts an external directory so tools can read, write, and search files outside the workspace.
 - `/unmount <path>` removes a previously mounted directory.
+- `/sandbox [status|on|off|toggle|auto|required]` shows or switches the session-level Landlock sandbox: `off` disables confinement for this session, `on` restores the configured mode, `auto`/`required` force a mode, `toggle` flips. Session-only — the persisted config is untouched.
 
 Small touches in the TUI matter too: branch switching, structured options, session sidebars, model picker, provider configuration, and direct control over long-running turns.
 
