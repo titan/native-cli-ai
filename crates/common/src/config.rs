@@ -4500,6 +4500,43 @@ host_xdg_runtime = true
     }
 
     #[test]
+    fn sandbox_mode_from_str_accepts_canonical_and_lenient_forms() {
+        use std::str::FromStr;
+
+        // Canonical values.
+        assert_eq!(
+            SandboxMode::from_str("auto").expect("auto"),
+            SandboxMode::Auto
+        );
+        assert_eq!(
+            SandboxMode::from_str("required").expect("required"),
+            SandboxMode::Required
+        );
+        assert_eq!(SandboxMode::from_str("off").expect("off"), SandboxMode::Off);
+
+        // Lenient forms: uppercase and surrounding whitespace.
+        assert_eq!(
+            SandboxMode::from_str("AUTO").expect("AUTO"),
+            SandboxMode::Auto
+        );
+        assert_eq!(
+            SandboxMode::from_str(" off ").expect("padded off"),
+            SandboxMode::Off
+        );
+    }
+
+    #[test]
+    fn sandbox_mode_from_str_rejects_unknown_with_expected_choices() {
+        use std::str::FromStr;
+
+        let err = SandboxMode::from_str("bogus").expect_err("bogus must be rejected");
+        assert!(
+            err.contains("auto, required, off"),
+            "error must list the valid choices, got: {err}"
+        );
+    }
+
+    #[test]
     fn extra_paths_roundtrip_via_workspace_file() {
         let tmp_home = tempfile::tempdir().expect("tempdir");
         let _guard = EnvGuard::set(&[

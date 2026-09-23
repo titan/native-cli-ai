@@ -2704,4 +2704,41 @@ mod tests {
         );
         assert_eq!("invalid".parse::<PermissionMode>().ok(), None);
     }
+
+    // === /sandbox argument parsing ===
+
+    #[test]
+    fn parse_sandbox_arg_status_variants() {
+        assert_eq!(parse_sandbox_arg(""), Ok(SandboxAction::Status));
+        assert_eq!(parse_sandbox_arg("status"), Ok(SandboxAction::Status));
+        // Case-insensitive + surrounding whitespace tolerated.
+        assert_eq!(parse_sandbox_arg("STATUS "), Ok(SandboxAction::Status));
+    }
+
+    #[test]
+    fn parse_sandbox_arg_on_and_off_aliases() {
+        assert_eq!(parse_sandbox_arg("on"), Ok(SandboxAction::On));
+        assert_eq!(parse_sandbox_arg("enable"), Ok(SandboxAction::On));
+        assert_eq!(parse_sandbox_arg("off"), Ok(SandboxAction::Off));
+        assert_eq!(parse_sandbox_arg("disable"), Ok(SandboxAction::Off));
+    }
+
+    #[test]
+    fn parse_sandbox_arg_toggle_and_modes() {
+        assert_eq!(parse_sandbox_arg("toggle"), Ok(SandboxAction::Toggle));
+        assert_eq!(
+            parse_sandbox_arg("auto"),
+            Ok(SandboxAction::Mode(SandboxMode::Auto))
+        );
+        assert_eq!(
+            parse_sandbox_arg("required"),
+            Ok(SandboxAction::Mode(SandboxMode::Required))
+        );
+    }
+
+    #[test]
+    fn parse_sandbox_arg_unknown_returns_usage_line() {
+        let err = parse_sandbox_arg("bogus").expect_err("bogus must be rejected");
+        assert_eq!(err, "usage: /sandbox [status|on|off|toggle|auto|required]");
+    }
 }

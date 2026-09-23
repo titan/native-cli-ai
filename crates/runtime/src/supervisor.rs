@@ -3661,4 +3661,160 @@ mod tests {
         };
         assert!(matches!(err, ProviderError::Configuration(_)));
     }
+
+    // === /sandbox session-level override folding ===
+
+    /// Serialize `Supervisor::create` across parallel tests: the IPC server
+    /// binds a fixed socket path (`$XDG_RUNTIME_DIR/nca/{session_id}.sock`)
+    /// and two concurrent creates with the same session id race on the bind.
+    /// Async mutex — the guard is held across the create `.await`.
+    static SUPERVISOR_CREATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Minimal offline supervisor for sandbox-override tests (mirrors
+    /// `gated_supervisor`'s config shape: fake key, bypass permissions,
+    /// auto-detect off — no network, no skill fixture needed).
+    async fn sandbox_supervisor(root: &Path) -> Supervisor {
+        let _guard = SUPERVISOR_CREATE_LOCK.lock().await;
+        let mut config = NcaConfig::default();
+        config.provider.deepseek.api_key = Some("test-key".into());
+        config.permissions.mode = nca_common::config::PermissionMode::BypassPermissions;
+        config.memory.context.auto_detect_context_window = false;
+        config.memory.context.query_provider_models_api = false;
+        config.memory.context.enable_auto_summarize = false;
+        Supervisor::create(SupervisorConfig {
+            config,
+            workspace_root: root.to_path_buf(),
+            safe_mode: false,
+            interactive_approvals: false,
+            session_id: Some("sandbox-override".into()),
+            approval_handler: None,
+            orchestration_context: None,
+            agent_name: None,
+            provider: None,
+        })
+        .await
+        .expect("sandbox supervisor")
+    }
+
+    fn live_sandbox_mode(sup: &Supervisor) -> SandboxMode {
+        sup.live_config().read().unwrap().permissions.sandbox.mode
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sandbox_status_defaults_to_no_override_and_configured_auto() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sup = sandbox_supervisor(dir.path()).await;
+
+        let status = sup.sandbox_status();
+        assert_eq!(status.override_mode, None, "fresh session has no override");
+        assert_eq!(
+            status.configured_mode,
+            SandboxMode::Auto,
+            "default config mode is auto"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sandbox_override_off_folds_into_live_config_but_never_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut sup = sandbox_supervisor(dir.path()).await;
+
+        sup.set_sandbox_override(Some(SandboxMode::Off));
+
+        let status = sup.sandbox_status();
+        assert_eq!(status.override_mode, Some(SandboxMode::Off));
+        // Child-session inheritance path: the live snapshot carries the
+        // override so subagents inherit the session's live state.
+        assert_eq!(
+            live_sandbox_mode(&sup),
+            SandboxMode::Off,
+            "live_config must fold the override"
+        );
+        // Core invariant: the authoritative config is never rewritten —
+        // a whole-config save must not persist the session toggle.
+        assert_eq!(
+            sup.config().permissions.sandbox.mode,
+            SandboxMode::Auto,
+            "config.permissions.sandbox.mode must never be mutated by the override"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sandbox_override_required_folds_into_live_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut sup = sandbox_supervisor(dir.path()).await;
+
+        sup.set_sandbox_override(Some(SandboxMode::Required));
+
+        assert_eq!(
+            sup.sandbox_status().override_mode,
+            Some(SandboxMode::Required)
+        );
+        assert_eq!(live_sandbox_mode(&sup), SandboxMode::Required);
+        assert_eq!(sup.config().permissions.sandbox.mode, SandboxMode::Auto);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sandbox_override_clear_restores_configured_mode_in_live_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut sup = sandbox_supervisor(dir.path()).await;
+
+        sup.set_sandbox_override(Some(SandboxMode::Off));
+        assert_eq!(live_sandbox_mode(&sup), SandboxMode::Off);
+
+        sup.set_sandbox_override(None);
+        assert_eq!(sup.sandbox_status().override_mode, None, "override cleared");
+        assert_eq!(
+            live_sandbox_mode(&sup),
+            SandboxMode::Auto,
+            "live_config falls back to the configured mode"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn apply_nca_config_preserves_sandbox_override() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut sup = sandbox_supervisor(dir.path()).await;
+
+        sup.set_sandbox_override(Some(SandboxMode::Off));
+
+        // An in-session config rebuild (e.g. /model, provider switch) must
+        // NOT clear the session's sandbox override.
+        let mut new_config = sup.config().clone();
+        new_config.provider.deepseek.api_key = Some("rebuild-key".into());
+        sup.apply_nca_config(new_config).expect("apply config");
+
+        assert_eq!(
+            sup.sandbox_status().override_mode,
+            Some(SandboxMode::Off),
+            "override must survive apply_nca_config"
+        );
+        assert_eq!(
+            live_sandbox_mode(&sup),
+            SandboxMode::Off,
+            "live_config still carries the override after the rebuild"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sandbox_status_confined_tracks_override_on_supported_kernel() {
+        if !crate::sandbox::backend_supported() {
+            eprintln!("SKIP: Landlock unavailable on this kernel");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut sup = sandbox_supervisor(dir.path()).await;
+
+        sup.set_sandbox_override(Some(SandboxMode::Off));
+        assert!(
+            !sup.sandbox_status().confined,
+            "Off override must yield an unconfined PTY"
+        );
+
+        sup.set_sandbox_override(Some(SandboxMode::Required));
+        assert!(
+            sup.sandbox_status().confined,
+            "Required override must yield a confined PTY"
+        );
+    }
 }
