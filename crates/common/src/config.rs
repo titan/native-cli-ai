@@ -123,7 +123,7 @@ impl NcaConfig {
         let mut base = Self::load_global_file().unwrap_or_default();
         base.apply_env();
 
-        let current_toml =
+        let mut current_toml =
             toml::Value::try_from(self).map_err(|source| ConfigError::SerializeToml {
                 path: workspace_config_path(workspace_root),
                 source,
@@ -133,6 +133,17 @@ impl NcaConfig {
                 path: workspace_config_path(workspace_root),
                 source,
             })?;
+
+        // Persona fields (`system_prompt`, `system_prompt_append`, `description`)
+        // are runtime-derived: skill-discovered agents get their persona from the
+        // skill body at startup (`register_skill_agents`), never from this file.
+        // Persisting them would freeze a snapshot of the skill text into
+        // `.nca/config.local.toml` (a `[agents.<name>]` entry there takes
+        // precedence over skill discovery on the next load), so a skill edit
+        // would silently stop applying. Strip them from the current side so the
+        // diff never contains a persona; the base side is unaffected (a
+        // user-authored persona in the global config stays authoritative).
+        strip_persona_fields(&mut current_toml);
 
         let diff = match diff_toml_values(&current_toml, &base_toml) {
             Some(d) => d,
@@ -1015,6 +1026,28 @@ fn save_config_to_path(config: &NcaConfig, path: &Path) -> Result<(), ConfigErro
         path: path.to_path_buf(),
         source,
     })
+}
+
+/// Remove persona fields from the `[agents.<name>]` tables of a serialized
+/// config. See [`NcaConfig::save_workspace_file`]: these fields are
+/// runtime-derived from skill bodies (or user-authored in the global config),
+/// never workspace-local overrides, so they must not round-trip through
+/// `.nca/config.local.toml`.
+fn strip_persona_fields(config_toml: &mut toml::Value) {
+    let Some(agents) = config_toml
+        .get_mut("agents")
+        .and_then(toml::Value::as_table_mut)
+    else {
+        return;
+    };
+    for profile in agents.iter_mut().map(|(_, v)| v) {
+        let Some(profile) = profile.as_table_mut() else {
+            continue;
+        };
+        profile.remove("system_prompt");
+        profile.remove("system_prompt_append");
+        profile.remove("description");
+    }
 }
 
 /// Recursively compute the diff of two TOML values.
@@ -3793,6 +3826,66 @@ blocking = false
         assert!(
             !local_path.exists(),
             "local config should be removed when there are no overrides"
+        );
+    }
+
+    #[test]
+    fn save_workspace_file_never_persists_agent_personas() {
+        // Regression: `/plan` (and any other whole-config save) used to
+        // serialize skill-derived personas into `.nca/config.local.toml`,
+        // where they'd shadow skill discovery on the next load and freeze
+        // the skill body as a stale snapshot. Persona fields must never
+        // round-trip through the workspace-local file.
+        let tmp_home = tempfile::tempdir().expect("tempdir");
+        let _guard = EnvGuard::set(&[
+            ("HOME", Some(tmp_home.path().to_str().unwrap())),
+            ("MINIMAX_API_KEY", None),
+            ("OPENAI_API_KEY", None),
+            ("NCA_EDITOR", None),
+            ("EDITOR", None),
+        ]);
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Simulate `register_skill_agents` + `apply_plan` state: a
+        // skill-discovered persona and a plan-pinned route on the same agent.
+        let mut config = NcaConfig::default();
+        config.agents.insert(
+            "tester".to_string(),
+            AgentProfileConfig {
+                description: Some("Test-writing specialist.".to_string()),
+                system_prompt: Some("You are Tester — a test-writing specialist.".to_string()),
+                system_prompt_append: Some("extra persona text".to_string()),
+                provider: Some(ProviderKind::Mimo),
+                model: Some("mimo-v2.6-pro".to_string()),
+                ..Default::default()
+            },
+        );
+        config.active_plan = Some("strong-glm".to_string());
+
+        config.save_workspace_file(dir.path()).expect("save");
+
+        let raw = std::fs::read_to_string(workspace_config_path(dir.path())).expect("read");
+        // Routing (the actual /plan payload) must persist …
+        assert!(
+            raw.contains("mimo-v2.6-pro"),
+            "model pin must persist: {raw}"
+        );
+        assert!(
+            raw.contains("active_plan"),
+            "active_plan must persist: {raw}"
+        );
+        // … but persona text must not.
+        assert!(
+            !raw.contains("system_prompt"),
+            "persona must not be persisted: {raw}"
+        );
+        assert!(
+            !raw.contains("Test-writing specialist"),
+            "description must not be persisted: {raw}"
+        );
+        assert!(
+            !raw.contains("You are Tester"),
+            "system prompt body must not be persisted: {raw}"
         );
     }
 
