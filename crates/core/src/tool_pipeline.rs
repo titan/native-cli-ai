@@ -28,6 +28,14 @@ pub struct PipelineResult {
     /// log these if needed but does NOT need to re-emit them — they were
     /// already sent via `event_tx`.
     pub events: Vec<AgentEvent>,
+    /// Calls refused by the repeat-call guard (`RepeatAction::Stop`):
+    /// `(tool name, refusal message)` per refused call. Hint/strong-hint
+    /// calls execute normally and are NOT listed. The driver escalates on
+    /// consecutive stop-bearing steps (see `TurnDriver`); without this the
+    /// refusals are invisible outside the tool-result messages and a model
+    /// that ignores them can keep re-issuing identical calls until the
+    /// (effectively unbounded) turn budget runs out.
+    pub guard_refusals: Vec<(String, String)>,
 }
 
 /// Run the permission-check / hook / execute pipeline on a batch of tool calls.
@@ -53,6 +61,7 @@ pub async fn run_tool_pipeline(
     workspace_root: &str,
 ) -> Result<PipelineResult, String> {
     let mut events = Vec::new();
+    let mut guard_refusals: Vec<(String, String)> = Vec::new();
     let mut emit = |e: AgentEvent| {
         events.push(e.clone());
         // Best-effort send; if the channel is full the event is still recorded.
@@ -79,6 +88,7 @@ pub async fn run_tool_pipeline(
             RepeatAction::Proceed => None,
             RepeatAction::Hint(msg) | RepeatAction::StrongHint(msg) => Some(msg),
             RepeatAction::Stop(msg) => {
+                guard_refusals.push((call.name.clone(), msg.clone()));
                 tickets.push(Ticket::Resolved(ToolResult {
                     call_id: call.id.clone(),
                     success: false,
@@ -368,6 +378,7 @@ pub async fn run_tool_pipeline(
     Ok(PipelineResult {
         results: final_results,
         events,
+        guard_refusals,
     })
 }
 
@@ -766,5 +777,66 @@ mod tests {
         assert!(r.results[1].success, "2nd in batch executes (warn regime)");
         assert!(r.results[1].output.contains(WAIT_GUARD_MARKER));
         assert_eq!(*executions.lock().unwrap(), 2, "both calls ran, serialized");
+    }
+
+    /// Guard Stops must surface in `PipelineResult::guard_refusals` so the
+    /// turn driver can escalate on consecutive refusal-bearing steps — the
+    /// per-call error alone is invisible to the driver's loop control.
+    #[tokio::test]
+    async fn guard_stop_populates_guard_refusals() {
+        struct CountingTool {
+            executions: Arc<Mutex<u32>>,
+        }
+        #[async_trait::async_trait]
+        impl ToolExecutor for CountingTool {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    timeout_ms: None,
+                    name: "okay".into(),
+                    description: "succeeds".into(),
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                }
+            }
+            async fn execute(&self, call: &ToolCall) -> ToolResult {
+                *self.executions.lock().unwrap() += 1;
+                ToolResult {
+                    timed_out: false,
+                    call_id: call.id.clone(),
+                    success: true,
+                    output: "fine".into(),
+                    error: None,
+                }
+            }
+        }
+
+        let executions = Arc::new(Mutex::new(0));
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(CountingTool {
+            executions: Arc::clone(&executions),
+        }));
+
+        // 8 identical calls in one batch: counts 1–7 execute (hints from 3
+        // on), the 8th is hard-stopped → exactly one guard refusal.
+        let calls: Vec<ToolCall> = (0..8)
+            .map(|i| ToolCall {
+                id: format!("k{i}"),
+                name: "okay".into(),
+                input: serde_json::json!({"same": true}),
+            })
+            .collect();
+        let mut guard = RepeatCallGuard::new();
+        let r = run_with_guard(&tools, calls, &mut guard)
+            .await
+            .expect("pipeline");
+
+        assert_eq!(r.guard_refusals.len(), 1, "exactly the 8th call refused");
+        assert_eq!(r.guard_refusals[0].0, "okay");
+        assert!(
+            r.guard_refusals[0].1.contains("[guard]"),
+            "refusal carries the guard message: {}",
+            r.guard_refusals[0].1
+        );
+        assert_eq!(*executions.lock().unwrap(), 7, "only the first 7 run");
+        assert!(!r.results[7].success, "the 8th result is the refusal");
     }
 }

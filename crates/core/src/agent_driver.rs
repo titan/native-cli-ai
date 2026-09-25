@@ -101,10 +101,25 @@ pub(crate) struct TurnDriver<'a> {
     /// `all_failed_same_tool` branch; only read when the max is reached).
     last_failed_output: String,
     last_failed_error: Option<String>,
+    /// Consecutive steps in which the repeat-call guard refused at least one
+    /// call (`RepeatAction::Stop`). Guard refusals are already delivered to
+    /// the model as failed tool results; a model that keeps collecting them
+    /// across consecutive steps is ignoring explicit correction and only
+    /// burning inference passes (each refused call still costs a full-context
+    /// re-prefill). At [`MAX_CONSECUTIVE_GUARD_STOP_STEPS`] the turn is ended
+    /// with the refusals spelled out — for a sub-agent that output surfaces
+    /// to the parent via the spawn reply / task_result.
+    consecutive_guard_stop_steps: u32,
 }
 
 const MAX_EMPTY_RETRIES: u32 = 2;
 const MAX_CONSECUTIVE_TOOL_FAILURES: u32 = 3;
+/// Consecutive steps that each contain at least one guard refusal before the
+/// turn is force-ended. The guard only Stops a call on its 8th+ identical
+/// issue, so one refusal-bearing step already implies seven identical priors;
+/// three in a row is unambiguous loop pathology, not legitimate iteration
+/// (fix → test loops vary their calls and never reach a Stop).
+const MAX_CONSECUTIVE_GUARD_STOP_STEPS: u32 = 3;
 
 impl<'a> TurnDriver<'a> {
     pub(crate) fn new(
@@ -124,6 +139,7 @@ impl<'a> TurnDriver<'a> {
             last_failed_tool: String::new(),
             last_failed_output: String::new(),
             last_failed_error: None,
+            consecutive_guard_stop_steps: 0,
         }
     }
 
@@ -621,10 +637,20 @@ impl<'a> TurnDriver<'a> {
                 .await;
         }
 
-        // Track consecutive failures of the same tool to detect infinite retry loops.
+        // Track consecutive pure-retry steps to detect infinite retry loops.
+        // A step qualifies when EVERY call was the SAME tool and every result
+        // failed — the step produced nothing but failed retries. (Historically
+        // this required `tool_calls.len() == 1`, which never fired for models
+        // that batch 4–8 calls per step; observed sub-agent runs showed
+        // 20+ guard hard-stops with the breaker silent.) Any successful call
+        // or a mixed-tool batch resets the streak — a legitimate fix → test →
+        // fail iteration always intersperses edits or reads that succeed.
+        let step_single_tool = tool_calls
+            .first()
+            .is_some_and(|first| tool_calls.iter().all(|c| c.name == first.name));
         let all_failed_same_tool = !pipeline.results.is_empty()
             && pipeline.results.iter().all(|r| !r.success)
-            && tool_calls.len() == 1;
+            && step_single_tool;
         if all_failed_same_tool {
             let tool_name = &tool_calls[0].name;
             let last_result = &pipeline.results[0];
@@ -669,6 +695,55 @@ impl<'a> TurnDriver<'a> {
                     duration_ms,
                 })
                 .await;
+        }
+
+        // ── Guard-refusal escalation ─────────────────────────────────────
+        // The messages above already delivered each refusal to the model; this
+        // counts stop-bearing STEPS so a model that ignores them ends the
+        // turn instead of re-billing full-context inference until the 1024-step
+        // budget expires. A clean step (no refusals) resets the streak.
+        if pipeline.guard_refusals.is_empty() {
+            self.consecutive_guard_stop_steps = 0;
+        } else {
+            self.consecutive_guard_stop_steps += 1;
+            if self.consecutive_guard_stop_steps >= MAX_CONSECUTIVE_GUARD_STOP_STEPS {
+                let n_refusals = pipeline.guard_refusals.len();
+                let mut msg = format!(
+                    "Repeat-call guard refused calls in {} consecutive steps \
+                     (latest step: {n_refusals} refusal(s)) — you keep re-issuing \
+                     identical tool calls that were already answered and refused. \
+                     Ending the turn to break the loop.\n\
+                     Refused calls in the latest step:",
+                    self.consecutive_guard_stop_steps
+                );
+                for (tool, refusal) in pipeline.guard_refusals.iter().take(3) {
+                    msg.push_str(&format!(
+                        "\n- `{tool}`: {}",
+                        crate::agent::truncate_str(refusal, 200)
+                    ));
+                }
+                if pipeline.guard_refusals.len() > 3 {
+                    msg.push_str(&format!(
+                        "\n- (and {} more in this step)",
+                        pipeline.guard_refusals.len() - 3
+                    ));
+                }
+                msg.push_str(
+                    "\nTo proceed: vary the parameters, use a different tool, or rely \
+                     on the earlier tool outputs already in your context. If you are \
+                     a sub-agent, report this limitation and what you already \
+                     established in your final output.",
+                );
+                agent
+                    .emit(AgentEvent::Error {
+                        message: msg.clone(),
+                    })
+                    .await;
+                return Ok(StepOutcome::FinalText {
+                    text: msg,
+                    had_tool_calls: true,
+                });
+            }
         }
 
         if self.consecutive_tool_failures >= MAX_CONSECUTIVE_TOOL_FAILURES {
@@ -861,5 +936,239 @@ mod tests {
             error_pos.unwrap() < step_failed_pos,
             "Error must arrive BEFORE StepFailed"
         );
+    }
+
+    // ── Loop-breaker generalization + guard-refusal escalation ────────────
+
+    /// Scripted provider: each `chat()` call replays the next round of
+    /// chunks, then closes the channel. Counts calls.
+    struct RoundsProvider {
+        rounds: Vec<Vec<StreamChunk>>,
+        calls: Arc<AtomicU32>,
+    }
+
+    impl RoundsProvider {
+        fn new(rounds: Vec<Vec<StreamChunk>>) -> (Self, Arc<AtomicU32>) {
+            let calls = Arc::new(AtomicU32::new(0));
+            (
+                Self {
+                    rounds,
+                    calls: Arc::clone(&calls),
+                },
+                calls,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for RoundsProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[nca_common::tool::ToolDefinition],
+            _model: &str,
+            _workspace_root: &Path,
+        ) -> Result<tokio::sync::mpsc::Receiver<StreamChunk>, ProviderError> {
+            let index = self.calls.fetch_add(1, Ordering::SeqCst) as usize;
+            let round = self.rounds.get(index).cloned().unwrap_or_default();
+            let (tx, rx) = tokio::sync::mpsc::channel(64);
+            tokio::spawn(async move {
+                for chunk in round {
+                    let _ = tx.send(chunk).await;
+                }
+            });
+            Ok(rx)
+        }
+    }
+
+    /// Always-failing tool for the pure-retry breaker test.
+    struct BoomTool;
+    #[async_trait::async_trait]
+    impl crate::tools::ToolExecutor for BoomTool {
+        fn definition(&self) -> nca_common::tool::ToolDefinition {
+            nca_common::tool::ToolDefinition {
+                timeout_ms: None,
+                name: "boom".into(),
+                description: "always fails".into(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+        async fn execute(&self, call: &ToolCall) -> nca_common::tool::ToolResult {
+            nca_common::tool::ToolResult {
+                timed_out: false,
+                call_id: call.id.clone(),
+                success: false,
+                output: String::new(),
+                error: Some("kaboom".into()),
+            }
+        }
+    }
+
+    /// Always-succeeding tool for the guard-escalation test (the guard Stops
+    /// on repeat COUNT, not on failure — a succeeding tool still gets
+    /// hard-stopped on its 8th identical issue).
+    struct OkayTool;
+    #[async_trait::async_trait]
+    impl crate::tools::ToolExecutor for OkayTool {
+        fn definition(&self) -> nca_common::tool::ToolDefinition {
+            nca_common::tool::ToolDefinition {
+                timeout_ms: None,
+                name: "okay".into(),
+                description: "always succeeds".into(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+        async fn execute(&self, call: &ToolCall) -> nca_common::tool::ToolResult {
+            nca_common::tool::ToolResult {
+                timed_out: false,
+                call_id: call.id.clone(),
+                success: true,
+                output: "fine".into(),
+                error: None,
+            }
+        }
+    }
+
+    fn use_call(id: &str, name: &str, input: serde_json::Value) -> StreamChunk {
+        StreamChunk::ToolUse(ToolCall {
+            id: id.into(),
+            name: name.into(),
+            input,
+        })
+    }
+
+    fn breaker_agent(
+        provider: Arc<dyn Provider>,
+        tool: Box<dyn crate::tools::ToolExecutor>,
+    ) -> AgentLoop {
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(1024);
+        let mut tools = ToolRegistry::new();
+        tools.register(tool);
+        AgentLoop::new(
+            provider,
+            tools,
+            ApprovalPolicy::new(PermissionConfig {
+                mode: PermissionMode::BypassPermissions,
+                ..Default::default()
+            }),
+            "test-model".into(),
+            event_tx,
+            20,
+            16,
+            0,
+            None,
+        )
+    }
+
+    /// A step whose ENTIRE batch is the same failing tool must count toward
+    /// the consecutive-failure breaker — not just single-call steps. Before
+    /// the fix, `tool_calls.len() == 1` meant batched retriers (the common
+    /// sub-agent shape, 4–8 calls/step) looped forever.
+    #[tokio::test]
+    async fn same_tool_batched_failures_trip_the_breaker() {
+        // 4 rounds × 2 identical boom calls; breaker must fire on round 3.
+        let round = || {
+            vec![
+                use_call("a", "boom", serde_json::json!({"x": 1})),
+                use_call("b", "boom", serde_json::json!({"x": 1})),
+                StreamChunk::Finish {
+                    reason: "tool_calls".into(),
+                },
+            ]
+        };
+        let (provider, calls) = RoundsProvider::new(vec![round(), round(), round(), round()]);
+        let mut agent = breaker_agent(Arc::new(provider), Box::new(BoomTool));
+
+        let text = agent
+            .run_turn("go", Path::new("."), &[])
+            .await
+            .expect("breaker ends the turn with a final text, not an error");
+        assert!(
+            text.contains("failed 3 times consecutively"),
+            "breaker message expected: {text}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "fires on the 3rd step");
+    }
+
+    /// A model that keeps re-issuing identical calls past the guard's hard
+    /// stop gets its turn force-ended after MAX_CONSECUTIVE_GUARD_STOP_STEPS
+    /// consecutive refusal-bearing steps. Pre-fix the refusals were invisible
+    /// to the driver and the loop ran to the 1024-step budget.
+    #[tokio::test]
+    async fn persistent_guard_refusals_end_the_turn() {
+        // 10 identical `okay` calls: counts 1–7 execute (hints from 3 on),
+        // counts 8–10 are guard Stops = 3 consecutive stop-bearing steps.
+        let rounds: Vec<_> = (0..10)
+            .map(|i| {
+                vec![
+                    use_call(&format!("c{i}"), "okay", serde_json::json!({"q": 1})),
+                    StreamChunk::Finish {
+                        reason: "tool_calls".into(),
+                    },
+                ]
+            })
+            .collect();
+        let (provider, calls) = RoundsProvider::new(rounds);
+        let mut agent = breaker_agent(Arc::new(provider), Box::new(OkayTool));
+
+        let text = agent
+            .run_turn("go", Path::new("."), &[])
+            .await
+            .expect("escalation ends the turn with a final text");
+        assert!(
+            text.contains("Repeat-call guard refused calls in 3 consecutive steps"),
+            "escalation message expected: {text}"
+        );
+        assert!(
+            text.contains("`okay`"),
+            "message must name the offending tool: {text}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            10,
+            "exactly the scripted steps"
+        );
+    }
+
+    /// A clean (refusal-free) step resets the streak: stop/clean/stop/clean/
+    /// stop never escalates, and the turn finishes normally.
+    #[tokio::test]
+    async fn clean_step_resets_the_guard_stop_streak() {
+        let in1 = serde_json::json!({"q": 1});
+        let in2 = serde_json::json!({"q": 2});
+        // 8× in1 (8th = Stop), in2 (clean), in1 (Stop), in2 (clean), in1
+        // (Stop) — streak peaks at 1 with resets, would reach 3 without.
+        let mut rounds: Vec<Vec<StreamChunk>> = Vec::new();
+        for i in 0..8 {
+            rounds.push(vec![
+                use_call(&format!("a{i}"), "okay", in1.clone()),
+                StreamChunk::Finish {
+                    reason: "tool_calls".into(),
+                },
+            ]);
+        }
+        for (i, input) in [
+            (100, in2.clone()),
+            (101, in1.clone()),
+            (102, in2),
+            (103, in1),
+        ] {
+            rounds.push(vec![
+                use_call(&format!("c{i}"), "okay", input),
+                StreamChunk::Finish {
+                    reason: "tool_calls".into(),
+                },
+            ]);
+        }
+        rounds.push(vec![StreamChunk::TextDelta("all good".into())]);
+        let (provider, calls) = RoundsProvider::new(rounds);
+        let mut agent = breaker_agent(Arc::new(provider), Box::new(OkayTool));
+
+        let text = agent
+            .run_turn("go", Path::new("."), &[])
+            .await
+            .expect("turn must complete normally");
+        assert_eq!(text, "all good", "no escalation may fire: {text}");
+        assert_eq!(calls.load(Ordering::SeqCst), 13);
     }
 }
