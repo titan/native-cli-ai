@@ -710,6 +710,10 @@ fn default_wake_interval_ms() -> u64 {
     1000
 }
 
+fn default_wake_hold_ms() -> u64 {
+    30_000
+}
+
 /// `[subagent.wake]` — parent wake-on-terminal scheduling (P3): when a
 /// background child task reaches a terminal state, an idle parent session
 /// is woken with a single reconciled prompt.
@@ -724,6 +728,11 @@ pub struct WakeConfig {
     /// within the window coalesce into a single wake.
     #[serde(default = "default_wake_interval_ms")]
     pub interval_ms: u64,
+    /// Bounded `wait_for_user` wake hold, milliseconds; held
+    /// background-terminal wakes deliver after this grace or the user's
+    /// next Submit, whichever comes first.
+    #[serde(default = "default_wake_hold_ms")]
+    pub hold_ms: u64,
 }
 
 impl Default for WakeConfig {
@@ -731,6 +740,7 @@ impl Default for WakeConfig {
         Self {
             enabled: default_wake_enabled(),
             interval_ms: default_wake_interval_ms(),
+            hold_ms: default_wake_hold_ms(),
         }
     }
 }
@@ -742,6 +752,9 @@ impl WakeConfig {
         }
         if let Some(interval_ms) = partial.interval_ms {
             self.interval_ms = interval_ms;
+        }
+        if let Some(hold_ms) = partial.hold_ms {
+            self.hold_ms = hold_ms;
         }
     }
 }
@@ -2717,6 +2730,7 @@ struct PartialSubagentConfig {
 struct PartialWakeConfig {
     enabled: Option<bool>,
     interval_ms: Option<u64>,
+    hold_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -3188,6 +3202,10 @@ mod tests {
             config.subagent.wake.interval_ms, 1000,
             "wake interval defaults to 1s debounce"
         );
+        assert_eq!(
+            config.subagent.wake.hold_ms, 30_000,
+            "wake hold defaults to a 30s bounded wait_for_user grace"
+        );
         assert_eq!(config.subagent.result_timeout_ms, 30_000);
     }
 
@@ -3200,6 +3218,7 @@ background = false
 [subagent.wake]
 enabled = false
 interval_ms = 250
+hold_ms = 7500
 "#;
         let partial: PartialNcaConfig = toml::from_str(raw).expect("parse");
         let mut config = NcaConfig::default();
@@ -3207,6 +3226,7 @@ interval_ms = 250
         assert!(!config.subagent.background);
         assert!(!config.subagent.wake.enabled);
         assert_eq!(config.subagent.wake.interval_ms, 250);
+        assert_eq!(config.subagent.wake.hold_ms, 7500);
         assert_eq!(
             config.subagent.result_timeout_ms, 30_000,
             "untouched sibling keeps its default"
@@ -3222,7 +3242,14 @@ enabled = false
         let mut config = NcaConfig::default();
         config.merge(partial);
         assert!(!config.subagent.wake.enabled);
-        assert_eq!(config.subagent.wake.interval_ms, 1000);
+        assert_eq!(
+            config.subagent.wake.interval_ms, 1000,
+            "untouched sibling keeps its default"
+        );
+        assert_eq!(
+            config.subagent.wake.hold_ms, 30_000,
+            "untouched hold keeps its default"
+        );
     }
 
     #[test]
@@ -3235,6 +3262,7 @@ result_timeout_ms = 45000
 [subagent.wake]
 enabled = false
 interval_ms = 500
+hold_ms = 20000
 "#;
         let partial: PartialNcaConfig = toml::from_str(raw).expect("parse");
         let mut config = NcaConfig::default();
@@ -3243,6 +3271,7 @@ interval_ms = 500
         assert_eq!(config.subagent.result_timeout_ms, 45000);
         assert!(!config.subagent.wake.enabled);
         assert_eq!(config.subagent.wake.interval_ms, 500);
+        assert_eq!(config.subagent.wake.hold_ms, 20000);
 
         // Round-trips through Serialize/Deserialize (config file writes) —
         // nested wake must survive a full NcaConfig serialization.
@@ -3252,6 +3281,7 @@ interval_ms = 500
         assert_eq!(back.subagent.result_timeout_ms, 45000);
         assert!(!back.subagent.wake.enabled);
         assert_eq!(back.subagent.wake.interval_ms, 500);
+        assert_eq!(back.subagent.wake.hold_ms, 20000);
     }
 
     #[test]
@@ -3570,6 +3600,8 @@ onboarding_completed = true
         config.provider.zhipuai.api_key_env = "__NCA_TEST_NONE__".into();
         config.provider.deepseek.api_key_env = "__NCA_TEST_NONE__".into();
         config.provider.kimi.api_key_env = "__NCA_TEST_NONE__".into();
+        config.provider.mimo.api_key_env = "__NCA_TEST_NONE__".into();
+        config.provider.custom.api_key_env = "__NCA_TEST_NONE__".into();
         config
     }
 

@@ -127,7 +127,7 @@ impl ToolExecutor for SpawnSubagentTool {
                     },
                     "background": {
                         "type": "boolean",
-                        "description": "Detached execution: the reply returns immediately with status \"running\" and the final output is fetched later via task_result; completion auto-wakes the parent in interactive TUI sessions (a wake landing while you stand by is held and delivered right after the user's next message). Sessions without a wake path (stdio/one-shot) run spawns in the foreground regardless. Absent = inherit the session default (top-level TUI sessions default to background)."
+                        "description": "Detached execution: the reply returns immediately with status \"running\" and the final output is fetched later via task_result; completion auto-wakes the parent in interactive TUI sessions (a wake landing while you stand by is held for a short grace period ([subagent.wake] hold_ms, default 30s) or until the user's next message, whichever comes first). Sessions without a wake path (stdio/one-shot) run spawns in the foreground regardless. Absent = inherit the session default (top-level TUI sessions default to background)."
                     },
                     "alias": {
                         "type": "string",

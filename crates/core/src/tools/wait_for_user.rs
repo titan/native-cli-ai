@@ -4,9 +4,10 @@
 //! Distinct from `ask_question` by construction: no options, no oneshot, no
 //! `QuestionRequested` event, no event channel at all. Its only side effect
 //! is the injected `pause_hook` (the CLI wires it to
-//! `WakeScheduler::pause`), which defers background-subagent wakes until
-//! the user's next Submit (a terminal landing while paused is held and
-//! delivered right after that Submit, never dropped). Registered
+//! `WakeScheduler::pause`), which defers background-subagent wakes for a
+//! short grace period (`[subagent.wake] hold_ms`, default 30s) or until
+//! the user's next Submit, whichever comes first (a terminal landing
+//! while held is queued, never dropped). Registered
 //! `is_interactive` so the tool pipeline runs it strictly alone, last in a
 //! batch. Same-turn repeats are guarded separately: see
 //! `crate::tool_guards` (warn on the 2nd call in a turn, refuse from the 3rd).
@@ -49,7 +50,8 @@ impl ToolExecutor for WaitForUserTool {
                 you need to continue. Do NOT call it when waiting on background subagent \
                 tasks: for those, simply end your turn; you will be woken automatically \
                 when they complete. While you stand by, background task wakes are held \
-                and delivered right after the user's next message. Call it last, alone — never \
+                for a short grace period ([subagent.wake] hold_ms, default 30s) or until \
+                your next user message, whichever comes first. Call it last, alone — never \
                 alongside other tool calls in the same batch. It returns immediately, \
                 never prompts, and never blocks."
                 .into(),
@@ -69,7 +71,8 @@ impl ToolExecutor for WaitForUserTool {
             call_id: call.id.clone(),
             success: true,
             output: "Standing by for the user. End your turn now; background task wakes \
-                are held and will be delivered right after the user's next message."
+                are held for a short grace period ([subagent.wake] hold_ms, default 30s) \
+                or until the user's next message, whichever comes first."
                 .into(),
             error: None,
         }
@@ -106,8 +109,7 @@ mod tests {
             res.output
         );
         assert!(
-            res.output
-                .contains("delivered right after the user's next message"),
+            res.output.contains("or until the user's next message"),
             "output must state the deferral policy: {}",
             res.output
         );

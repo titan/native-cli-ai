@@ -35,16 +35,23 @@
 //! arrives" bug. Wake frequency is bounded by the `delivered` flag (at
 //! most one queued wake per input).
 //!
-//! Pause latch (P4): [`WakeScheduler::pause`] DEFERS wake delivery until
-//! the next [`WakeScheduler::note_input`] — used by the `wait_for_user`
-//! tool so background terminals stay quiet while the orchestrator hands
-//! control back to the user. A terminal that lands while paused is pushed
-//! into the unseen-notes queue (it reserves no window and fires nothing);
-//! the next `note_input` flushes it immediately after the user's Submit.
-//! There is deliberately NO `resume()`: an inverse that only cleared
-//! `paused` would be incomplete (a pending window's debounce task must
-//! also be re-evaluated), and a resume that also reset the window flags
-//! would just duplicate `note_input`. Un-pausing rides `note_input` alone.
+//! Pause latch (P4, bounded hold): [`WakeScheduler::pause`] — used by
+//! the `wait_for_user` tool when the orchestrator hands control back to
+//! the user — holds wake delivery for at most `hold`. A terminal that
+//! lands while held is pushed into the unseen-notes queue (it reserves
+//! no window and fires nothing) and delivers at the EARLIER of
+//! (a) the next [`WakeScheduler::note_input`] (the Submit choke point
+//! flushes the queue immediately — user input first, wake behind it),
+//! or (b) `hold` expiry, where the release task clears the latch and
+//! re-arms a debounce window for any stranded notes. The bound kills
+//! the unattended wedge: a `wait_for_user` turn in a headless run has
+//! no next Submit to ride, so a purely latch-based defer could hold a
+//! promised wake forever. A newer pause supersedes an unexpired
+//! release task via the pause epoch. There is deliberately NO public
+//! `resume()`: an inverse that only cleared `paused` would be
+//! incomplete (stranded notes must also be re-armed, which is exactly
+//! what the release task's re-arm does), and un-pausing rides
+//! `note_input` and hold expiry alone.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -98,9 +105,19 @@ struct Inner {
     notes: Mutex<NoteQueue>,
     /// Pause latch (P4): while set, no wake may commit — terminals
     /// neither reserve a window nor fire; they queue as unseen notes.
-    /// Cleared by the next `note_input` (there is intentionally no
-    /// `resume()`; see the module docs).
+    /// Cleared at the earlier of the next `note_input` or the bounded
+    /// hold's release task (there is intentionally no public `resume()`;
+    /// see the module docs).
     paused: AtomicBool,
+    /// Pause epoch, bumped by every `pause()` and `note_input()`. A
+    /// release task clears the latch only while its epoch is still
+    /// current, so a stale release can never clear a FRESH pause's
+    /// latch.
+    pause_epoch: AtomicU64,
+    /// Bounded pause hold (P4): the maximum time `pause()` may defer
+    /// wake delivery before its release task clears the latch and
+    /// re-arms delivery.
+    hold: Duration,
     /// Window generation, bumped by every `note_input`. A debounce task
     /// commits only while its generation is still current, so a window
     /// canceled by user input can never steal the reservation of a newer
@@ -115,11 +132,12 @@ struct Inner {
 /// when a detached child reaches a terminal state (completed / cancelled /
 /// failed). Every terminal is recorded in a bounded unseen-notes queue and
 /// delivered exactly once — either `interval` later through the debounce
-/// commit (coalescing ALL in-window terminals into one composite), or, when
-/// a wake is already queued and unconsumed (`delivered`) or the pause
-/// latch is set, as a chained composite flush at the next
-/// [`WakeScheduler::note_input`] (user input supersedes a wake's timing,
-/// never its delivery).
+/// commit (coalescing ALL in-window terminals into one composite), or,
+/// when a wake is already queued and unconsumed (`delivered`), as a
+/// chained composite flush at the next [`WakeScheduler::note_input`]
+/// (user input supersedes a wake's timing, never its delivery).
+/// Terminals landing while the bounded pause latch is held deliver at
+/// the earlier of that same `note_input` flush or the hold's expiry.
 #[derive(Clone)]
 pub struct WakeScheduler {
     inner: Arc<Inner>,
@@ -150,17 +168,17 @@ fn push_note(inner: &Inner, note: TerminalNote) {
     });
 }
 
-/// Drain the unseen-note queue (take every retained note plus the
-/// overflow count, resetting both) and render the wake text. Returns
-/// `None` when nothing was queued.
-fn drain_rendered(inner: &Inner) -> Option<String> {
+/// Drain the unseen-note queue: take every retained note plus the
+/// overflow count, resetting both. Returns `None` when nothing was
+/// queued (empty notes and zero overflow).
+fn drain_notes(inner: &Inner) -> Option<(Vec<TerminalNote>, u32)> {
     with_notes(inner, |queue| {
-        if queue.notes.is_empty() {
+        if queue.notes.is_empty() && queue.overflow == 0 {
             return None;
         }
         let notes: Vec<TerminalNote> = std::mem::take(&mut queue.notes).into();
         let overflow = std::mem::take(&mut queue.overflow);
-        Some(render_wake(&notes, overflow))
+        Some((notes, overflow))
     })
 }
 
@@ -200,33 +218,121 @@ fn render_wake(notes: &[TerminalNote], overflow: u32) -> String {
     text
 }
 
-/// The single idempotent delivery path: claim the `delivered` flag (max
-/// one queued wake per input), drain the unseen-note queue, and fire the
-/// trigger with the rendered composite text. A failed claim means another
-/// deliverer already took the notes — return without firing. A successful
-/// claim with an EMPTY drain does not fire either: a razor-thin race
-/// (e.g. a flush and a debounce commit interleaving with a fresh push)
-/// can leave the claimant holding no notes; `delivered` stays `true` as
-/// conservative suppression until the next `note_input` re-arms the
-/// claim, and any note that landed in between stays queued — deferred,
-/// never lost.
+/// The single idempotent delivery path, drain FIRST / claim SECOND:
+/// drain the unseen-note queue, then claim the `delivered` flag (max
+/// one queued wake per input) and fire the trigger with the rendered
+/// composite text. An EMPTY drain returns WITHOUT claiming — a claim
+/// taken with nothing to deliver would sit as a phantom wake and
+/// strand every later terminal behind it (`delivered` set while idle
+/// is only recoverable through `note_input`; the empty-claim wedge). A
+/// LOSING claim — another deliverer won the flag while these notes
+/// were drained — re-queues the notes at the FRONT of the queue in
+/// original order (plus overflow) and returns without firing: the
+/// winner's wake is already on its way, and the pushed-back notes ride
+/// the next `note_input` chain flush. A losing claimant never strands
+/// notes.
 fn commit_delivery(inner: &Inner) {
+    let Some((notes, overflow)) = drain_notes(inner) else {
+        // Nothing to deliver: leave `delivered` untouched so a later
+        // terminal can still claim its own wake.
+        return;
+    };
     if inner.delivered.swap(true, Ordering::SeqCst) {
+        // Lost the claim: put the drained notes back at the FRONT (in
+        // original order) so they deliver ahead of anything newer.
+        with_notes(inner, |queue| {
+            for note in notes.into_iter().rev() {
+                queue.notes.push_front(note);
+            }
+            queue.overflow = queue.overflow.saturating_add(overflow);
+        });
         return;
     }
-    if let Some(text) = drain_rendered(inner) {
-        (inner.trigger)(&text);
+    let text = render_wake(&notes, overflow);
+    (inner.trigger)(&text);
+}
+
+/// Spawn the debounce task for the just-reserved window — the single
+/// spawn tail shared by `notify_terminal` (the window owner) and
+/// `ensure_armed` (the pause-expiry re-arm). After `interval`: pause
+/// gate → stale-generation guard → in-flight CAS → mid-commit pause
+/// check → [`commit_delivery`].
+fn spawn_debounce(inner: Arc<Inner>) {
+    let generation = inner.generation.load(Ordering::SeqCst);
+    tokio::spawn(async move {
+        tokio::time::sleep(inner.interval).await;
+        // Pause gate: `pause()` may have landed after this window was
+        // reserved (the reserve-just-before-pause race) — close the
+        // window WITHOUT delivering; the notes stay queued and deliver
+        // at the earlier of the next `note_input` flush or the pause's
+        // hold expiry (whose release task re-arms them).
+        if inner.paused.load(Ordering::SeqCst) {
+            inner.in_flight.store(false, Ordering::SeqCst);
+            return;
+        }
+        // Stale-window guard: if `note_input` canceled this window (a
+        // newer one may own the reservation), input supersedes the
+        // wake's TIMING, not its DELIVERY — deliver through the
+        // common idempotent path (unless an input-time flush already
+        // claimed the notes).
+        if inner.generation.load(Ordering::SeqCst) != generation {
+            commit_delivery(&inner);
+            return;
+        }
+        // Commit via CAS true→false: a lost race means `note_input`
+        // ran during the window — user input supersedes the wake's
+        // timing, so deliver anyway through the common path instead
+        // of dropping.
+        if inner
+            .in_flight
+            .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            commit_delivery(&inner);
+            return;
+        }
+        // Pause landed mid-commit (after the CAS closed the window):
+        // the window is closed; the notes stay queued for the hold's
+        // release task (or the next `note_input` flush, whichever
+        // comes first).
+        if inner.paused.load(Ordering::SeqCst) {
+            return;
+        }
+        commit_delivery(&inner);
+    });
+}
+
+/// Open a debounce window for unseen notes stranded with no live
+/// window — the pause-expiry recovery path. No-op when a wake is
+/// already queued and unconsumed (`delivered`: the next `note_input`
+/// chain flush covers the notes), when a window is already open
+/// (`in_flight`: its commit drains them), or when nothing is queued.
+fn ensure_armed(inner: &Arc<Inner>) {
+    if inner.delivered.load(Ordering::SeqCst) || inner.in_flight.load(Ordering::SeqCst) {
+        return;
+    }
+    let has_unseen = with_notes(inner, |queue| !queue.notes.is_empty() || queue.overflow > 0);
+    if !has_unseen {
+        return;
+    }
+    if !inner.in_flight.swap(true, Ordering::SeqCst) {
+        spawn_debounce(Arc::clone(inner));
     }
 }
 
 impl WakeScheduler {
-    /// Build a scheduler. `enabled: false` is the rollback gate — every
-    /// later entry point returns without spawning a task.
-    pub fn new(enabled: bool, interval: Duration, trigger: WakeTrigger) -> Self {
+    /// Build a scheduler. `interval` is the terminal→wake debounce
+    /// window; `hold` is the bounded `wait_for_user` wake hold — the
+    /// maximum time [`WakeScheduler::pause`] may defer delivery before
+    /// its release task clears the latch and re-arms a window.
+    /// `enabled: false` is the rollback gate — every later entry point
+    /// returns without spawning a task.
+    pub fn new(enabled: bool, interval: Duration, hold: Duration, trigger: WakeTrigger) -> Self {
         Self {
             inner: Arc::new(Inner {
                 enabled,
                 interval,
+                hold,
                 trigger,
                 in_flight: AtomicBool::new(false),
                 delivered: AtomicBool::new(false),
@@ -235,6 +341,7 @@ impl WakeScheduler {
                     overflow: 0,
                 }),
                 paused: AtomicBool::new(false),
+                pause_epoch: AtomicU64::new(0),
                 generation: AtomicU64::new(0),
             }),
         }
@@ -245,8 +352,9 @@ impl WakeScheduler {
     /// The terminal is ALWAYS recorded first: it is pushed into the
     /// bounded unseen-notes queue, so from here on it lives in exactly
     /// one place until a delivery renders it — nothing is dropped. Then,
-    /// in order: while the pause latch is set it reserves no window
-    /// (deferred; the next [`WakeScheduler::note_input`] flushes it);
+    /// in order: while the pause latch is held it reserves no window
+    /// (deferred; delivered at the earlier of the next
+    /// [`WakeScheduler::note_input`] flush or the hold's expiry);
     /// while a wake is already queued and unconsumed (`delivered`) it is
     /// likewise deferred into the queue and flushed as a chained
     /// composite at the next `note_input` (no window opens, no timer
@@ -269,8 +377,9 @@ impl WakeScheduler {
             },
         );
         // Pause latch: the note stays queued — no window is reserved and
-        // nothing fires; the next `note_input` flushes the queue right
-        // after the user's turn.
+        // nothing fires; delivery comes at the earlier of the next
+        // `note_input` flush (right after the user's turn) or the pause's
+        // hold expiry (whose release task re-arms a window).
         if inner.paused.load(Ordering::SeqCst) {
             return;
         }
@@ -286,79 +395,68 @@ impl WakeScheduler {
             return;
         }
         // This call owns the window: spawn the debounce task.
-        let inner = Arc::clone(&self.inner);
-        let generation = inner.generation.load(Ordering::SeqCst);
-        tokio::spawn(async move {
-            tokio::time::sleep(inner.interval).await;
-            // Pause gate: `pause()` may have landed after this window was
-            // reserved (the reserve-just-before-pause race) — close the
-            // window WITHOUT delivering; the notes stay queued and the
-            // next `note_input` flushes them.
-            if inner.paused.load(Ordering::SeqCst) {
-                inner.in_flight.store(false, Ordering::SeqCst);
-                return;
-            }
-            // Stale-window guard: if `note_input` canceled this window (a
-            // newer one may own the reservation), input supersedes the
-            // wake's TIMING, not its DELIVERY — deliver through the
-            // common idempotent path (unless an input-time flush already
-            // claimed the notes).
-            if inner.generation.load(Ordering::SeqCst) != generation {
-                commit_delivery(&inner);
-                return;
-            }
-            // Commit via CAS true→false: a lost race means `note_input`
-            // ran during the window — user input supersedes the wake's
-            // timing, so deliver anyway through the common path instead
-            // of dropping.
-            if inner
-                .in_flight
-                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-            {
-                commit_delivery(&inner);
-                return;
-            }
-            // Pause landed mid-commit (after the CAS closed the window):
-            // the window is closed; the notes stay queued for the next
-            // `note_input` flush.
-            if inner.paused.load(Ordering::SeqCst) {
-                return;
-            }
-            commit_delivery(&inner);
-        });
+        spawn_debounce(Arc::clone(inner));
     }
 
-    /// Pause wake delivery (P4). The caller is the `wait_for_user` tool's
-    /// injected hook: the orchestrator is handing control back to the
-    /// user, so background-child wakes must be held. Terminals landing
-    /// while paused are DEFERRED into the unseen-notes queue (no window,
-    /// no fire) and flushed by the next [`WakeScheduler::note_input`] —
-    /// delivered immediately after the user's next Submit, so while
-    /// paused the next Submit is external (the user's) by construction.
-    /// Harmless on a disabled scheduler.
+    /// Pause wake delivery (P4, bounded hold). The caller is the
+    /// `wait_for_user` tool's injected hook: the orchestrator is handing
+    /// control back to the user, so background-child wakes are held for
+    /// at most `hold`. Terminals landing while held are DEFERRED into
+    /// the unseen-notes queue (no window, no fire) and deliver at the
+    /// EARLIER of the next [`WakeScheduler::note_input`] (immediate
+    /// flush right after the user's Submit) or this hold's expiry (the
+    /// release task clears the latch and re-arms a window). A newer
+    /// pause supersedes an unexpired release via the pause epoch.
+    /// Harmless on a disabled scheduler — the rollback gate skips the
+    /// release task, so the latch simply stays set.
     pub fn pause(&self) {
-        self.inner.paused.store(true, Ordering::SeqCst);
+        let inner = &self.inner;
+        inner.paused.store(true, Ordering::SeqCst);
+        let epoch = inner.pause_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        if !inner.enabled {
+            return;
+        }
+        let task_inner = Arc::clone(inner);
+        tokio::spawn(async move {
+            tokio::time::sleep(task_inner.hold).await;
+            // Epoch guard: a newer pause (or a note_input) superseded
+            // this one — leave the FRESH latch set; the fresh pause's
+            // own release task owns the re-arm.
+            if task_inner.pause_epoch.load(Ordering::SeqCst) == epoch {
+                task_inner.paused.store(false, Ordering::SeqCst);
+            }
+            // Re-arm unconditionally, even when superseded: if
+            // `delivered` is set the note_input chain flush covers the
+            // notes; if a window is open its commit drains them; if a
+            // fresh pause holds, the debounce task's pause gate stays
+            // quiet and the fresh release re-arms.
+            ensure_armed(&task_inner);
+        });
     }
 
     /// Called on every Submit (user or wake). Clears the gate flags: any
     /// input consumes/obsoletes a queued wake, cancels a pending debounce
     /// (timing only — a canceled window's task still delivers through the
     /// common idempotent path), re-arms the scheduler for the next
-    /// terminal, and releases the P4 pause latch. Then flushes whatever
-    /// terminals accumulated unseen — queued while `delivered` (the
-    /// chained-delivery case) or while paused — through the SAME claim as
-    /// the debounce commit: the composite wake enqueues as an ordinary
-    /// Submit behind the input being processed, so the model learns about
-    /// every terminal right after this turn. The flush re-raises
-    /// `delivered` until that Submit's own `note_input` consumes it
-    /// (chaining is bounded: one extra Submit per consume).
+    /// terminal, and releases the P4 pause latch (retiring any pending
+    /// release task). Then flushes whatever terminals accumulated unseen
+    /// — queued while `delivered` (the chained-delivery case) or while
+    /// paused — through the SAME claim as the debounce commit: the
+    /// composite wake enqueues as an ordinary Submit behind the input
+    /// being processed, so the model learns about every terminal right
+    /// after this turn. The flush re-raises `delivered` until that
+    /// Submit's own `note_input` consumes it (chaining is bounded: one
+    /// extra Submit per consume).
     pub fn note_input(&self) {
         let inner = &self.inner;
         inner.generation.fetch_add(1, Ordering::SeqCst);
         inner.in_flight.store(false, Ordering::SeqCst);
         inner.delivered.store(false, Ordering::SeqCst);
         inner.paused.store(false, Ordering::SeqCst);
+        // Retire any release task from an older pause: it must not clear
+        // a FRESH pause's latch (this input already cleared `paused`
+        // itself, above).
+        inner.pause_epoch.fetch_add(1, Ordering::SeqCst);
         // The emptiness pre-check keeps a quiet Submit from re-raising
         // `delivered`; the swap claim inside `commit_delivery` is the
         // real double-delivery lock.
@@ -374,6 +472,10 @@ mod tests {
     use super::*;
 
     const INTERVAL: Duration = Duration::from_millis(1000);
+    /// Bounded pause hold used by every pause-family test: long enough
+    /// to pin quiet-inside-the-window behavior with intermediate
+    /// `elapse` steps, short enough to reach expiry quickly.
+    const HOLD: Duration = Duration::from_secs(5);
 
     /// Build an enabled scheduler whose trigger records every delivered
     /// wake text on an unbounded channel.
@@ -382,7 +484,7 @@ mod tests {
         let trigger: WakeTrigger = Arc::new(move |text: &str| {
             let _ = tx.send(text.to_string());
         });
-        (WakeScheduler::new(enabled, INTERVAL, trigger), rx)
+        (WakeScheduler::new(enabled, INTERVAL, HOLD, trigger), rx)
     }
 
     /// Advance virtual time past `interval` and run everything scheduled up
@@ -561,15 +663,25 @@ mod tests {
             "paused terminal must not reserve a debounce window"
         );
 
-        elapse(Duration::from_secs(10)).await;
-        assert!(fired(&mut rx).is_empty(), "no delivery while paused");
+        // Inside the hold window: quiet — no delivery, no timer.
+        elapse(Duration::from_secs(2)).await;
+        assert!(fired(&mut rx).is_empty(), "no delivery while held");
 
-        // The next note_input flushes the deferred wake immediately.
-        sched.note_input();
-        elapse(INTERVAL).await;
+        // At hold expiry the release task clears the latch and re-arms a
+        // window (ensure_armed): the wake commits one INTERVAL later with
+        // NO Submit at all — the unattended-run recovery path.
+        elapse(HOLD).await;
         let fires = fired(&mut rx);
-        assert_eq!(fires.len(), 1, "deferred notes flushed: {fires:?}");
+        assert_eq!(
+            fires.len(),
+            1,
+            "held notes delivered at hold expiry: {fires:?}"
+        );
         assert!(fires[0].contains("a-1"));
+
+        // Exactly one delivery — the queue was drained.
+        elapse(Duration::from_secs(10)).await;
+        assert!(fired(&mut rx).is_empty(), "no delayed second fire");
     }
 
     #[tokio::test(start_paused = true)]
@@ -635,7 +747,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn pause_during_open_window_defers_until_note_input() {
+    async fn pause_during_open_window_defers_until_hold_expiry() {
         let (sched, mut rx) = scheduler(true);
         // The window is open (timer parked at t=0); pause lands INSIDE it,
         // before the debounce commits — pinned synchronously so the paused
@@ -645,33 +757,36 @@ mod tests {
         elapse(INTERVAL).await;
         assert!(
             fired(&mut rx).is_empty(),
-            "pause during the window defers the wake"
+            "pause during the window closes it without delivering"
         );
 
-        // Still paused: a second terminal queues as an unseen note and
-        // still reserves no window.
-        sched.notify_terminal("a-2", "completed", "still paused");
+        // Still inside the hold: a second terminal queues as an unseen
+        // note and still reserves no window.
+        sched.notify_terminal("a-2", "completed", "still held");
         assert!(
             !sched.inner.in_flight.load(Ordering::SeqCst),
-            "paused terminal must not reserve a debounce window"
+            "held terminal must not reserve a debounce window"
         );
-        elapse(INTERVAL).await;
-        assert!(fired(&mut rx).is_empty(), "defer holds until note_input");
+        elapse(Duration::from_secs(2)).await;
+        assert!(
+            fired(&mut rx).is_empty(),
+            "hold is quiet until expiry (or note_input)"
+        );
 
-        // note_input releases the latch and flushes the queue — BOTH
-        // deferred terminals ride the composite.
-        sched.note_input();
+        // Hold expiry: the release task clears the latch and re-arms —
+        // BOTH deferred terminals ride the composite, no Submit needed.
+        elapse(HOLD).await;
         let fires = fired(&mut rx);
-        assert_eq!(fires.len(), 1, "flushed on note_input: {fires:?}");
+        assert_eq!(fires.len(), 1, "delivered at hold expiry: {fires:?}");
         assert!(
             fires[0].contains("a-1") && fires[0].contains("a-2"),
-            "composite flush carries both deferred terminals"
+            "composite carries both deferred terminals"
         );
 
-        // Consume the flushed wake (the Submit choke point); the scheduler
-        // is re-armed.
+        // The delivered wake is consumed by the next note_input; the
+        // scheduler is re-armed.
         sched.note_input();
-        sched.notify_terminal("b-2", "completed", "after the user spoke");
+        sched.notify_terminal("b-2", "completed", "after the wake");
         elapse(INTERVAL).await;
         let fires = fired(&mut rx);
         assert_eq!(fires.len(), 1, "re-armed after note_input: {fires:?}");
@@ -701,6 +816,48 @@ mod tests {
         let fires = fired(&mut rx);
         assert_eq!(fires.len(), 1, "note_input un-pauses: {fires:?}");
         assert!(fires[0].contains("c-1"));
+
+        // The pause's release task (parked since t=0) was retired by the
+        // note_input epoch bump: it wakes at HOLD, clears nothing, and
+        // its ensure_armed is a no-op — no duplicate fire ever lands.
+        elapse(HOLD).await;
+        assert!(
+            fired(&mut rx).is_empty(),
+            "retired release task never duplicates a wake"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn newer_pause_supersedes_unexpired_release() {
+        let (sched, mut rx) = scheduler(true);
+        sched.pause();
+        sched.notify_terminal("a-1", "completed", "held");
+
+        // Inside the first hold a SECOND pause lands: its epoch bump
+        // retires the first release task and restarts the hold clock.
+        elapse(Duration::from_secs(2)).await;
+        sched.pause();
+
+        // The first release (due at t=5s) fires inside this elapse: the
+        // epoch check leaves the FRESH latch set. Its ensure_armed opens
+        // a window, but the debounce task's pause gate closes it without
+        // delivering — still quiet at t≈7.1s.
+        elapse(HOLD).await;
+        assert!(
+            fired(&mut rx).is_empty(),
+            "superseded release must not deliver"
+        );
+
+        // The fresh pause's own release (due at t≈7.05s) has cleared the
+        // latch and armed a window: the wake commits one INTERVAL later.
+        elapse(INTERVAL).await;
+        let fires = fired(&mut rx);
+        assert_eq!(
+            fires.len(),
+            1,
+            "delivered at the FRESH hold's expiry: {fires:?}"
+        );
+        assert!(fires[0].contains("a-1"));
     }
 
     #[tokio::test(start_paused = true)]
@@ -713,6 +870,12 @@ mod tests {
         assert!(
             !sched.inner.in_flight.load(Ordering::SeqCst),
             "no window reserved when disabled"
+        );
+        // The rollback gate also covers the release task: none was
+        // spawned, so the latch stays set even far past the hold.
+        assert!(
+            sched.inner.paused.load(Ordering::SeqCst),
+            "disabled pause spawns no release task — latch stays set"
         );
 
         // Even the un-pause path stays inert on a disabled scheduler.

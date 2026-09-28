@@ -215,7 +215,13 @@ fn wake_channel(interval: Duration) -> (WakeScheduler, mpsc::UnboundedReceiver<S
     let trigger: WakeTrigger = Arc::new(move |text: &str| {
         let _ = tx.send(text.to_string());
     });
-    (WakeScheduler::new(true, interval, trigger), rx)
+    (
+        // Hold far beyond every in-test wait (assert_silent windows are
+        // ≤ COALESCE_INTERVAL × 2 of real time) so the P4 defer test
+        // keeps its flushed-by-note_input semantics.
+        WakeScheduler::new(true, interval, Duration::from_secs(60), trigger),
+        rx,
+    )
 }
 
 fn spawn_request(

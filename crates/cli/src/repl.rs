@@ -1888,7 +1888,8 @@ impl Repl {
         // applies to spawn defaults).
         let wake_scheduler = self.runtime.config().subagent.wake.enabled.then(|| {
             let interval = Duration::from_millis(self.runtime.config().subagent.wake.interval_ms);
-            WakeScheduler::new(true, interval, wake_submit_trigger(cmd_tx.clone()))
+            let hold = Duration::from_millis(self.runtime.config().subagent.wake.hold_ms);
+            WakeScheduler::new(true, interval, hold, wake_submit_trigger(cmd_tx.clone()))
         });
 
         // P4 `wait_for_user`: registration IS the top-level gate — child

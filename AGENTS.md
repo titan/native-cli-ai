@@ -176,8 +176,8 @@ Built in `core::harness::build_system_prompt_with_agent` (accepts an optional `A
 | `crates/runtime/src/supervisor.rs` | Session lifecycle supervisor, `apply_agent_profile`, `register_skill_agents` |
 | `crates/runtime/src/context_manager.rs` | Token tracking, auto-summarize, sliding window |
 | `crates/runtime/src/subagent.rs` | Subagent spawning and management |
-| `crates/runtime/src/wake_scheduler.rs` | P3 wake scheduler (debounced parent wake on background-child terminal); P4 pause latch DEFERS terminals (pending slot flushed at the next Submit) — todo mute gate removed |
-| `crates/core/src/tools/wait_for_user.rs` | P4 non-blocking turn-end signal: defers wake delivery (held, delivered right after the user's next Submit) |
+| `crates/runtime/src/wake_scheduler.rs` | P3 wake scheduler (debounced parent wake on background-child terminal); P4 pause latch holds terminals for a bounded grace (`hold_ms`, default 30s) or until the next Submit, whichever comes first — todo mute gate removed |
+| `crates/core/src/tools/wait_for_user.rs` | P4 non-blocking turn-end signal: defers wake delivery (held for the `[subagent.wake] hold_ms` grace or until the user's next Submit, whichever comes first) |
 | `crates/runtime/src/worktree.rs` | Git worktree creation and cleanup |
 | `crates/runtime/src/memory_store.rs` | Workspace memory persistence |
 | `crates/cli/src/main.rs` | Binary entrypoint |

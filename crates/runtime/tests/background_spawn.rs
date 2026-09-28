@@ -150,7 +150,14 @@ fn wake_channel() -> (WakeScheduler, mpsc::UnboundedReceiver<String>) {
         let _ = tx.send(text.to_string());
     });
     (
-        WakeScheduler::new(true, Duration::from_millis(50), trigger),
+        WakeScheduler::new(
+            true,
+            Duration::from_millis(50),
+            // Hold far beyond every in-test wait so pause behavior (never
+            // exercised here) stays out of the picture.
+            Duration::from_secs(60),
+            trigger,
+        ),
         rx,
     )
 }
