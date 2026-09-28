@@ -1026,6 +1026,33 @@ fn apply_child_routing(
     }
 }
 
+/// Render a `panic!` payload (`Box<dyn Any + Send>`) as a readable
+/// message. `panic!("literal")` produces a `&'static str` payload and
+/// `panic!("fmt {x}")` produces a `String` — both are surfaced verbatim;
+/// any other payload type falls back to a generic label.
+fn describe_panic_payload(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
+/// Readable message for a [`tokio::task::JoinError`] returned by joining
+/// a child run task: a real panic surfaces its payload via
+/// [`describe_panic_payload`]; a cancelled/aborted task carries no payload
+/// (`into_panic` would itself panic) and reports its own label. Used by
+/// the background-arm panic guard in [`spawn_subagent_consumer`].
+fn panic_message(join: tokio::task::JoinError) -> String {
+    if join.is_panic() {
+        describe_panic_payload(join.into_panic())
+    } else {
+        "task was cancelled".to_string()
+    }
+}
+
 /// Spawns a background task that consumes spawn requests from the sub-agent tool
 /// and runs child sessions. Each child session inherits parent context — both
 /// the text summary and any images are taken from the live `parent_history`
@@ -1208,8 +1235,83 @@ pub fn spawn_subagent_consumer(
                                 .alias
                                 .clone()
                                 .unwrap_or_else(|| prepared.child_id.clone());
+                            // Panic-guard snapshot, taken BEFORE `sup`/
+                            // `prepared` move into the inner run task
+                            // below: everything the join-error path needs
+                            // once the run task has (possibly) died inside.
+                            // Mirrors the meta snapshot
+                            // `run_prepared_child` takes before dropping
+                            // the supervisor.
+                            let panic_child_id = prepared.child_id.clone();
+                            let panic_generation = prepared.generation;
+                            let panic_workspace = sup.workspace_root.display().to_string();
+                            let panic_branch = sup.branch.clone();
+                            let panic_worktree =
+                                sup.worktree_path.as_ref().map(|p| p.display().to_string());
                             tokio::spawn(async move {
-                                let result = run_prepared_child(sup, prepared).await;
+                                // Panic guard: run the child on an INNER
+                                // task and join the handle. A plain
+                                // `run_prepared_child(sup, prepared).await`
+                                // would detach the run's own JoinHandle —
+                                // a panic inside it would be silently
+                                // swallowed, losing the terminal registry
+                                // fold, the `ChildSessionStatusChanged`
+                                // and `ChildSessionCompleted` events, and
+                                // the parent wake below: the registry
+                                // entry would show `Running` forever and
+                                // an idle parent would sleep through its
+                                // finished child (the "sub-agent done but
+                                // parent never wakes" wedge). Joining
+                                // lets this arm fold the terminal state
+                                // itself on panic/abort, so
+                                // `complete_child_request` and the wake
+                                // hook run for EVERY outcome.
+                                let run = tokio::spawn(run_prepared_child(sup, prepared));
+                                let result = match run.await {
+                                    Ok(result) => result,
+                                    Err(join) => {
+                                        let panicked = join.is_panic();
+                                        let detail = panic_message(join);
+                                        let output = if panicked {
+                                            format!("child task panicked: {detail}")
+                                        } else {
+                                            format!("child task aborted: {detail}")
+                                        };
+                                        // Mirror `run_prepared_child`'s
+                                        // terminal fold (registry + status
+                                        // event) so the child lands
+                                        // `Failed`, never stuck `Running`.
+                                        let result_summary =
+                                            terminal_result_summary("error", &output, None);
+                                        registry.record_terminal(
+                                            &panic_child_id,
+                                            ChildSessionState::Failed,
+                                            result_summary.clone(),
+                                        );
+                                        if let Some(ref tx) = tx {
+                                            let _ = tx
+                                                .send(AgentEvent::ChildSessionStatusChanged {
+                                                    parent_session_id: parent.clone(),
+                                                    child_session_id: panic_child_id.clone(),
+                                                    state: ChildSessionState::Failed,
+                                                    generation: panic_generation,
+                                                    alias: registry
+                                                        .get(&panic_child_id)
+                                                        .and_then(|e| e.alias),
+                                                    result_summary,
+                                                })
+                                                .await;
+                                        }
+                                        ChildSessionResult {
+                                            child_session_id: panic_child_id,
+                                            status: "error".into(),
+                                            output,
+                                            workspace: panic_workspace,
+                                            branch: panic_branch,
+                                            worktree_path: panic_worktree,
+                                        }
+                                    }
+                                };
                                 complete_child_request(
                                     &result,
                                     &parent,
@@ -1361,6 +1463,67 @@ mod tests {
             summary.chars().rev().take(3).collect::<String>()
         );
         assert!(summary.ends_with('…'));
+    }
+
+    // ── panic guard helpers (background-arm JoinHandle guard) ──────
+
+    /// Run `f` with the process-global panic hook silenced so deliberate
+    /// panics don't spam test output; the previous hook is restored after.
+    fn with_silent_panic_hook<T>(f: impl FnOnce() -> T) -> T {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let out = f();
+        std::panic::set_hook(prev);
+        out
+    }
+
+    #[test]
+    fn describe_panic_payload_reads_real_panic_payloads() {
+        // The two payload shapes std actually produces: `panic!("literal")`
+        // yields `&'static str`, `panic!("fmt {}", ..)` yields `String`.
+        let (static_str, formatted) = with_silent_panic_hook(|| {
+            let s = std::panic::catch_unwind(|| panic!("static boom")).expect_err("must unwind");
+            let f =
+                std::panic::catch_unwind(|| panic!("formatted {}", 7)).expect_err("must unwind");
+            (s, f)
+        });
+        assert_eq!(describe_panic_payload(static_str), "static boom");
+        assert_eq!(describe_panic_payload(formatted), "formatted 7");
+    }
+
+    #[test]
+    fn describe_panic_payload_falls_back_for_exotic_payloads() {
+        // A non-message payload (e.g. panic_any) must not wedge the guard —
+        // the generic label surfaces instead.
+        let payload: Box<dyn std::any::Any + Send> = Box::new(42_i32);
+        assert_eq!(describe_panic_payload(payload), "unknown panic payload");
+    }
+
+    #[tokio::test]
+    async fn panic_message_reads_panic_from_a_real_task() {
+        // The panic hook fires when the spawned task is polled (during the
+        // await), so silence it across the await point, not around a closure.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let handle = tokio::spawn(async { panic!("inner boom") });
+        let join_err = handle.await.expect_err("panicking task must join Err");
+        let (panicked, message) = (join_err.is_panic(), panic_message(join_err));
+        std::panic::set_hook(prev);
+        assert!(panicked, "a real panic must report is_panic()");
+        assert_eq!(message, "inner boom");
+    }
+
+    #[tokio::test]
+    async fn panic_message_labels_aborted_task_without_panicking() {
+        // An aborted task's JoinError carries NO panic payload —
+        // `into_panic()` would panic there; `panic_message` must not.
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        handle.abort();
+        let join_err = handle.await.expect_err("aborted task must join Err");
+        assert!(!join_err.is_panic());
+        assert_eq!(panic_message(join_err), "task was cancelled");
     }
 
     /// The child's first user message must NOT inline the specialist
