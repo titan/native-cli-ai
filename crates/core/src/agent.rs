@@ -188,6 +188,14 @@ impl AgentLoop {
         self.provider = provider;
     }
 
+    /// Reset the session-scoped repeat-call guard. Called by the supervisor's
+    /// `reset_for_new_session` (`/new`): a fresh session starts with fresh
+    /// identical-call escalation state, since this loop instance outlives the
+    /// session it was built for.
+    pub fn reset_repeat_guard(&mut self) {
+        self.repeat_guard.reset_session();
+    }
+
     /// Run one turn: send messages to the provider, execute any tool calls,
     /// and repeat until the provider returns a final text response.
     pub async fn run_turn(
@@ -752,6 +760,37 @@ mod tests {
             agent.repeat_guard.record("wait_for_user", &input),
             RepeatAction::Hint(_)
         ));
+    }
+
+    // `/new` regression seam: the supervisor reuses this AgentLoop across
+    // sessions, so `reset_repeat_guard` must clear the session-scoped
+    // identical-call counts (the runtime wiring calls it from
+    // `reset_for_new_session`).
+    #[test]
+    fn reset_repeat_guard_clears_session_scoped_counts() {
+        use crate::tool_guards::RepeatAction;
+
+        let (provider, _calls) = ScriptedProvider::new(Vec::new());
+        let mut agent = test_agent(Arc::new(provider));
+
+        let input = serde_json::json!({"path": "same"});
+        for _ in 0..8 {
+            let _ = agent.repeat_guard.record("read_file", &input);
+        }
+        assert!(
+            matches!(
+                agent.repeat_guard.record("read_file", &input),
+                RepeatAction::Stop(_)
+            ),
+            "burn-in must reach the hard stop"
+        );
+
+        agent.reset_repeat_guard();
+        assert_eq!(
+            agent.repeat_guard.record("read_file", &input),
+            RepeatAction::Proceed,
+            "fresh session must restore first-call behavior"
+        );
     }
 
     fn tc(id: &str) -> MessageToolCall {

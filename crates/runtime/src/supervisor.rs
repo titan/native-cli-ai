@@ -2322,6 +2322,10 @@ impl Supervisor {
         self.session_id = generate_session_id();
         self.agent.messages.clear();
         self.rebuild_system_prompt();
+        // Fresh session = fresh tool-call escalation state. This loop instance
+        // is reused across `/new`; without this, identical-call counts burned
+        // by the previous session hard-stop the same call in the new one.
+        self.agent.reset_repeat_guard();
         self.child_session_ids.clear();
         self.parent_session_id = None;
         self.inherited_summary = None;

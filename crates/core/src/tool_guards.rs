@@ -173,6 +173,17 @@ impl RepeatCallGuard {
     pub fn reset_turn(&mut self) {
         self.wait_turn_runs.clear();
     }
+
+    /// Reset all guard state (generic identical-call counts included).
+    ///
+    /// Called by the runtime supervisor when a NEW session starts in-process
+    /// (`/new`): the same `AgentLoop` is reused, but a fresh session must not
+    /// inherit the previous session's escalation state — a call the old
+    /// session burned to the Stop threshold would otherwise be hard-stopped
+    /// on its first legitimate use in the new session.
+    pub fn reset_session(&mut self) {
+        *self = Self::new();
+    }
 }
 
 impl Default for RepeatCallGuard {
@@ -344,5 +355,30 @@ mod tests {
             guard.record("ask_question", &input),
             RepeatAction::Hint(_)
         ));
+    }
+
+    #[test]
+    fn reset_session_restores_first_call_behavior() {
+        // `/new` regression: the guard lives on a reused AgentLoop, so its
+        // counts must be cleared at the session boundary. Burn a key past the
+        // Stop threshold, reset, and the same key proceeds again from 1.
+        let mut guard = RepeatCallGuard::new();
+        let input = json!({"path": "x"});
+        for _ in 0..8 {
+            let _ = guard.record("read_file", &input);
+        }
+        assert!(matches!(
+            guard.record("read_file", &input),
+            RepeatAction::Stop(_)
+        ));
+
+        guard.reset_session();
+        assert_eq!(guard.record("read_file", &input), RepeatAction::Proceed);
+
+        // Wait-tool per-turn state is cleared too: first wait proceeds.
+        assert_eq!(
+            guard.record("wait_for_user", &json!({})),
+            RepeatAction::Proceed
+        );
     }
 }
