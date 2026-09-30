@@ -104,6 +104,7 @@ fn entry(provider: Option<ProviderKind>, model: Option<&str>) -> PlanEntry {
     PlanEntry {
         provider,
         model: model.map(str::to_string),
+        fallback: None,
     }
 }
 
@@ -537,4 +538,103 @@ async fn orchestrator_entry_with_specialist_active_updates_base_only() {
     sup.apply_agent_profile(None).expect("switch to default");
     assert_eq!(sup.config().provider.default, ProviderKind::Kimi);
     assert!(!sup.config().agents.contains_key("orchestrator"));
+}
+
+/// Per-agent fallback integration (`/plan` schema): a plan entry's `fallback`
+/// pins into the covered agent's profile (surviving switches and spawns via
+/// the profile table), while the reserved `orchestrator` key writes the
+/// GLOBAL `[fallback]` — base routing has no profile. Semantic A: an
+/// explicit chain enables failover without the global master switch.
+#[tokio::test(flavor = "multi_thread")]
+async fn plan_pins_per_agent_fallback_chain() {
+    let (_env, ws) = env_and_ws();
+    let mut config = base_config();
+    // Global fallback stays OFF — the per-agent chain must still work.
+    assert!(!config.fallback.enabled);
+    config.plans.insert(
+        "resilient".into(),
+        BTreeMap::from([
+            (
+                "fixer".into(),
+                PlanEntry {
+                    fallback: Some(vec!["zhipuai:glm-5.3".into(), "kimi".into()]),
+                    ..entry(Some(ProviderKind::ZhipuAI), Some("glm-5.3-flash"))
+                },
+            ),
+            (
+                "orchestrator".into(),
+                PlanEntry {
+                    fallback: Some(vec!["kimi".into()]),
+                    ..entry(Some(ProviderKind::ZhipuAI), None)
+                },
+            ),
+        ]),
+    );
+    let mut sup = sup(ws.path(), config).await;
+
+    let outcome = sup.apply_plan("resilient").expect("apply");
+
+    // fixer: chain pinned into the profile entry (the spawn-time inheritance
+    // path — children read the profile from live_config).
+    assert_eq!(
+        sup.config()
+            .agents
+            .get("fixer")
+            .and_then(|p| p.fallback.clone()),
+        Some(vec!["zhipuai:glm-5.3".to_string(), "kimi".to_string()]),
+        "per-agent chain must be pinned into [agents.fixer]"
+    );
+    // orchestrator: base routing has no profile — the chain goes global and
+    // enables failover (semantic A).
+    assert!(sup.config().fallback.enabled);
+    assert_eq!(sup.config().fallback.chain, vec!["kimi".to_string()]);
+
+    // Outcome reports the chains for /plan display.
+    let fixer_change = outcome
+        .changes
+        .iter()
+        .find(|c| c.agent == "fixer")
+        .expect("fixer change");
+    assert_eq!(
+        fixer_change.fallback,
+        Some(vec!["zhipuai:glm-5.3".to_string(), "kimi".to_string()])
+    );
+
+    // The pinned profile chain survives a persona round-trip (rebuild from
+    // base_config must not drop the pin).
+    sup.apply_agent_profile(Some("fixer"))
+        .expect("switch to fixer");
+    sup.apply_agent_profile(None).expect("switch back");
+    assert_eq!(
+        sup.config()
+            .agents
+            .get("fixer")
+            .and_then(|p| p.fallback.clone()),
+        Some(vec!["zhipuai:glm-5.3".to_string(), "kimi".to_string()]),
+        "profile fallback pin must survive persona switches"
+    );
+}
+
+/// A plan entry WITHOUT `fallback` leaves the agent's existing chain pin
+/// untouched (plans are partial overrides, same as provider/model).
+#[tokio::test(flavor = "multi_thread")]
+async fn plan_entry_without_fallback_leaves_chain_untouched() {
+    let (_env, ws) = env_and_ws();
+    let mut config = base_config();
+    config.agents.get_mut("fixer").unwrap().fallback = Some(vec!["kimi".into()]);
+    config.plans.insert(
+        "retarget".into(),
+        BTreeMap::from([("fixer".into(), entry(Some(ProviderKind::Kimi), Some("k3")))]),
+    );
+    let mut sup = sup(ws.path(), config).await;
+
+    sup.apply_plan("retarget").expect("apply");
+    assert_eq!(
+        sup.config()
+            .agents
+            .get("fixer")
+            .and_then(|p| p.fallback.clone()),
+        Some(vec!["kimi".to_string()]),
+        "fallback: None must not clear an existing chain pin"
+    );
 }

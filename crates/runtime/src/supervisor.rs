@@ -593,6 +593,9 @@ pub struct PlanRouteChange {
     /// Resulting model pin, `None` when the agent inherits the provider's
     /// default model.
     pub model: Option<String>,
+    /// Resulting per-agent fallback chain pin (`provider` / `provider:model`
+    /// entries), `None` when the plan left the chain untouched.
+    pub fallback: Option<Vec<String>>,
 }
 
 /// Summary of a successful [`Supervisor::apply_plan`], consumed by the CLI
@@ -2047,6 +2050,16 @@ impl Supervisor {
             if let Some(mode) = p.permission_mode {
                 effective.permissions.mode = mode;
             }
+            // Per-agent fallback chain (plan/profile schema, semantic A):
+            // `Some` implies failover enabled for this agent — no global
+            // `[fallback].enabled` needed. `None` keeps the global settings.
+            // Transient by design: the pin lives in `[agents.<name>]`, which
+            // is what children inherit via live_config; the effective fold
+            // only shapes THIS session's provider build.
+            if let Some(ref chain) = p.fallback {
+                effective.fallback.enabled = true;
+                effective.fallback.chain = chain.clone();
+            }
         }
 
         // Rebuild provider if config changed.
@@ -2217,6 +2230,14 @@ impl Supervisor {
                     let resolved = self.config.model.resolve_alias(model);
                     self.config.apply_model_override(&resolved);
                 }
+                // The orchestrator key owns the BASE routing, and base
+                // routing has no profile — its fallback chain IS the global
+                // `[fallback]`. Semantic A: an explicit chain enables
+                // failover for every agent without its own pin.
+                if let Some(chain) = &entry.fallback {
+                    self.config.fallback.enabled = true;
+                    self.config.fallback.chain = chain.clone();
+                }
                 // Reserved-name hygiene: an older `/plan` wrote the
                 // orchestrator pin as a real `[agents.orchestrator]` profile.
                 // Such a stale entry shadows this base retarget forever —
@@ -2237,10 +2258,12 @@ impl Supervisor {
                 // persona switch.
                 self.base_config.provider = self.config.provider.clone();
                 self.base_config.model = self.config.model.clone();
+                self.base_config.fallback = self.config.fallback.clone();
                 changes.push(PlanRouteChange {
                     agent: agent.clone(),
                     provider: Some(self.config.provider.default),
                     model: Some(self.config.provider.active_model().to_string()),
+                    fallback: entry.fallback.clone(),
                 });
                 continue;
             }
@@ -2258,10 +2281,14 @@ impl Supervisor {
                 None if entry.provider.is_some() => profile.model = None,
                 None => {}
             }
+            if let Some(chain) = &entry.fallback {
+                profile.fallback = Some(chain.clone());
+            }
             changes.push(PlanRouteChange {
                 agent: agent.clone(),
                 provider: profile.provider,
                 model: profile.model.clone(),
+                fallback: profile.fallback.clone(),
             });
         }
 

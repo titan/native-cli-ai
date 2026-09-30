@@ -2582,11 +2582,15 @@ fn format_restart_ghost_wake(ghosts: &[nca_runtime::supervisor::RestartGhost]) -
 /// (shown as just the provider), a model-only entry keeps the agent's
 /// existing provider pin (shown as just the model).
 fn plan_entry_summary(entry: &PlanEntry) -> String {
-    match (entry.provider, entry.model.as_deref()) {
+    let route = match (entry.provider, entry.model.as_deref()) {
         (Some(p), Some(m)) => format!("{}/{}", p.display_name().to_lowercase(), m),
         (Some(p), None) => p.display_name().to_lowercase(),
         (None, Some(m)) => m.to_string(),
         (None, None) => "(inherit)".to_string(),
+    };
+    match &entry.fallback {
+        Some(chain) => format!("{route} ↤ {}", chain.join(" → ")),
+        None => route,
     }
 }
 
@@ -2599,7 +2603,11 @@ fn plan_change_summary(config: &NcaConfig, change: &PlanRouteChange) -> String {
         .model
         .clone()
         .unwrap_or_else(|| config.provider.model_for(provider).to_string());
-    format!("{}/{}", provider.display_name().to_lowercase(), model)
+    let route = format!("{}/{}", provider.display_name().to_lowercase(), model);
+    match &change.fallback {
+        Some(chain) => format!("{route} ↤ {}", chain.join(" → ")),
+        None => route,
+    }
 }
 
 fn build_model_picker_entries(

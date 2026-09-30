@@ -81,11 +81,16 @@ pub fn build_provider_with_events(
 /// Resolve the `[fallback]` chain into built entries. `None` when fallback
 /// is disabled or the chain resolves to nothing after skipping.
 ///
-/// Entries are parsed with [`ProviderKind::from_cli_name`] (strict: unknown
-/// names fail loudly) and built with the same factory as the primary.
-/// Entries matching the primary provider or repeating an earlier entry are
-/// skipped — a provider that just failed is not retried immediately. Each
-/// fallback provider uses its own configured model.
+/// Entries are `provider` or `provider:model` (e.g. `zhipuai:glm-5.3-flash`):
+/// a pinned model is baked into that entry's provider at build time, so a
+/// failover keeps the intended model tier instead of landing on the
+/// provider's configured default. Providers are parsed with
+/// [`ProviderKind::from_cli_name`] (strict: unknown names fail loudly) and
+/// built with the same factory as the primary. An entry duplicating an
+/// earlier TARGET — same provider AND same effective model, the primary
+/// included — is skipped: an identical target reproduces the same failure.
+/// Same provider with a DIFFERENT model is kept (tier chains like
+/// `zhipuai:glm-5.3-flash → zhipuai:glm-5.3`).
 fn resolve_fallback_entries(
     config: &NcaConfig,
 ) -> Result<Option<Vec<FallbackEntry>>, ProviderError> {
@@ -93,25 +98,44 @@ fn resolve_fallback_entries(
         return Ok(None);
     }
     let mut entries: Vec<FallbackEntry> = Vec::with_capacity(config.fallback.chain.len());
-    let mut seen_kinds = vec![config.provider.default];
+    let mut seen: Vec<(ProviderKind, String)> = vec![(
+        config.provider.default,
+        config.provider.active_model().to_string(),
+    )];
     for raw in &config.fallback.chain {
-        let Some(kind) = ProviderKind::from_cli_name(raw) else {
+        let (provider_name, model_pin) = match raw.split_once(':') {
+            Some((p, m)) if !m.is_empty() => (p, Some(m)),
+            _ => (raw.as_str(), None),
+        };
+        let Some(kind) = ProviderKind::from_cli_name(provider_name) else {
             return Err(ProviderError::Configuration(format!(
                 "[fallback] chain entry {raw:?} is not a known provider name"
             )));
         };
-        if seen_kinds.contains(&kind) {
+        let effective_model = model_pin
+            .map(str::to_string)
+            .unwrap_or_else(|| config.provider.model_for(kind).to_string());
+        if seen.contains(&(kind, effective_model.clone())) {
             tracing::warn!(
                 entry = raw,
-                "[fallback] chain entry duplicates an earlier provider; skipping"
+                "[fallback] chain entry duplicates an earlier target (same provider and model); skipping"
             );
             continue;
         }
-        seen_kinds.push(kind);
-        entries.push(FallbackEntry {
-            name: kind.display_name().to_string(),
-            provider: build_provider_for(config, kind)?,
-        });
+        seen.push((kind, effective_model.clone()));
+        let provider = match model_pin {
+            Some(model) => {
+                let mut pinned = config.clone();
+                pinned.provider.set_model_for(kind, model);
+                build_provider_for(&pinned, kind)?
+            }
+            None => build_provider_for(config, kind)?,
+        };
+        let name = match model_pin {
+            Some(model) => format!("{}({model})", kind.display_name()),
+            None => kind.display_name().to_string(),
+        };
+        entries.push(FallbackEntry { name, provider });
     }
     Ok(Some(entries).filter(|entries| !entries.is_empty()))
 }
@@ -473,6 +497,73 @@ mod tests {
             .expect("non-empty");
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["OpenAI", "Kimi"], "primary + dup skipped");
+    }
+
+    // `provider:model` entries pin the tier into the built provider and are
+    // named with the model so ProviderFallback events show what took over.
+    // Same provider + DIFFERENT model = distinct failover target (tier
+    // chains: glm-5.3-flash → glm-5.3 on the same coding plan).
+    #[test]
+    fn fallback_pinned_model_entries_form_tier_chain() {
+        let mut config = NcaConfig::default();
+        config.provider.deepseek.api_key = Some("deepseek-key".into());
+        config.provider.zhipuai.api_key = Some("zhipuai-key".into());
+        config.provider.kimi.api_key = Some("kimi-key".into());
+        config.fallback.enabled = true;
+        config.fallback.chain = vec![
+            "zhipuai:glm-5.3-flash".into(),
+            "zhipuai:glm-5.3".into(),
+            "kimi".into(),
+        ];
+        let entries = resolve_fallback_entries(&config)
+            .expect("chain resolves")
+            .expect("non-empty");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["ZhipuAI(glm-5.3-flash)", "ZhipuAI(glm-5.3)", "Kimi"],
+            "same-provider different-model entries must both survive"
+        );
+    }
+
+    // Dedup keys on (provider, effective model): the primary's exact target
+    // and identical repeats are skipped — retrying an identical target
+    // reproduces the same failure.
+    #[test]
+    fn fallback_identical_target_deduped() {
+        let mut config = NcaConfig::default();
+        config.provider.deepseek.api_key = Some("deepseek-key".into());
+        config.provider.zhipuai.api_key = Some("zhipuai-key".into());
+        config.fallback.enabled = true;
+        config.fallback.chain = vec![
+            "deepseek".into(), // == primary (default model)
+            "zhipuai:glm-5.3".into(),
+            "zhipuai:glm-5.3".into(), // identical repeat
+        ];
+        let entries = resolve_fallback_entries(&config)
+            .expect("chain resolves")
+            .expect("non-empty");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["ZhipuAI(glm-5.3)"]);
+    }
+
+    // A pinned model equal to the PRIMARY's exact target is skipped: the
+    // primary is zhipuai and the entry pins zhipuai with the same configured
+    // model — an identical target that would reproduce the same failure.
+    #[test]
+    fn fallback_pin_matching_primary_target_deduped() {
+        let mut config = NcaConfig::default();
+        config.provider.default = ProviderKind::ZhipuAI;
+        config.provider.zhipuai.api_key = Some("zhipuai-key".into());
+        config.provider.kimi.api_key = Some("kimi-key".into());
+        config.fallback.enabled = true;
+        let primary_model = config.provider.zhipuai.model.clone();
+        config.fallback.chain = vec![format!("zhipuai:{primary_model}"), "kimi".into()];
+        let entries = resolve_fallback_entries(&config)
+            .expect("chain resolves")
+            .expect("non-empty");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["Kimi"], "identical-to-primary target skipped");
     }
 
     #[test]

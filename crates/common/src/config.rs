@@ -562,6 +562,14 @@ pub struct AgentProfileConfig {
     /// Override the model name for this agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Per-agent fallback chain override: `provider` or `provider:model`
+    /// entries (e.g. `["zhipuai:glm-5.3", "minimax"]`). `Some` implies
+    /// failover is ENABLED for this agent — the profile is self-contained,
+    /// no global `[fallback].enabled` needed. `None` follows the global
+    /// `[fallback]` settings. Pinned by `/plan` entries carrying a
+    /// `fallback` field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<Vec<String>>,
     /// Override the permission mode for this agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<PermissionMode>,
@@ -599,6 +607,9 @@ impl AgentProfileConfig {
         }
         if let Some(v) = partial.model {
             self.model = Some(v);
+        }
+        if let Some(v) = partial.fallback {
+            self.fallback = Some(v);
         }
         if let Some(v) = partial.permission_mode {
             self.permission_mode = Some(v);
@@ -647,6 +658,7 @@ struct PartialAgentProfileConfig {
     description: Option<String>,
     provider: Option<ProviderKind>,
     model: Option<String>,
+    fallback: Option<Vec<String>>,
     permission_mode: Option<PermissionMode>,
     system_prompt: Option<String>,
     system_prompt_append: Option<String>,
@@ -669,6 +681,13 @@ pub struct PlanEntry {
     /// Model override (aliases like `dsv4` resolve at apply time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Fallback chain override for this agent (`provider` or
+    /// `provider:model` entries; see `[agents.<name>].fallback`). Applied
+    /// into the agent's profile pin — the reserved `orchestrator` key
+    /// writes the GLOBAL `[fallback]` instead (base routing has no
+    /// profile). `None` leaves the agent's chain untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4806,6 +4825,7 @@ model = "gpt-4o-mini"
                     PlanEntry {
                         provider: Some(ProviderKind::Kimi),
                         model: Some("k3".into()),
+                        fallback: Some(vec!["zhipuai:glm-5.3".into(), "kimi".into()]),
                     },
                 ),
                 (
@@ -4813,6 +4833,7 @@ model = "gpt-4o-mini"
                     PlanEntry {
                         provider: None,
                         model: Some("glm-5.2".into()),
+                        fallback: None,
                     },
                 ),
             ]),
@@ -4831,10 +4852,15 @@ model = "gpt-4o-mini"
         let provider_only = PlanEntry {
             provider: Some(ProviderKind::Kimi),
             model: None,
+            fallback: None,
         };
         let s = toml::to_string(&provider_only).expect("serialize provider-only");
         assert!(s.contains("provider"), "provider pin must serialize: {s}");
         assert!(!s.contains("model"), "None model must be skipped: {s}");
+        assert!(
+            !s.contains("fallback"),
+            "None fallback must be skipped: {s}"
+        );
 
         // An all-None entry serializes to nothing.
         let empty = PlanEntry::default();
