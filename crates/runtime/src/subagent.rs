@@ -482,6 +482,16 @@ pub async fn run_prepared_child(
         Err(e) => turn_was_cancelled(e, child_cancel_flag.load(Ordering::SeqCst)),
     };
     let (status, output) = match result {
+        // Loop-breaker early-final (consecutive tool failures / guard-refusal
+        // escalation) is a pathological stop, not success: classify as error so
+        // the registry, `task_status`, and the parent's wake label show
+        // `failed`, while keeping the full breaker text as the output.
+        // `from_spawn_status("error")` maps to `ChildSessionState::Failed`,
+        // so the wake label follows without wake-side changes.
+        Ok(text) if text.starts_with(nca_core::agent::LOOP_BREAKER_MARKER) => {
+            sup.finish(EndReason::Error).await;
+            ("error".to_string(), text)
+        }
         Ok(text) => {
             sup.finish(EndReason::Completed).await;
             ("completed".to_string(), text)

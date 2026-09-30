@@ -366,6 +366,14 @@ pub(crate) fn sanitize_tool_call_pairs(messages: &mut Vec<Message>) {
     *messages = out;
 }
 
+/// Marker prefix stamped on loop-breaker early-final texts (consecutive
+/// tool failures, guard-refusal escalation) so downstream consumers can
+/// classify the turn as a pathological stop without string-sniffing the
+/// human-readable message. Stamped at position 0 of the final text; the
+/// runtime's child-session folding checks `starts_with` on it to map such
+/// turns to `error`/`Failed` instead of `completed`.
+pub const LOOP_BREAKER_MARKER: &str = "[nca:loop-breaker]";
+
 /// Truncate a string to `max_chars` characters, appending "…" if truncated.
 /// `pub` for cross-crate use (runtime's subagent registry truncates result
 /// summaries with the same bound as the spawn tool's error surfacing).

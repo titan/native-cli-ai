@@ -14,7 +14,7 @@ use nca_common::message::{ImageAttachment, Message, MessageToolCall};
 use nca_common::tool::ToolCall;
 use serde_json::json;
 
-use crate::agent::AgentLoop;
+use crate::agent::{AgentLoop, LOOP_BREAKER_MARKER};
 use crate::cache_keepalive::{CacheKeepalive, KeepaliveSnapshot};
 use crate::hooks::HookEventKind;
 use crate::middleware::{StepReply, StepRequest};
@@ -709,7 +709,7 @@ impl<'a> TurnDriver<'a> {
             if self.consecutive_guard_stop_steps >= MAX_CONSECUTIVE_GUARD_STOP_STEPS {
                 let n_refusals = pipeline.guard_refusals.len();
                 let mut msg = format!(
-                    "Repeat-call guard refused calls in {} consecutive steps \
+                    "{LOOP_BREAKER_MARKER} Repeat-call guard refused calls in {} consecutive steps \
                      (latest step: {n_refusals} refusal(s)) — you keep re-issuing \
                      identical tool calls that were already answered and refused. \
                      Ending the turn to break the loop.\n\
@@ -753,7 +753,7 @@ impl<'a> TurnDriver<'a> {
                 .map(|e| e.to_string())
                 .unwrap_or_else(|| crate::agent::truncate_str(&self.last_failed_output, 300));
             let msg = format!(
-                "Tool `{}` failed {} times consecutively — stopping to avoid infinite loop.\n\nLast failure detail:\n{}",
+                "{LOOP_BREAKER_MARKER} Tool `{}` failed {} times consecutively — stopping to avoid infinite loop.\n\nLast failure detail:\n{}",
                 self.last_failed_tool, self.consecutive_tool_failures, detail
             );
             agent
@@ -1084,6 +1084,10 @@ mod tests {
             .await
             .expect("breaker ends the turn with a final text, not an error");
         assert!(
+            text.starts_with(crate::agent::LOOP_BREAKER_MARKER),
+            "loop-breaker final text must carry the classification marker: {text}"
+        );
+        assert!(
             text.contains("failed 3 times consecutively"),
             "breaker message expected: {text}"
         );
@@ -1115,6 +1119,10 @@ mod tests {
             .run_turn("go", Path::new("."), &[])
             .await
             .expect("escalation ends the turn with a final text");
+        assert!(
+            text.starts_with(crate::agent::LOOP_BREAKER_MARKER),
+            "loop-breaker final text must carry the classification marker: {text}"
+        );
         assert!(
             text.contains("Repeat-call guard refused calls in 3 consecutive steps"),
             "escalation message expected: {text}"
