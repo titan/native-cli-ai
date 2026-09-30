@@ -197,8 +197,8 @@ impl NcaModel {
             return Ok(());
         }
 
-        // 5. Animation Frame: while busy, the Turn Timer and busy indicator
-        //    are time-dependent widgets. When no events arrive (e.g. the LLM
+        // 5. Animation Frame: while busy, the session work timer (⏱) and busy
+        //    indicator are time-dependent widgets. When no events arrive (e.g. the LLM
         //    is thinking with no tokens yet), redraw at the spinner cadence so
         //    they keep animating. Idle is static — no periodic redraw, keeping
         //    idle CPU under the <1% target.
@@ -770,6 +770,10 @@ impl NcaModel {
                 // Reset context usage too — without this the previous session's
                 // ctx% lingers until the next ContextStatsUpdated event arrives.
                 self.components.status_bar.update_context(0, 0);
+                // And the session work timer (⏱): it is client-side
+                // accumulated state, so nothing else clears it on /new or
+                // /session switch.
+                self.components.status_bar.reset_work();
             }
             TuiFeedbackMsg::SetOnboardingMode(onboarding) => {
                 // Stored for future onboarding flow; no visual effect in Elm yet.
