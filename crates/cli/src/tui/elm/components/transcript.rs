@@ -835,6 +835,39 @@ impl TranscriptState {
                 )));
                 self.blocks_pushed();
             }
+            AgentEvent::ToolBatchGuarded {
+                dropped,
+                deduplicated,
+            } => {
+                // Batch-guardrail containment is informational, not a
+                // failure — but never silent: one dim system line so the
+                // user sees the blast radius was capped.
+                let mut segments = Vec::new();
+                if *dropped > 0 {
+                    segments.push(format!("{dropped} calls dropped past the batch cap"));
+                }
+                if !deduplicated.is_empty() {
+                    let groups = deduplicated
+                        .iter()
+                        .map(|(tool, n)| format!("{tool} ×{n}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    segments.push(format!("{groups} deduplicated"));
+                }
+                self.blocks.push(DisplayBlock::System(format!(
+                    "⚠ tool batch guarded: {}",
+                    segments.join("; ")
+                )));
+                self.blocks_pushed();
+            }
+            AgentEvent::EventsElided { count } => {
+                // Backpressure elision summary — one dim system line so the
+                // accounting stays visible in the transcript too.
+                self.blocks.push(DisplayBlock::System(format!(
+                    "… {count} stream notices elided (channel under backpressure)"
+                )));
+                self.blocks_pushed();
+            }
             AgentEvent::ContextCompactionStart {
                 tokens_before,
                 reason,
@@ -1663,6 +1696,61 @@ mod tests {
             Some(DisplayBlock::System(text)) => {
                 assert!(text.contains("DeepSeek → OpenAI"), "line: {text}");
                 assert!(text.contains("rate_limited"), "line: {text}");
+            }
+            other => panic!("expected System block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_batch_guarded_pushes_dim_system_line() {
+        let mut t = TranscriptState::new();
+        let before = t.blocks.len();
+        t.apply_event(&AgentEvent::ToolBatchGuarded {
+            dropped: 5,
+            deduplicated: vec![("read_file".into(), 950)],
+        });
+        assert_eq!(t.blocks.len(), before + 1, "one system line pushed");
+        match t.blocks.last() {
+            Some(DisplayBlock::System(text)) => {
+                assert!(text.contains("⚠ tool batch guarded"), "line: {text}");
+                assert!(
+                    text.contains("5 calls dropped past the batch cap"),
+                    "line: {text}"
+                );
+                assert!(text.contains("read_file ×950 deduplicated"), "line: {text}");
+            }
+            other => panic!("expected System block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_batch_guarded_dedup_only_pushes_one_line() {
+        let mut t = TranscriptState::new();
+        let before = t.blocks.len();
+        t.apply_event(&AgentEvent::ToolBatchGuarded {
+            dropped: 0,
+            deduplicated: vec![("count".into(), 3)],
+        });
+        assert_eq!(t.blocks.len(), before + 1);
+        match t.blocks.last() {
+            Some(DisplayBlock::System(text)) => {
+                assert!(!text.contains("dropped"), "no drop segment: {text}");
+                assert!(text.contains("count ×3 deduplicated"), "line: {text}");
+            }
+            other => panic!("expected System block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn events_elided_pushes_one_dim_system_line() {
+        let mut t = TranscriptState::new();
+        let before = t.blocks.len();
+        t.apply_event(&AgentEvent::EventsElided { count: 4_754 });
+        assert_eq!(t.blocks.len(), before + 1, "one system line pushed");
+        match t.blocks.last() {
+            Some(DisplayBlock::System(text)) => {
+                assert!(text.contains("4754"), "elision count surfaced: {text}");
+                assert!(text.contains("elided"), "line: {text}");
             }
             other => panic!("expected System block, got {other:?}"),
         }

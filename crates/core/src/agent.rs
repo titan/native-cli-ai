@@ -1,10 +1,10 @@
 use nca_common::event::{AgentEvent, BusyState};
 use nca_common::message::{ContentPart, ImageAttachment, Message, Role};
-use nca_common::tool::ToolDefinition;
+use nca_common::tool::{ToolCall, ToolDefinition};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::agent_driver::InboxItem;
@@ -27,6 +27,11 @@ pub struct AgentLoop {
     pub(crate) event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
     pub(crate) max_turns: u32,
     pub(crate) max_tool_calls_per_turn: u32,
+    /// Cap on tool calls executed from a single assistant message
+    /// (`[session] max_tool_calls_per_message`). Excess calls are dropped
+    /// with synthetic error results — see [`plan_tool_batch`]. Default
+    /// mirrors the config default; the supervisor wires the config value in.
+    pub(crate) max_tool_calls_per_message: usize,
     pub(crate) checkpoint_interval: u32,
     pub(crate) cancel_flag: Arc<AtomicBool>,
     pub(crate) hooks: Option<HookRunner>,
@@ -39,6 +44,11 @@ pub struct AgentLoop {
     /// Step-request middleware chain (P4). Empty by default — a bare
     /// `AgentLoop` is observably identical to pre-P4 behavior.
     pub(crate) middleware: crate::middleware::MiddlewareChain,
+    /// Droppable events elided so far because the bounded event channel was
+    /// full (see [`emit_classified`]). Flushed as one
+    /// [`AgentEvent::EventsElided`] summary before the next must-deliver
+    /// event; never reset except by that flush.
+    pub(crate) elided_events: AtomicU64,
     /// Sender half of the single inbox (bounded 16). Cloned out via
     /// [`AgentLoop::inbox_sender`] for prompts/steering while a turn runs.
     inbox_tx: tokio::sync::mpsc::Sender<InboxItem>,
@@ -103,6 +113,7 @@ impl AgentLoop {
             event_tx,
             max_turns,
             max_tool_calls_per_turn,
+            max_tool_calls_per_message: nca_common::config::default_max_tool_calls_per_message(),
             checkpoint_interval,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             hooks,
@@ -110,6 +121,7 @@ impl AgentLoop {
             keepalive_profile: KeepaliveProfile::disabled(),
             repeat_guard: RepeatCallGuard::new(),
             middleware: crate::middleware::MiddlewareChain::new(),
+            elided_events: AtomicU64::new(0),
             inbox_tx,
             inbox_rx,
             turn_seq: 0,
@@ -160,6 +172,13 @@ impl AgentLoop {
     /// provider construction, using per-provider economics).
     pub fn set_keepalive_profile(&mut self, profile: KeepaliveProfile) {
         self.keepalive_profile = profile;
+    }
+
+    /// Set the per-message tool-call batch cap (`[session]
+    /// `max_tool_calls_per_message`). Wired by the supervisor from config;
+    /// tests force small values to exercise the guardrail.
+    pub fn set_max_tool_calls_per_message(&mut self, cap: usize) {
+        self.max_tool_calls_per_message = cap;
     }
 
     /// Set the session's system prompt, REPLACING any system message
@@ -268,7 +287,7 @@ impl AgentLoop {
     }
 
     pub(crate) async fn emit(&self, event: AgentEvent) {
-        let _ = self.event_tx.send(event).await;
+        emit_classified(&self.event_tx, &self.elided_events, event).await;
     }
 
     /// Record a model-visible message: emit [`AgentEvent::MessageRecorded`]
@@ -305,6 +324,48 @@ impl AgentLoop {
     pub(crate) fn is_cancelled(&self) -> bool {
         self.cancel_flag.load(Ordering::SeqCst)
     }
+}
+
+/// Classified event send, the single backpressure policy for agent events
+/// (incident 2026-10-02, Chunk 3b).
+///
+/// - **Droppable** notices ([`AgentEvent::is_droppable_under_backpressure`]:
+///   `ToolCallStarted`, stream deltas, `ToolOutputChunk`) use `try_send`;
+///   on a full channel the event is ELIDED (dropped) and counted in
+///   `elided_events`. A degenerate batch can then no longer park the turn's
+///   stream loop on per-call notices — the incident's "7,642 ToolCallStarted
+///   then nothing" shape.
+/// - **Must-deliver** events keep the blocking `send().await`: losing one
+///   would corrupt the replay projection (`MessageRecorded`), break bracket
+///   parity (`Step*`/`TurnCompleted`/`ToolCallCompleted`), orphan an
+///   interactive oneshot (`ApprovalRequested`/`QuestionRequested`), or hide
+///   a failure (`Error`). Before sending, any pending elision count is
+///   flushed as one [`AgentEvent::EventsElided`] summary so consumers see
+///   the gap adjacent to the next guaranteed event.
+///
+/// Channel-closed behaves like the previous fire-and-forget (`let _ =`).
+pub(crate) async fn emit_classified(
+    event_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+    elided_events: &AtomicU64,
+    event: AgentEvent,
+) {
+    if event.is_droppable_under_backpressure() {
+        match event_tx.try_send(event) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                elided_events.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+        }
+        return;
+    }
+    let pending = elided_events.swap(0, Ordering::Relaxed);
+    if pending > 0 {
+        let _ = event_tx
+            .send(AgentEvent::EventsElided { count: pending })
+            .await;
+    }
+    let _ = event_tx.send(event).await;
 }
 
 /// Ensure every assistant message carrying `tool_calls` is followed by a
@@ -373,6 +434,97 @@ pub(crate) fn sanitize_tool_call_pairs(messages: &mut Vec<Message>) {
 /// runtime's child-session folding checks `starts_with` on it to map such
 /// turns to `error`/`Failed` instead of `completed`.
 pub const LOOP_BREAKER_MARKER: &str = "[nca:loop-breaker]";
+
+/// Planned execution shape for one assistant message's tool-call batch:
+/// which calls execute, which are intra-batch duplicates of an executor,
+/// and which fall beyond the per-message cap.
+///
+/// Produced by [`plan_tool_batch`] at batch finalization (all tool-use
+/// blocks received). Plan-before-record: the caller runs this BEFORE the
+/// assistant message is recorded and records only the kept window
+/// (executors + duplicates in emission order); `dropped` ids never enter
+/// history, so tool_use/tool-result pairing stays balanced by construction.
+/// Duplicates receive the executor's result re-bound to their own call_id.
+#[derive(Debug, Default)]
+pub(crate) struct ToolBatchPlan {
+    /// Distinct calls that will execute, in first-occurrence order.
+    pub(crate) executors: Vec<ToolCall>,
+    /// `(duplicate call_id, index into `executors`)` for every kept call
+    /// whose (name, canonical input) matches an earlier kept call.
+    pub(crate) duplicates: Vec<(String, usize)>,
+    /// Emitted calls beyond `max_tool_calls_per_message`, in emission
+    /// order. Never executed and never recorded — trimmed from the
+    /// assistant message so the overflow cannot become a history bomb.
+    pub(crate) dropped: Vec<ToolCall>,
+    /// `(tool name, kept occurrences)` per deduped group with more than one
+    /// member, sorted by name for deterministic warning order.
+    pub(crate) dedup_groups: Vec<(String, usize)>,
+}
+
+/// Plan a buffered tool-call batch for execution: apply the per-message cap
+/// in emission order (the first `cap` emitted calls are kept), then dedup
+/// identical `(name, input)` pairs within the kept prefix.
+///
+/// Incident 2026-10-02: a degenerate model emitted ONE assistant message
+/// with 7,642 duplicate tool_use blocks; all were accepted and the session
+/// wedged. This is the containment choke point — provider-neutral, before
+/// any event fan-out or approval.
+///
+/// Canonical input key: `serde_json` maps are `BTreeMap`-ordered in this
+/// workspace (the `preserve_order` feature is NOT enabled), so
+/// `serde_json::to_string` is a stable canonical form. If that feature is
+/// ever enabled, keys must be sorted manually here.
+pub(crate) fn plan_tool_batch(calls: &[ToolCall], cap: usize) -> ToolBatchPlan {
+    let mut plan = ToolBatchPlan::default();
+    let mut first_seen: HashMap<String, usize> = HashMap::with_capacity(calls.len());
+    let mut group_counts: HashMap<String, usize> = HashMap::new();
+
+    for call in calls {
+        // The cap applies to the first `cap` emitted calls (emission order);
+        // duplicates among them still occupy a kept slot — everything after
+        // is dropped from execution.
+        if plan.executors.len() + plan.duplicates.len() >= cap {
+            plan.dropped.push(call.clone());
+            continue;
+        }
+        let key = format!(
+            "{}\u{0}{}",
+            call.name,
+            serde_json::to_string(&call.input).unwrap_or_else(|_| call.input.to_string())
+        );
+        match first_seen.get(&key) {
+            Some(&executor_index) => {
+                plan.duplicates.push((call.id.clone(), executor_index));
+            }
+            None => {
+                first_seen.insert(key.clone(), plan.executors.len());
+                plan.executors.push(call.clone());
+            }
+        }
+        *group_counts.entry(key).or_insert(0) += 1;
+    }
+
+    plan.dedup_groups = group_counts
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|(key, count)| {
+            let name = key
+                .split_once('\u{0}')
+                .map(|(name, _)| name)
+                .unwrap_or(key.as_str());
+            (name.to_string(), count)
+        })
+        .collect();
+    plan.dedup_groups.sort();
+    plan
+}
+
+/// Provider-neutral error payload for synthetic tool results injected by
+/// the batch guardrails (the duplicate-rebind fallback in the driver). A
+/// JSON string so any provider accepts it on re-upload.
+pub(crate) fn guard_tool_result_error(message: &str) -> String {
+    serde_json::json!({ "error": message }).to_string()
+}
 
 /// Truncate a string to `max_chars` characters, appending "…" if truncated.
 /// `pub` for cross-crate use (runtime's subagent registry truncates result
@@ -866,5 +1018,229 @@ mod tests {
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[2].role, Role::Tool);
         assert_eq!(msgs[2].tool_call_id.as_deref(), Some("x"));
+    }
+
+    fn pct(id: &str, name: &str, input: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            input,
+        }
+    }
+
+    #[test]
+    fn plan_tool_batch_cap_window_and_dedup() {
+        // cap=3 over [A, A, B, C, A]: the kept window is the first 3
+        // emitted calls (A, A, B) — C and the trailing A are dropped
+        // regardless of dedup. Executors are the distinct kept calls.
+        let calls = vec![
+            pct("a1", "read", serde_json::json!({"p": 1})),
+            pct("a2", "read", serde_json::json!({"p": 1})),
+            pct("b1", "read", serde_json::json!({"p": 2})),
+            pct("c1", "search", serde_json::json!({"q": "x"})),
+            pct("a3", "read", serde_json::json!({"p": 1})),
+        ];
+        let plan = plan_tool_batch(&calls, 3);
+        assert_eq!(
+            plan.executors
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a1", "b1"]
+        );
+        assert_eq!(plan.duplicates, vec![("a2".to_string(), 0)]);
+        assert_eq!(
+            plan.dropped
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c1", "a3"]
+        );
+        assert_eq!(plan.dedup_groups, vec![("read".to_string(), 2)]);
+    }
+
+    #[test]
+    fn plan_tool_batch_input_key_is_order_insensitive() {
+        // Same logical input with different key order must dedup: serde_json
+        // maps are BTreeMap-ordered here (no `preserve_order` feature), so
+        // to_string is canonical.
+        let calls = vec![
+            pct(
+                "x1",
+                "edit",
+                serde_json::json!({"path": "a", "content": "b"}),
+            ),
+            pct(
+                "x2",
+                "edit",
+                serde_json::json!({"content": "b", "path": "a"}),
+            ),
+        ];
+        let plan = plan_tool_batch(&calls, 32);
+        assert_eq!(plan.executors.len(), 1);
+        assert_eq!(plan.duplicates.len(), 1);
+        assert!(plan.dropped.is_empty());
+    }
+
+    #[test]
+    fn plan_tool_batch_cap_zero_drops_everything() {
+        let calls = vec![pct("a", "read", serde_json::json!({}))];
+        let plan = plan_tool_batch(&calls, 0);
+        assert!(plan.executors.is_empty());
+        assert!(plan.duplicates.is_empty());
+        assert_eq!(plan.dropped.len(), 1);
+    }
+
+    // ── Chunk 3b: backpressure classification of `AgentLoop::emit` ──────
+
+    /// Droppable notices are ELIDED (not blocking, not silent): with a full
+    /// bounded channel and no consumer, `try_send` fails, the counter climbs,
+    /// and the next must-deliver send first flushes an `EventsElided` summary
+    /// so consumers see the gap adjacent to the next guaranteed event.
+    #[tokio::test]
+    async fn emit_elides_droppable_and_flushes_summary_before_next_must_deliver() {
+        let (provider, _calls) = ScriptedProvider::new(Vec::new());
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(2);
+        let agent = AgentLoop::new(
+            Arc::new(provider),
+            ToolRegistry::new(),
+            ApprovalPolicy::new(PermissionConfig::default()),
+            "m".into(),
+            event_tx,
+            10,
+            16,
+            0,
+            None,
+        );
+
+        // No consumer: buffer absorbs 2, the next 3 Started are elided.
+        // Pre-fix each of these was a blocking `send().await` — this loop
+        // would have parked forever on the third (the incident's stream-loop
+        // wedge).
+        for i in 0..5 {
+            agent
+                .emit(AgentEvent::ToolCallStarted {
+                    call_id: format!("c{i}"),
+                    tool: "read".into(),
+                    input: serde_json::json!({}),
+                })
+                .await;
+        }
+        assert_eq!(
+            agent.elided_events.load(Ordering::SeqCst),
+            3,
+            "exactly the overflow is counted"
+        );
+
+        // Consumer appears; the must-deliver send unblocks and carries the
+        // summary immediately before itself.
+        let consumer = tokio::spawn(async move {
+            let mut got = Vec::new();
+            while let Some(event) = event_rx.recv().await {
+                let done = matches!(event, AgentEvent::TurnStarted { .. });
+                got.push(event);
+                if done {
+                    break;
+                }
+            }
+            got
+        });
+        agent.emit(AgentEvent::TurnStarted { turn_id: 1 }).await;
+        let got = consumer.await.expect("consumer");
+        assert_eq!(
+            got.len(),
+            4,
+            "2 buffered + summary + the must-deliver event"
+        );
+        assert!(matches!(&got[0], AgentEvent::ToolCallStarted { .. }));
+        assert!(matches!(&got[1], AgentEvent::ToolCallStarted { .. }));
+        assert!(matches!(&got[2], AgentEvent::EventsElided { count: 3 }));
+        assert!(matches!(&got[3], AgentEvent::TurnStarted { .. }));
+        assert_eq!(
+            agent.elided_events.load(Ordering::SeqCst),
+            0,
+            "summary flush resets the counter"
+        );
+    }
+
+    /// Must-deliver events survive backpressure intact: a buffer-1 channel
+    /// paced by a 1 ms-per-event consumer forces every send through the
+    /// blocking path, and all of them arrive — no elision, no summary.
+    #[tokio::test]
+    async fn emit_never_elides_must_deliver_events() {
+        let (provider, _calls) = ScriptedProvider::new(Vec::new());
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+        let agent = AgentLoop::new(
+            Arc::new(provider),
+            ToolRegistry::new(),
+            ApprovalPolicy::new(PermissionConfig::default()),
+            "m".into(),
+            event_tx,
+            10,
+            16,
+            0,
+            None,
+        );
+        let events = vec![
+            AgentEvent::MessageReceived {
+                role: "user".into(),
+                content: "hi".into(),
+                steering: false,
+            },
+            AgentEvent::StepStarted {
+                turn_id: 1,
+                step_index: 1,
+            },
+            AgentEvent::MessageRecorded {
+                message: Message::assistant("reply"),
+            },
+            AgentEvent::ToolCallCompleted {
+                call_id: "c".into(),
+                output: nca_common::tool::ToolResult {
+                    call_id: "c".into(),
+                    success: true,
+                    output: "ok".into(),
+                    error: None,
+                    timed_out: false,
+                },
+                duration_ms: 1,
+            },
+            AgentEvent::Error {
+                message: "boom".into(),
+            },
+            AgentEvent::TurnCompleted {
+                turn_id: 1,
+                duration_ms: 2,
+            },
+        ];
+        let total = events.len();
+
+        let consumer = async {
+            let mut got = Vec::new();
+            while let Some(event) = event_rx.recv().await {
+                let done = matches!(event, AgentEvent::TurnCompleted { .. });
+                got.push(event);
+                if done {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            got
+        };
+        let (_, got) = tokio::join!(
+            async {
+                for event in events {
+                    agent.emit(event).await;
+                }
+            },
+            consumer
+        );
+        assert_eq!(got.len(), total, "every must-deliver event arrived");
+        assert!(
+            !got.iter()
+                .any(|e| matches!(e, AgentEvent::EventsElided { .. })),
+            "nothing was elided — only droppable kinds ever are"
+        );
+        assert_eq!(agent.elided_events.load(Ordering::SeqCst), 0);
     }
 }

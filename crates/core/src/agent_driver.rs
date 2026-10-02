@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use nca_common::event::{AgentEvent, BusyState};
 use nca_common::message::{ImageAttachment, Message, MessageToolCall};
-use nca_common::tool::ToolCall;
+use nca_common::tool::{ToolCall, ToolResult};
 use serde_json::json;
 
 use crate::agent::{AgentLoop, LOOP_BREAKER_MARKER};
@@ -565,7 +565,50 @@ impl<'a> TurnDriver<'a> {
             });
         }
 
-        let replay_tool_calls = tool_calls
+        // ── Batch guardrails (incident 2026-10-02) ──────────────────────
+        // A degenerate model emitted ONE assistant message with 7,642
+        // duplicate tool_use blocks; all were accepted and the session
+        // wedged. Contain the blast radius here, at batch finalization,
+        // with a plan-before-record strategy: the cap and the dedup run
+        // BEFORE the assistant message is recorded, and the recorded
+        // message carries only the kept window (the first `cap` calls in
+        // emission order — executors and duplicates alike). Overflow ids
+        // never enter history, so tool_use/tool-result pairing stays
+        // balanced by construction and the incident's ~206K-token history
+        // bomb (823 KB of tool_use blocks re-uploaded every step) cannot
+        // form. One `ToolBatchGuarded` event surfaces the containment to
+        // the user (transcript/system line); a one-line guard note on the
+        // first kept result teaches the model.
+        let plan = crate::agent::plan_tool_batch(&tool_calls, agent.max_tool_calls_per_message);
+        if !plan.dropped.is_empty() {
+            tracing::warn!(
+                total = tool_calls.len(),
+                dropped = plan.dropped.len(),
+                cap = agent.max_tool_calls_per_message,
+                "tool-call batch exceeded max_tool_calls_per_message; overflow calls are trimmed from the recorded message"
+            );
+        }
+        for (tool, occurrences) in &plan.dedup_groups {
+            tracing::warn!(
+                tool = %tool,
+                occurrences,
+                "duplicate tool calls within one batch; executed once, result fanned out to duplicates"
+            );
+        }
+        if !plan.dropped.is_empty() || !plan.dedup_groups.is_empty() {
+            agent
+                .emit(AgentEvent::ToolBatchGuarded {
+                    dropped: plan.dropped.len(),
+                    deduplicated: plan.dedup_groups.clone(),
+                })
+                .await;
+        }
+
+        // The kept window is a strict emission-order prefix (the plan drops
+        // every call past the cap), so the recorded message is the prefix
+        // of length `len - dropped.len()`.
+        let kept_len = tool_calls.len() - plan.dropped.len();
+        let replay_tool_calls = tool_calls[..kept_len]
             .iter()
             .map(|call| MessageToolCall {
                 id: call.id.clone(),
@@ -581,10 +624,11 @@ impl<'a> TurnDriver<'a> {
         agent.record(&msg).await;
         agent.messages.push(msg);
 
-        if tool_calls.len() as u32 > agent.max_tool_calls_per_turn {
+        let executors = plan.executors;
+        if executors.len() as u32 > agent.max_tool_calls_per_turn {
             return Err(ProviderError::Other(format!(
                 "tool-call budget exceeded in turn {turn} ({} > {})",
-                tool_calls.len(),
+                executors.len(),
                 agent.max_tool_calls_per_turn
             )));
         }
@@ -614,9 +658,10 @@ impl<'a> TurnDriver<'a> {
             &agent.hooks,
             &agent.event_tx,
             &agent.cancel_flag,
-            tool_calls.clone(),
+            executors.clone(),
             &mut agent.repeat_guard,
             &self.workspace_root.display().to_string(),
+            &agent.elided_events,
         )
         .await
         .map_err(ProviderError::Other)?;
@@ -645,14 +690,14 @@ impl<'a> TurnDriver<'a> {
         // 20+ guard hard-stops with the breaker silent.) Any successful call
         // or a mixed-tool batch resets the streak — a legitimate fix → test →
         // fail iteration always intersperses edits or reads that succeed.
-        let step_single_tool = tool_calls
+        let step_single_tool = executors
             .first()
-            .is_some_and(|first| tool_calls.iter().all(|c| c.name == first.name));
+            .is_some_and(|first| executors.iter().all(|c| c.name == first.name));
         let all_failed_same_tool = !pipeline.results.is_empty()
             && pipeline.results.iter().all(|r| !r.success)
             && step_single_tool;
         if all_failed_same_tool {
-            let tool_name = &tool_calls[0].name;
+            let tool_name = &executors[0].name;
             let last_result = &pipeline.results[0];
             if *tool_name == self.last_failed_tool {
                 self.consecutive_tool_failures += 1;
@@ -676,7 +721,62 @@ impl<'a> TurnDriver<'a> {
             self.last_failed_tool.clear();
         }
 
-        for result in pipeline.results {
+        // Assemble the result set for the KEPT window only: real executor
+        // results plus copies re-bound to duplicate call_ids. Overflow ids
+        // were trimmed from the recorded message above, so they get no
+        // result and no completion — pairing stays balanced by construction
+        // (one result per kept call_id) and replay tolerates the unclosed
+        // `ToolCallStarted` brackets the streaming loop emitted for them.
+        let mut all_results = pipeline.results;
+        let executor_count = all_results.len();
+        for (duplicate_id, executor_index) in &plan.duplicates {
+            debug_assert!(*executor_index < executor_count);
+            let mut result = match all_results.get(*executor_index).cloned() {
+                Some(result) => result,
+                // Invariant breach (duplicate index into a missing executor
+                // result): impossible today — the plan only emits indices it
+                // itself allocated — but a release-mode fallback must never
+                // silently skip: the duplicate id IS in the recorded message
+                // and would break pairing without a result (oracle F4).
+                None => ToolResult {
+                    timed_out: false,
+                    call_id: String::new(),
+                    success: false,
+                    output: String::new(),
+                    error: Some(crate::agent::guard_tool_result_error(
+                        "internal: duplicate tool-call rebind found no executor result",
+                    )),
+                },
+            };
+            result.call_id = duplicate_id.clone();
+            all_results.push(result);
+        }
+        // Trimmed ids got a `ToolCallStarted` during stream assembly but
+        // no completion follows; drop their timing entries so the map
+        // cannot accumulate across steps.
+        for dropped in &plan.dropped {
+            agent.tool_start_times.remove(&dropped.id);
+        }
+        // Model-visible teaching: when the guardrail trimmed anything
+        // (overflow dropped and/or duplicates collapsed), the FIRST kept
+        // result carries a one-line note so the model sees the recorded
+        // batch was smaller than what it emitted.
+        if !plan.dropped.is_empty() || !plan.dedup_groups.is_empty() {
+            let dedup_total: usize = plan
+                .dedup_groups
+                .iter()
+                .map(|(_, occurrences)| occurrences.saturating_sub(1))
+                .sum();
+            if let Some(first) = all_results.first_mut() {
+                first.output.push_str(&format!(
+                    "\n[nca: tool batch guarded — {} overflow call(s) dropped, {} duplicate call(s) collapsed]",
+                    plan.dropped.len(),
+                    dedup_total
+                ));
+            }
+        }
+
+        for result in all_results {
             let duration_ms = agent
                 .tool_start_times
                 .remove(&result.call_id)
@@ -1138,6 +1238,298 @@ mod tests {
         );
     }
 
+    // ── Batch guardrails: cap + intra-batch dedup (incident 2026-10-02) ──
+
+    /// Tool that records every execution's `n` argument and echoes it in the
+    /// output — lets tests count executions and compare fan-out content.
+    struct CountingTool {
+        executions: Arc<std::sync::Mutex<Vec<i64>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::ToolExecutor for CountingTool {
+        fn definition(&self) -> nca_common::tool::ToolDefinition {
+            nca_common::tool::ToolDefinition {
+                timeout_ms: None,
+                name: "count".into(),
+                description: "records executions".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"n": {"type": "integer"}}
+                }),
+            }
+        }
+        async fn execute(&self, call: &ToolCall) -> nca_common::tool::ToolResult {
+            let n = call.input.get("n").and_then(|v| v.as_i64()).unwrap_or(-1);
+            self.executions.lock().expect("executions lock").push(n);
+            nca_common::tool::ToolResult {
+                timed_out: false,
+                call_id: call.id.clone(),
+                success: true,
+                output: format!("done:{n}"),
+                error: None,
+            }
+        }
+    }
+
+    fn guardrail_agent(
+        provider: Arc<dyn Provider>,
+        tool: Box<dyn crate::tools::ToolExecutor>,
+    ) -> (AgentLoop, tokio::sync::mpsc::Receiver<AgentEvent>) {
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(1024);
+        let mut tools = ToolRegistry::new();
+        tools.register(tool);
+        let agent = AgentLoop::new(
+            provider,
+            tools,
+            ApprovalPolicy::new(PermissionConfig {
+                mode: PermissionMode::BypassPermissions,
+                ..Default::default()
+            }),
+            "test-model".into(),
+            event_tx,
+            20,
+            16,
+            0,
+            None,
+        );
+        (agent, event_rx)
+    }
+
+    /// `(tool_call_id, content)` for every tool-result message in the
+    /// history, in push order.
+    fn tool_message_contents(agent: &AgentLoop) -> Vec<(String, String)> {
+        use nca_common::message::{MessageContent, Role};
+        agent
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .map(|m| {
+                let content = match &m.content {
+                    MessageContent::Text(t) => t.clone(),
+                    _ => panic!("expected text tool content"),
+                };
+                (m.tool_call_id.clone().expect("tool call id"), content)
+            })
+            .collect()
+    }
+
+    /// Tallies from draining a guardrail test's event stream.
+    struct ToolEventTally {
+        started: usize,
+        completed: usize,
+        /// One entry per `ToolBatchGuarded` event: (dropped, dedup groups).
+        guarded: Vec<(usize, Vec<(String, usize)>)>,
+    }
+
+    /// Drain the event stream tallying the tool-call bracket
+    /// (`ToolCallStarted`/`ToolCallCompleted`) and every
+    /// `ToolBatchGuarded` payload. Note: bracket parity only holds for
+    /// KEPT calls — `Started` fires during stream assembly for every
+    /// incoming block, while completions cover the kept window only
+    /// (replay drops unclosed brackets), so capped batches legitimately
+    /// tally started > completed. The guarded payloads assert the
+    /// surfaced containment notice.
+    fn count_tool_events(event_rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>) -> ToolEventTally {
+        let mut tally = ToolEventTally {
+            started: 0,
+            completed: 0,
+            guarded: Vec::new(),
+        };
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                AgentEvent::ToolCallStarted { .. } => tally.started += 1,
+                AgentEvent::ToolCallCompleted { .. } => tally.completed += 1,
+                AgentEvent::ToolBatchGuarded {
+                    dropped,
+                    deduplicated,
+                } => tally.guarded.push((dropped, deduplicated)),
+                _ => {}
+            }
+        }
+        tally
+    }
+
+    #[tokio::test]
+    async fn tool_batch_capped_trims_recorded_message_and_drops_overflow() {
+        // Incident 2026-10-02 shape, scaled down: one assistant message
+        // carrying 9 distinct calls with the cap forced to 4. Plan-before-
+        // record: the RECORDED assistant message is trimmed to the 4-call
+        // kept window; exactly 4 execute; exactly 4 tool results exist
+        // (kept ids only — overflow ids get NO results, NO completions,
+        // and never enter history); the first kept result carries the
+        // guard note; the turn completes normally.
+        let mut round1 = Vec::new();
+        for i in 0..9 {
+            round1.push(use_call(
+                &format!("c{i}"),
+                "count",
+                serde_json::json!({"n": i}),
+            ));
+        }
+        round1.push(StreamChunk::Finish {
+            reason: "tool_calls".into(),
+        });
+        let round2 = vec![
+            StreamChunk::TextDelta("all done".into()),
+            StreamChunk::Finish {
+                reason: "stop".into(),
+            },
+        ];
+        let (provider, calls) = RoundsProvider::new(vec![round1, round2]);
+        let executions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut agent, mut event_rx) = guardrail_agent(
+            Arc::new(provider),
+            Box::new(CountingTool {
+                executions: Arc::clone(&executions),
+            }),
+        );
+        agent.set_max_tool_calls_per_message(4);
+
+        let text = agent
+            .run_turn("go", Path::new("."), &[])
+            .await
+            .expect("turn must complete normally despite the oversized batch");
+        assert_eq!(text, "all done");
+
+        assert_eq!(
+            executions.lock().expect("executions lock").len(),
+            4,
+            "exactly cap calls may execute"
+        );
+
+        // The RECORDED assistant message is trimmed to the kept window —
+        // history never carries the overflow, so the incident's ~206K-token
+        // history bomb cannot form.
+        use nca_common::message::Role;
+        let recorded_ids: Vec<String> = agent
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .find_map(|m| m.tool_calls.clone())
+            .expect("assistant message with tool_calls")
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(
+            recorded_ids,
+            vec!["c0", "c1", "c2", "c3"],
+            "kept window is the emission-order prefix, trimmed to cap"
+        );
+
+        // Results exist for KEPT ids only — no synthetic results for the
+        // trimmed ids (pairing balanced by construction, not synthesis).
+        let results = tool_message_contents(&agent);
+        let result_ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(result_ids, vec!["c0", "c1", "c2", "c3"]);
+        for (id, content) in &results {
+            assert!(content.starts_with("done:"), "{id} executed: {content}");
+        }
+        // Guard note on the FIRST kept result (5 dropped, no dedup);
+        // only that one result carries it.
+        assert!(
+            results[0].1.contains(
+                "[nca: tool batch guarded — 5 overflow call(s) dropped, 0 duplicate call(s) collapsed]"
+            ),
+            "first kept result carries the guard note: {}",
+            results[0].1
+        );
+        for (id, content) in &results[1..] {
+            assert!(
+                !content.contains("nca: tool batch guarded"),
+                "only the first kept result carries the note ({id}): {content}"
+            );
+        }
+
+        // Bracket shape: Started fired for all 9 incoming blocks during
+        // stream assembly (droppable/lossy class; replay drops unclosed
+        // brackets); completions cover the 4 kept calls.
+        let tally = count_tool_events(&mut event_rx);
+        assert_eq!((tally.started, tally.completed), (9, 4));
+        // Exactly ONE surfaced containment notice with the dropped count;
+        // all inputs are distinct so there is nothing to dedup.
+        assert_eq!(
+            tally.guarded,
+            vec![(5, Vec::new())],
+            "one ToolBatchGuarded: 9 - cap(4) = 5 dropped, no dedup groups"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "turn continued to a final-answer step"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_tool_calls_execute_once_and_fan_out_results() {
+        // Same (name, input) ×3 plus one distinct call in ONE batch: two
+        // executions total; the duplicates receive the executor's result
+        // under their own call_ids; four results overall.
+        let round1 = vec![
+            use_call("dup1", "count", serde_json::json!({"n": 7})),
+            use_call("dup2", "count", serde_json::json!({"n": 7})),
+            use_call("dup3", "count", serde_json::json!({"n": 7})),
+            use_call("uniq", "count", serde_json::json!({"n": 1})),
+            StreamChunk::Finish {
+                reason: "tool_calls".into(),
+            },
+        ];
+        let round2 = vec![
+            StreamChunk::TextDelta("ok".into()),
+            StreamChunk::Finish {
+                reason: "stop".into(),
+            },
+        ];
+        let (provider, _calls) = RoundsProvider::new(vec![round1, round2]);
+        let executions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut agent, mut event_rx) = guardrail_agent(
+            Arc::new(provider),
+            Box::new(CountingTool {
+                executions: Arc::clone(&executions),
+            }),
+        );
+
+        let text = agent
+            .run_turn("go", Path::new("."), &[])
+            .await
+            .expect("turn completes normally");
+        assert_eq!(text, "ok");
+
+        assert_eq!(
+            *executions.lock().expect("executions lock"),
+            vec![7, 1],
+            "first occurrence + distinct call execute, in emission order"
+        );
+
+        let results = tool_message_contents(&agent);
+        assert_eq!(results.len(), 4, "one result per emitted call_id");
+        let by_id: std::collections::HashMap<String, String> = results.into_iter().collect();
+        // dup1 is the first kept call in emission order → carries the guard
+        // note suffix (dedup-only batch: nothing dropped, 3 occurrences - 1
+        // = 2 collapsed). The rebinds clone the result BEFORE the note is
+        // appended, so only dup1 sees it.
+        assert_eq!(
+            by_id.get("dup1").map(String::as_str),
+            Some(
+                "done:7\n[nca: tool batch guarded — 0 overflow call(s) dropped, 2 duplicate call(s) collapsed]"
+            ),
+            "first kept result carries the guard note"
+        );
+        assert_eq!(by_id.get("dup2").map(String::as_str), Some("done:7"));
+        assert_eq!(by_id.get("dup3").map(String::as_str), Some("done:7"));
+        assert_eq!(by_id.get("uniq").map(String::as_str), Some("done:1"));
+
+        let tally = count_tool_events(&mut event_rx);
+        assert_eq!((tally.started, tally.completed), (4, 4));
+        // One notice: nothing dropped (4 ≤ default cap 32), one dedup group
+        // `count` ×3 collapsed to a single execution.
+        assert_eq!(
+            tally.guarded,
+            vec![(0, vec![("count".to_string(), 3)])],
+            "one ToolBatchGuarded: 0 dropped, count ×3 deduplicated"
+        );
+    }
+
     /// A clean (refusal-free) step resets the streak: stop/clean/stop/clean/
     /// stop never escalates, and the turn finishes normally.
     #[tokio::test]
@@ -1178,5 +1570,362 @@ mod tests {
             .expect("turn must complete normally");
         assert_eq!(text, "all good", "no escalation may fire: {text}");
         assert_eq!(calls.load(Ordering::SeqCst), 13);
+    }
+
+    // ── Chunk 3b: root-cause repro + event classification (incident
+    // 2026-10-02, revised timeline: everything through the giant
+    // MessageRecorded was written, then ZERO completions — the wedge sat in
+    // the post-recording phase under a 7,642-call batch) ──────────────────
+
+    /// Tallies for the flood tests: bracket counters, replay-critical
+    /// message classes, and the elision accounting.
+    #[derive(Default)]
+    struct FloodTally {
+        started: usize,
+        completed: usize,
+        tool_result_messages: usize,
+        assistant_tool_call_blocks: usize,
+        tokens_streamed: usize,
+        elided: u64,
+        turn_completed: usize,
+        /// Whether an `EventsElided` summary was received BEFORE the giant
+        /// assistant `MessageRecorded` (adjacency of gap-notice and the next
+        /// guaranteed event).
+        elided_before_assistant_record: bool,
+    }
+
+    /// Drain the event channel forever, tallying by kind. `lead` is an
+    /// optional initial stall (the incident's consumer freeze window).
+    fn spawn_drainer(
+        mut rx: tokio::sync::mpsc::Receiver<AgentEvent>,
+        lead: Option<Duration>,
+    ) -> tokio::task::JoinHandle<FloodTally> {
+        tokio::spawn(async move {
+            if let Some(lead) = lead {
+                tokio::time::sleep(lead).await;
+            }
+            let mut tally = FloodTally::default();
+            let mut seen_assistant_record = false;
+            while let Some(event) = rx.recv().await {
+                match event {
+                    AgentEvent::ToolCallStarted { .. } => tally.started += 1,
+                    AgentEvent::ToolCallCompleted { .. } => tally.completed += 1,
+                    AgentEvent::TokensStreamed { .. } => tally.tokens_streamed += 1,
+                    AgentEvent::EventsElided { count } => {
+                        tally.elided += count;
+                        if !seen_assistant_record {
+                            tally.elided_before_assistant_record = true;
+                        }
+                    }
+                    AgentEvent::TurnCompleted { .. } => tally.turn_completed += 1,
+                    AgentEvent::MessageRecorded { message } => match message.role {
+                        nca_common::message::Role::Tool => tally.tool_result_messages += 1,
+                        nca_common::message::Role::Assistant => {
+                            if let Some(calls) = message.tool_calls
+                                && !seen_assistant_record
+                                && !calls.is_empty()
+                            {
+                                seen_assistant_record = true;
+                                tally.assistant_tool_call_blocks = calls.len();
+                            }
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+            tally
+        })
+    }
+
+    /// Agent with explicit event-channel buffer and turn tool budget — the
+    /// flood tests need production-shaped buffering (256) and, when the cap
+    /// is bypassed, a per-turn budget that doesn't reject the giant batch.
+    fn flood_agent(
+        provider: Arc<dyn Provider>,
+        tool: Box<dyn crate::tools::ToolExecutor>,
+        event_buffer: usize,
+        max_tool_calls_per_turn: u32,
+    ) -> (AgentLoop, tokio::sync::mpsc::Receiver<AgentEvent>) {
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(event_buffer);
+        let mut tools = ToolRegistry::new();
+        tools.register(tool);
+        let agent = AgentLoop::new(
+            provider,
+            tools,
+            ApprovalPolicy::new(PermissionConfig {
+                mode: PermissionMode::BypassPermissions,
+                ..Default::default()
+            }),
+            "test-model".into(),
+            event_tx,
+            20,
+            max_tool_calls_per_turn,
+            0,
+            None,
+        );
+        (agent, event_rx)
+    }
+
+    /// The incident's 8-distinct-paths × ~950-repeats shape, N total
+    /// duplicate `read_file`-shaped calls across 8 distinct inputs.
+    fn incident_round(n: usize) -> Vec<StreamChunk> {
+        let paths = [
+            "crates/core/src/agent.rs",
+            "crates/core/src/agent_driver.rs",
+            "crates/core/src/tool_pipeline.rs",
+            "crates/core/src/harness.rs",
+            "crates/common/src/event.rs",
+            "crates/common/src/config.rs",
+            "crates/runtime/src/supervisor.rs",
+            "crates/cli/src/stream.rs",
+        ];
+        let mut round = Vec::with_capacity(n + 1);
+        for i in 0..n {
+            round.push(use_call(
+                &format!("call_{i:05}",),
+                "count",
+                serde_json::json!({"path": paths[i % paths.len()]}),
+            ));
+        }
+        round.push(StreamChunk::Finish {
+            reason: "tool_calls".into(),
+        });
+        round
+    }
+
+    /// ROOT-CAUSE PROBE 1 (pipeline exoneration, drained consumer): the
+    /// incident's revised timeline — all Started events + the giant
+    /// MessageRecorded WERE written, so the consumer was draining; the
+    /// wedge appeared afterwards, inside the post-recording phase. This test
+    /// keeps the consumer draining (tight recv loop) and bypasses the cap
+    /// (10_000) for a 5,000-call duplicate batch. If the tool pipeline
+    /// (repeat-guard bookkeeping, approval scan, join_all execution) had a
+    /// super-linear or wedging pathology, this test stalls into the 30 s
+    /// timeout. Timings are printed for the design.md root-cause note.
+    #[tokio::test]
+    async fn giant_duplicate_batch_cap_bypassed_completes_when_events_drain() {
+        const N: usize = 5_000;
+        let round2 = vec![
+            StreamChunk::TextDelta("done".into()),
+            StreamChunk::Finish {
+                reason: "stop".into(),
+            },
+        ];
+        let (provider, calls) = RoundsProvider::new(vec![incident_round(N), round2]);
+        let executions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut agent, event_rx) = flood_agent(
+            Arc::new(provider),
+            Box::new(CountingTool {
+                executions: Arc::clone(&executions),
+            }),
+            256, // production buffer (supervisor.rs wires mpsc::channel(256))
+            16,
+        );
+        agent.set_max_tool_calls_per_message(10_000); // cap BYPASSED
+        let drainer = spawn_drainer(event_rx, None);
+
+        let started_at = Instant::now();
+        let text = tokio::time::timeout(
+            Duration::from_secs(30),
+            agent.run_turn("go", Path::new("."), &[]),
+        )
+        .await
+        .expect("drained-consumer giant batch must NOT wedge (see design.md root-cause note)")
+        .expect("turn completes");
+        let elapsed = started_at.elapsed();
+        eprintln!(
+            "root-cause probe 1 (5,000 dup calls, cap bypassed, drained consumer): {elapsed:?}"
+        );
+
+        assert_eq!(text, "done");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "turn reached final answer");
+        assert_eq!(
+            executions.lock().expect("executions lock").len(),
+            8,
+            "intra-batch dedup collapses the flood to the 8 distinct inputs"
+        );
+        drop(agent); // release the last event_tx clone so the drainer can see close
+        let tally = drainer.await.expect("drainer");
+        assert_eq!(
+            tally.completed, N,
+            "every call_id gets a completion (must-deliver)"
+        );
+        assert_eq!(
+            tally.tool_result_messages, N,
+            "replay-critical tool MessageRecorded events: zero loss"
+        );
+        assert_eq!(tally.assistant_tool_call_blocks, N);
+        assert_eq!(tally.turn_completed, 1);
+    }
+
+    /// ROOT-CAUSE PROBE 2 (distinct flood): 5,000 DISTINCT calls with the cap
+    /// and the per-turn budget bypassed — the worst-case pipeline load
+    /// (Phase-1 guard+approval per call, join_all over 5,000 executions,
+    /// fan-out assembly). Drained consumer; must complete linearly.
+    #[tokio::test]
+    async fn giant_distinct_batch_cap_bypassed_completes_when_events_drain() {
+        const N: usize = 5_000;
+        let mut round1 = Vec::with_capacity(N + 1);
+        for i in 0..N {
+            round1.push(use_call(
+                &format!("call_{i:05}"),
+                "count",
+                serde_json::json!({"n": i}),
+            ));
+        }
+        round1.push(StreamChunk::Finish {
+            reason: "tool_calls".into(),
+        });
+        let round2 = vec![
+            StreamChunk::TextDelta("done".into()),
+            StreamChunk::Finish {
+                reason: "stop".into(),
+            },
+        ];
+        let (provider, _calls) = RoundsProvider::new(vec![round1, round2]);
+        let executions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut agent, event_rx) = flood_agent(
+            Arc::new(provider),
+            Box::new(CountingTool {
+                executions: Arc::clone(&executions),
+            }),
+            256,
+            N as u32 + 16, // per-turn budget also bypassed for the probe
+        );
+        agent.set_max_tool_calls_per_message(10_000);
+        let drainer = spawn_drainer(event_rx, None);
+
+        let started_at = Instant::now();
+        let text = tokio::time::timeout(
+            Duration::from_secs(30),
+            agent.run_turn("go", Path::new("."), &[]),
+        )
+        .await
+        .expect("distinct-flood pipeline must stay linear (drained consumer)")
+        .expect("turn completes");
+        let elapsed = started_at.elapsed();
+        eprintln!("root-cause probe 2 (5,000 distinct calls, drained consumer): {elapsed:?}");
+
+        assert_eq!(text, "done");
+        assert_eq!(
+            executions.lock().expect("executions lock").len(),
+            N,
+            "no dedup: every distinct call executes"
+        );
+        drop(agent); // release the last event_tx clone so the drainer can see close
+        let tally = drainer.await.expect("drainer");
+        assert_eq!(tally.completed, N);
+        assert_eq!(tally.tool_result_messages, N);
+    }
+
+    /// THE REGRESSION (PRD acceptance): the incident's stall shape — bounded
+    /// event channel under flood with a consumer that stops keeping up. The
+    /// turn must still terminate with full must-deliver fidelity; only the
+    /// droppable Started notices are elided (and accounted). Pre-fix every
+    /// event used a blocking send, so the 5,000-Started flood parked the
+    /// stream loop on send #257 until the consumer resumed — and a consumer
+    /// that never resumed (the 20-minute incident) wedged the turn with
+    /// zero completions and no terminal event, exactly as logged.
+    #[tokio::test]
+    async fn flood_backpressure_elides_started_but_never_must_deliver() {
+        const N: usize = 5_000;
+        let round2 = vec![
+            StreamChunk::TextDelta("done".into()),
+            StreamChunk::Finish {
+                reason: "stop".into(),
+            },
+        ];
+        let (provider, _calls) = RoundsProvider::new(vec![incident_round(N), round2]);
+        let executions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut agent, event_rx) = flood_agent(
+            Arc::new(provider),
+            Box::new(CountingTool {
+                executions: Arc::clone(&executions),
+            }),
+            256, // production buffer
+            16,
+        );
+        agent.set_max_tool_calls_per_message(10_000); // cap BYPASSED — isolate the classification fix
+        // Consumer freezes for 2 s (mid-flood), then drains — the incident's
+        // stall window, bounded so the must-deliver backlog can clear.
+        let drainer = spawn_drainer(event_rx, Some(Duration::from_secs(2)));
+
+        let started_at = Instant::now();
+        let text = tokio::time::timeout(
+            Duration::from_secs(30),
+            agent.run_turn("go", Path::new("."), &[]),
+        )
+        .await
+        .expect("turn must terminate despite the consumer stall")
+        .expect("turn completes");
+        let elapsed = started_at.elapsed();
+        eprintln!("regression (5,000 dup calls, 2 s consumer stall, cap bypassed): {elapsed:?}");
+
+        assert_eq!(text, "done");
+        assert_eq!(executions.lock().expect("executions lock").len(), 8);
+        drop(agent); // release the last event_tx clone so the drainer can see close
+        let tally = drainer.await.expect("drainer");
+
+        // Must-deliver fidelity: zero loss, brackets closed.
+        assert_eq!(tally.completed, N, "completions are never elided");
+        assert_eq!(
+            tally.tool_result_messages, N,
+            "replay state is never elided"
+        );
+        assert_eq!(tally.assistant_tool_call_blocks, N);
+        assert_eq!(tally.turn_completed, 1, "terminal event delivered");
+
+        // Droppable flood: lossy but fully accounted.
+        assert!(
+            tally.elided > 0,
+            "the stalled window must elide Started notices"
+        );
+        assert!(
+            tally.started < N,
+            "classification active: not all 5,000 Started notices were delivered"
+        );
+        assert!(
+            tally.elided_before_assistant_record,
+            "EventsElided summary must precede the next guaranteed event"
+        );
+    }
+
+    /// History-size measurement for the oracle review (out-of-scope design
+    /// question: trimming the giant assistant message). Builds the exact
+    /// incident shape — 7,642 duplicate tool_use blocks over 8 distinct
+    /// paths — and reports serialized bytes + estimated tokens.
+    #[test]
+    fn giant_assistant_message_size_measurement() {
+        const N: usize = 7_642;
+        let paths = [
+            "crates/core/src/agent.rs",
+            "crates/core/src/agent_driver.rs",
+            "crates/core/src/tool_pipeline.rs",
+            "crates/core/src/harness.rs",
+            "crates/common/src/event.rs",
+            "crates/common/src/config.rs",
+            "crates/runtime/src/supervisor.rs",
+            "crates/cli/src/stream.rs",
+        ];
+        let tool_calls: Vec<MessageToolCall> = (0..N)
+            .map(|i| MessageToolCall {
+                // Realistic provider id length (OpenAI-style `call_…`).
+                id: format!("call_{i:05}_a1b2c3d4e5f6g7h8"),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path": paths[i % paths.len()]}),
+            })
+            .collect();
+        let msg = Message::assistant_with_tool_calls("", tool_calls);
+        let event = AgentEvent::MessageRecorded { message: msg };
+        let bytes = serde_json::to_string(&event).expect("serialize").len();
+        let est_tokens = bytes / 4; // same heuristic as KeepaliveSnapshot::est_tokens
+        eprintln!(
+            "incident giant assistant MessageRecorded: {N} tool_use blocks = {bytes} bytes serialized, ~{est_tokens} est. tokens"
+        );
+        assert!(
+            bytes / N >= 100,
+            "sanity: each serialized tool_use block costs ≥100 bytes"
+        );
     }
 }

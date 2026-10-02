@@ -83,6 +83,10 @@ default = "minimax"
 # history_dir = ".nca/sessions"     # 相对于工作区
 # max_turns_per_run = 1024
 # max_tool_calls_per_turn = 200
+# max_tool_calls_per_message = 32   # 单条助手消息内工具调用数上限（模型退化事故防护）；
+#                                   # 超出的调用从记录的消息中裁剪（首个保留结果附一行
+#                                   # 守护提示），同一批次内完全相同的调用只执行一次并
+#                                   # 将结果扇出给所有 call_id；默认 32
 # checkpoint_interval = 5
 # last_session_file = ".nca/.last_session"
 # auto_compact_on_finish = false

@@ -7,7 +7,7 @@
 //! "check → approve → execute" flow from the streaming/parser logic in
 //! AgentLoop.
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::time::Duration;
 
 use nca_common::event::AgentEvent;
@@ -49,6 +49,11 @@ pub struct PipelineResult {
 ///
 /// `workspace_root` is included in every hook payload as a top-level
 /// `workspace` string so hook scripts can identify the source directory.
+///
+/// `elided_events` is the caller-owned backpressure elision counter (see
+/// [`crate::agent::emit_classified`]); pipeline emissions share the agent's
+/// accounting so the summary flushes before the next must-deliver event
+/// regardless of which path dropped notices.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tool_pipeline(
     tools: &ToolRegistry,
@@ -59,14 +64,25 @@ pub async fn run_tool_pipeline(
     tool_calls: Vec<ToolCall>,
     repeat_guard: &mut RepeatCallGuard,
     workspace_root: &str,
+    elided_events: &AtomicU64,
 ) -> Result<PipelineResult, String> {
     let mut events = Vec::new();
     let mut guard_refusals: Vec<(String, String)> = Vec::new();
-    let mut emit = |e: AgentEvent| {
-        events.push(e.clone());
-        // Best-effort send; if the channel is full the event is still recorded.
-        let _ = event_tx.try_send(e);
-    };
+
+    /// Classified send (must-deliver blocking, droppable elided) + collection
+    /// into the returned `PipelineResult::events`. Previously every pipeline
+    /// event went through a bare `try_send` — under a flood (the 2026-10-02
+    /// incident shape) an `ApprovalRequested` could be silently dropped,
+    /// leaving the user unable to see (and answer) a pending approval.
+    async fn emit_event(
+        events: &mut Vec<AgentEvent>,
+        event_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+        elided_events: &AtomicU64,
+        event: AgentEvent,
+    ) {
+        crate::agent::emit_classified(event_tx, elided_events, event.clone()).await;
+        events.push(event);
+    }
 
     // ── Phase 1: permission checks (sequential — approvals may be interactive) ──
     enum Ticket {
@@ -115,11 +131,17 @@ pub async fn run_tool_pipeline(
 
             PermissionTier::Ask => {
                 let description = format!("Tool `{}` requires approval", call.name);
-                emit(AgentEvent::ApprovalRequested {
-                    call_id: call.id.clone(),
-                    tool: call.name.clone(),
-                    description: description.clone(),
-                });
+                emit_event(
+                    &mut events,
+                    event_tx,
+                    elided_events,
+                    AgentEvent::ApprovalRequested {
+                        call_id: call.id.clone(),
+                        tool: call.name.clone(),
+                        description: description.clone(),
+                    },
+                )
+                .await;
                 if let Some(hooks) = hooks {
                     hooks
                         .run_best_effort(
@@ -141,11 +163,17 @@ pub async fn run_tool_pipeline(
                     ApprovalVerdict::AllowPattern(p) => Some(p.clone()),
                     _ => None,
                 };
-                emit(AgentEvent::ApprovalResolved {
-                    call_id: call.id.clone(),
-                    approved,
-                    allow_pattern: allow_pattern.clone(),
-                });
+                emit_event(
+                    &mut events,
+                    event_tx,
+                    elided_events,
+                    AgentEvent::ApprovalResolved {
+                        call_id: call.id.clone(),
+                        approved,
+                        allow_pattern: allow_pattern.clone(),
+                    },
+                )
+                .await;
                 if let Some(pattern) = allow_pattern {
                     approval.add_session_allow(pattern);
                 }
@@ -184,9 +212,15 @@ pub async fn run_tool_pipeline(
                             "tool `{}` requires approval in headless mode; rerun with a non-interactive permission mode such as `dont-ask` or `bypass-permissions`",
                             call.name
                         );
-                        emit(AgentEvent::Error {
-                            message: message.clone(),
-                        });
+                        emit_event(
+                            &mut events,
+                            event_tx,
+                            elided_events,
+                            AgentEvent::Error {
+                                message: message.clone(),
+                            },
+                        )
+                        .await;
                         return Err(message);
                     }
                     tickets.push(Ticket::Resolved(ToolResult {
@@ -453,6 +487,7 @@ mod tests {
         let mut approval = ApprovalPolicy::new(config.permissions);
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
         let cancel = AtomicBool::new(false);
+        let elided = AtomicU64::new(0);
         run_tool_pipeline(
             tools,
             &mut approval,
@@ -462,6 +497,7 @@ mod tests {
             calls,
             guard,
             "/ws",
+            &elided,
         )
         .await
     }

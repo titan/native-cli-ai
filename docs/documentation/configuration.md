@@ -106,10 +106,20 @@ See [Permissions](./permissions.md) for full details on each mode.
 history_dir = ".nca/sessions"       # Relative to workspace
 max_turns_per_run = 1024             # Max agent turns per session run
 max_tool_calls_per_turn = 200       # Max tool calls in a single turn
+max_tool_calls_per_message = 32     # Max tool calls executed per assistant message
 checkpoint_interval = 5             # Save checkpoint every N turns
 last_session_file = ".nca/.last_session"
 auto_compact_on_finish = false      # Auto-summarize when session ends
 ```
+
+> **Note — batch guardrails:** `max_tool_calls_per_message` (default 32) contains degenerate
+> model output such as a single message carrying thousands of duplicate tool calls. Calls past
+> the cap are trimmed from the recorded message (with a one-line guard note on the first kept
+> result) so the conversation stays structurally valid; identical duplicate calls within one
+> batch execute once and the result is
+> fanned out to every duplicate call_id. Both cases emit an informational `ToolBatchGuarded`
+> event — not a failure. Under event backpressure, high-frequency stream notices may be elided
+> and accounted in a single `EventsElided` summary event.
 
 ### `[harness]` — System Prompt and Instructions
 

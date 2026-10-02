@@ -956,6 +956,10 @@ impl Supervisor {
             &fs.mounted_paths(),
         );
         agent.set_system_prompt(system_prompt);
+        // Per-message tool-call batch cap (`[session] max_tool_calls_per_message`,
+        // incident 2026-10-02 containment). Set at the single construction
+        // site so parent, resumed, and subagent-child sessions all get it.
+        agent.set_max_tool_calls_per_message(config.session.max_tool_calls_per_message);
         agent.set_keepalive_profile(cache_keepalive::resolve_profile(config.provider.default));
         // Middleware chain composition (roadmap initial order, knobs from
         // `[middleware]`, compaction mode from `[memory.context]`):

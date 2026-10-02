@@ -151,6 +151,28 @@ pub enum AgentEvent {
         call_id: String,
         delta: String,
     },
+    /// Droppable events were elided because the bounded event channel was
+    /// full (backpressure). Emitted immediately BEFORE the next successfully
+    /// delivered must-deliver event, so consumers can attribute the gap.
+    /// Replay-ignored; renderers show one dim summary line. The count covers
+    /// only events classified droppable by
+    /// [`AgentEvent::is_droppable_under_backpressure`] — must-deliver events
+    /// are never elided.
+    EventsElided {
+        #[serde(default)]
+        count: u64,
+    },
+    /// A tool-call batch was contained by the batch guardrails: calls dropped
+    /// past `max_tool_calls_per_message` and/or duplicate (name, input) calls
+    /// collapsed to one execution. Informational, not a failure.
+    ToolBatchGuarded {
+        /// Calls dropped for exceeding the per-message cap.
+        #[serde(default)]
+        dropped: usize,
+        /// (tool name, occurrences) groups where identical calls were collapsed.
+        #[serde(default)]
+        deduplicated: Vec<(String, usize)>,
+    },
     ApprovalRequested {
         call_id: String,
         tool: String,
@@ -356,6 +378,35 @@ pub enum AgentEvent {
         #[serde(default)]
         duration_ms: u64,
     },
+}
+
+impl AgentEvent {
+    /// Whether this event may be DROPPED when the bounded event channel is
+    /// full, instead of blocking the producer (backpressure elision).
+    ///
+    /// Classification policy (incident 2026-10-02, Chunk 3b):
+    /// - **Droppable** (lossy notices whose information is fully carried by a
+    ///   later must-deliver event): `ToolCallStarted` (the completion carries
+    ///   the result), `TokensStreamed`/`ReasoningStreamed` (the recorded
+    ///   assistant message carries the full text), `ToolOutputChunk` (the
+    ///   completion carries the full output).
+    /// - **Must-deliver** (everything else — deny by default, including any
+    ///   future variant): replay-state (`MessageRecorded`, `HistoryReplaced`),
+    ///   bracket/terminal events, approvals, questions, errors. Dropping any
+    ///   of these would corrupt the replay projection, orphan an interactive
+    ///   oneshot, or hide a failure.
+    ///
+    /// Elided droppables are accounted: an [`AgentEvent::EventsElided`]
+    /// summary is emitted before the next delivered must-deliver event.
+    pub fn is_droppable_under_backpressure(&self) -> bool {
+        matches!(
+            self,
+            AgentEvent::ToolCallStarted { .. }
+                | AgentEvent::TokensStreamed { .. }
+                | AgentEvent::ReasoningStreamed { .. }
+                | AgentEvent::ToolOutputChunk { .. }
+        )
+    }
 }
 
 /// One selectable row shown for an interactive question.
@@ -631,6 +682,160 @@ mod interactive_question_serde_tests {
                 assert_eq!(from, "DeepSeek");
                 assert_eq!(to, "OpenAI");
                 assert_eq!(reason, "");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn events_elided_roundtrip() {
+        let ev = AgentEvent::EventsElided { count: 4_754 };
+        let json = serde_json::to_string(&ev).expect("serialize");
+        assert!(
+            json.contains("\"type\":\"EventsElided\""),
+            "tagged wire form: {json}"
+        );
+        let back: AgentEvent = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            AgentEvent::EventsElided { count } => assert_eq!(count, 4_754),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn events_elided_torn_tail_still_deserializes() {
+        // A partially-written log tail may drop trailing fields; serde
+        // defaults must tolerate a missing count.
+        let raw = r#"{"type":"EventsElided"}"#;
+        let back: AgentEvent = serde_json::from_str(raw).expect("deserialize");
+        match back {
+            AgentEvent::EventsElided { count } => assert_eq!(count, 0),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn backpressure_classification_drops_only_lossy_notices() {
+        // Droppable: high-frequency notices whose content is fully carried
+        // by a later must-deliver event.
+        assert!(
+            AgentEvent::ToolCallStarted {
+                call_id: "c".into(),
+                tool: "read".into(),
+                input: serde_json::json!({}),
+            }
+            .is_droppable_under_backpressure()
+        );
+        assert!(AgentEvent::TokensStreamed { delta: "x".into() }.is_droppable_under_backpressure());
+        assert!(
+            AgentEvent::ReasoningStreamed { delta: "x".into() }.is_droppable_under_backpressure()
+        );
+        assert!(
+            AgentEvent::ToolOutputChunk {
+                call_id: "c".into(),
+                delta: "x".into(),
+            }
+            .is_droppable_under_backpressure()
+        );
+
+        // Must-deliver spot checks: replay state, brackets, interaction,
+        // errors — and unknown/future kinds deny by default via the
+        // exhaustive `matches!` above (a new variant must opt IN to be
+        // droppable, so adding one is a compile-time review point).
+        let must_deliver = [
+            AgentEvent::MessageRecorded {
+                message: crate::message::Message::user("u"),
+            },
+            AgentEvent::ToolCallCompleted {
+                call_id: "c".into(),
+                output: crate::tool::ToolResult {
+                    call_id: "c".into(),
+                    success: true,
+                    output: String::new(),
+                    error: None,
+                    timed_out: false,
+                },
+                duration_ms: 0,
+            },
+            AgentEvent::TurnCompleted {
+                turn_id: 1,
+                duration_ms: 0,
+            },
+            AgentEvent::Error {
+                message: "boom".into(),
+            },
+            AgentEvent::QuestionRequested {
+                question: InteractiveQuestionPayload {
+                    question_id: "q".into(),
+                    call_id: "c".into(),
+                    prompt: "p".into(),
+                    options: vec![],
+                    allow_custom: false,
+                    suggested_answer: String::new(),
+                },
+            },
+            AgentEvent::ApprovalRequested {
+                call_id: "c".into(),
+                tool: "t".into(),
+                description: "d".into(),
+            },
+            AgentEvent::ToolBatchGuarded {
+                dropped: 0,
+                deduplicated: vec![],
+            },
+            AgentEvent::HistoryReplaced { messages: vec![] },
+        ];
+        for event in &must_deliver {
+            assert!(
+                !event.is_droppable_under_backpressure(),
+                "must-deliver event classified droppable: {event:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_batch_guarded_roundtrip() {
+        let ev = AgentEvent::ToolBatchGuarded {
+            dropped: 5,
+            deduplicated: vec![("read_file".into(), 950), ("search_code".into(), 2)],
+        };
+        let json = serde_json::to_string(&ev).expect("serialize");
+        assert!(
+            json.contains("\"type\":\"ToolBatchGuarded\""),
+            "tagged wire form: {json}"
+        );
+        let back: AgentEvent = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            AgentEvent::ToolBatchGuarded {
+                dropped,
+                deduplicated,
+            } => {
+                assert_eq!(dropped, 5);
+                assert_eq!(
+                    deduplicated,
+                    vec![
+                        ("read_file".to_string(), 950),
+                        ("search_code".to_string(), 2)
+                    ]
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn tool_batch_guarded_torn_tail_still_deserializes() {
+        // A partially-written log tail may drop trailing fields; serde
+        // defaults must tolerate both a missing count and missing groups.
+        let raw = r#"{"type":"ToolBatchGuarded","dropped":3}"#;
+        let back: AgentEvent = serde_json::from_str(raw).expect("deserialize");
+        match back {
+            AgentEvent::ToolBatchGuarded {
+                dropped,
+                deduplicated,
+            } => {
+                assert_eq!(dropped, 3);
+                assert!(deduplicated.is_empty());
             }
             _ => panic!("wrong variant"),
         }

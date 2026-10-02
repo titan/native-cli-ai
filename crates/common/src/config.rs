@@ -2332,6 +2332,15 @@ pub struct SessionConfig {
     #[serde(alias = "max_turn_per_run")]
     pub max_turns_per_run: u32,
     pub max_tool_calls_per_turn: u32,
+    /// Maximum tool calls accepted from a single assistant message before the
+    /// rest are dropped. Excess calls in a single assistant message are
+    /// dropped with synthetic error tool results (one per dropped call_id, so
+    /// the tool_calls/tool-results pairing stays balanced for OpenAI-style
+    /// providers). Guards against degenerate model output flooding the
+    /// pipeline (incident 2026-10-02: one message carried 7,642 duplicate
+    /// `read_file` tool_use blocks and wedged the session).
+    #[serde(default = "default_max_tool_calls_per_message")]
+    pub max_tool_calls_per_message: usize,
     pub checkpoint_interval: u32,
     /// File that stores the last active session ID for auto-resume.
     pub last_session_file: PathBuf,
@@ -2346,6 +2355,7 @@ impl Default for SessionConfig {
             history_dir: PathBuf::from(".nca/sessions"),
             max_turns_per_run: 1024,
             max_tool_calls_per_turn: 200,
+            max_tool_calls_per_message: default_max_tool_calls_per_message(),
             checkpoint_interval: 5,
             last_session_file: PathBuf::from(".nca/.last_session"),
             auto_compact_on_finish: false,
@@ -2704,6 +2714,9 @@ impl SessionConfig {
         if let Some(max_tool_calls_per_turn) = partial.max_tool_calls_per_turn {
             self.max_tool_calls_per_turn = max_tool_calls_per_turn;
         }
+        if let Some(max_tool_calls_per_message) = partial.max_tool_calls_per_message {
+            self.max_tool_calls_per_message = max_tool_calls_per_message;
+        }
         if let Some(checkpoint_interval) = partial.checkpoint_interval {
             self.checkpoint_interval = checkpoint_interval;
         }
@@ -2928,6 +2941,7 @@ struct PartialSessionConfig {
     #[serde(alias = "max_turn_per_run")]
     max_turns_per_run: Option<u32>,
     max_tool_calls_per_turn: Option<u32>,
+    max_tool_calls_per_message: Option<usize>,
     checkpoint_interval: Option<u32>,
     last_session_file: Option<PathBuf>,
     auto_compact_on_finish: Option<bool>,
@@ -3002,6 +3016,12 @@ struct PartialWebConfig {
     default_search_limit: Option<usize>,
     user_agent: Option<String>,
     search_endpoint: Option<String>,
+}
+
+/// Default for `[session] max_tool_calls_per_message`. Also the default the
+/// agent loop itself uses until the supervisor wires the config knob in.
+pub const fn default_max_tool_calls_per_message() -> usize {
+    32
 }
 
 fn default_true() -> bool {
@@ -4692,6 +4712,33 @@ host_xdg_runtime = true
         assert!(
             !raw.contains("/opt/data"),
             "unmounted path must not linger in config file: {raw}"
+        );
+    }
+
+    #[test]
+    fn session_max_tool_calls_per_message_default_and_override() {
+        // Default: 32 — blast-radius containment for degenerate batches.
+        assert_eq!(default_max_tool_calls_per_message(), 32);
+        assert_eq!(
+            NcaConfig::default().session.max_tool_calls_per_message,
+            default_max_tool_calls_per_message()
+        );
+
+        // TOML override merges per-key.
+        let partial: PartialNcaConfig =
+            toml::from_str("[session]\nmax_tool_calls_per_message = 4\n").expect("parse");
+        let mut config = NcaConfig::default();
+        config.merge(partial);
+        assert_eq!(config.session.max_tool_calls_per_message, 4);
+
+        // Old configs without the key keep the default (serde default path).
+        let old: PartialNcaConfig =
+            toml::from_str("[session]\nmax_tool_calls_per_turn = 100\n").expect("parse old");
+        let mut config = NcaConfig::default();
+        config.merge(old);
+        assert_eq!(
+            config.session.max_tool_calls_per_message, 32,
+            "missing key keeps the default"
         );
     }
 

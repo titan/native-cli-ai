@@ -74,6 +74,7 @@ async fn run_batch(
     let hooks: Option<HookRunner> = None;
     let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
     let cancel_flag = AtomicBool::new(false);
+    let elided = std::sync::atomic::AtomicU64::new(0);
     let pipeline = run_tool_pipeline(
         tools,
         &mut approval,
@@ -83,6 +84,7 @@ async fn run_batch(
         calls,
         guard,
         "/tmp/test-workspace",
+        &elided,
     )
     .await
     .expect("pipeline must not be cancelled");

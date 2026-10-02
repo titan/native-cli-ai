@@ -626,6 +626,28 @@ fn render_event(event: &AgentEvent, stats: &StreamStats) {
                 format!("↳ provider fallback · {from} → {to} · {reason}").color(theme::TEXT_DIM)
             );
         }
+        AgentEvent::ToolBatchGuarded {
+            dropped,
+            deduplicated,
+        } => {
+            print!("{}", theme::CLEAR_LINE);
+            println!(
+                "  {}",
+                format!(
+                    "⚠ tool batch guarded: {}",
+                    tool_batch_guarded_details(*dropped, deduplicated)
+                )
+                .color(theme::TEXT_DIM)
+            );
+        }
+        AgentEvent::EventsElided { count } => {
+            print!("{}", theme::CLEAR_LINE);
+            println!(
+                "  {}",
+                format!("… {count} stream notices elided (channel under backpressure)")
+                    .color(theme::TEXT_DIM)
+            );
+        }
         AgentEvent::ContextCompactionStart {
             tokens_before,
             reason,
@@ -710,6 +732,25 @@ fn render_event(event: &AgentEvent, stats: &StreamStats) {
 }
 
 /// Public wrapper for rendering a single event (used by main.rs)
+/// Human-readable detail segment for [`AgentEvent::ToolBatchGuarded`]:
+/// `"5 calls dropped past the batch cap; read_file ×950 deduplicated"`
+/// (each segment only when it applies).
+fn tool_batch_guarded_details(dropped: usize, deduplicated: &[(String, usize)]) -> String {
+    let mut segments = Vec::new();
+    if dropped > 0 {
+        segments.push(format!("{dropped} calls dropped past the batch cap"));
+    }
+    if !deduplicated.is_empty() {
+        let groups = deduplicated
+            .iter()
+            .map(|(tool, n)| format!("{tool} ×{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        segments.push(format!("{groups} deduplicated"));
+    }
+    segments.join("; ")
+}
+
 pub fn render_human_event(event: &AgentEvent) {
     let stats = StreamStats::new();
     render_event(event, &stats);
@@ -745,6 +786,41 @@ mod tests {
             to: "OpenAI".into(),
             reason: "rate_limited: Rate limited, retry after 1000ms".into(),
         });
+    }
+
+    #[test]
+    fn render_tool_batch_guarded_does_not_panic() {
+        render_human_event(&AgentEvent::ToolBatchGuarded {
+            dropped: 5,
+            deduplicated: vec![("read_file".into(), 950)],
+        });
+        // Dedup-only containment (nothing dropped) must render too.
+        render_human_event(&AgentEvent::ToolBatchGuarded {
+            dropped: 0,
+            deduplicated: vec![("search_code".into(), 2)],
+        });
+    }
+
+    #[test]
+    fn render_events_elided_does_not_panic() {
+        // Backpressure elision summary: one dim line, never silent.
+        render_human_event(&AgentEvent::EventsElided { count: 4_754 });
+    }
+
+    #[test]
+    fn tool_batch_guarded_details_segments() {
+        assert_eq!(
+            tool_batch_guarded_details(5, &[("read_file".into(), 950)]),
+            "5 calls dropped past the batch cap; read_file ×950 deduplicated"
+        );
+        assert_eq!(
+            tool_batch_guarded_details(0, &[("search".into(), 2)]),
+            "search ×2 deduplicated"
+        );
+        assert_eq!(
+            tool_batch_guarded_details(3, &[]),
+            "3 calls dropped past the batch cap"
+        );
     }
 
     #[test]
