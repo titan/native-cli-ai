@@ -207,22 +207,31 @@ output, and context caching:
 | `mimo-v2.6-flash` | Efficient tier. |
 | `mimo-v2.6-pro-ultraspeed` | 20× output speed variant. |
 
-### Thinking Toggle and `max_tokens`
+### Thinking Toggle and the Output Cap
 
-MiMo supports DeepSeek-style `reasoning_content` in streaming deltas — a
-response-only signal that nca strips before re-uploading (same as DeepSeek).
+MiMo supports DeepSeek-style `reasoning_content` in streaming deltas. When
+`enable_thinking = false` (the default), nca strips it before re-uploading
+(same as DeepSeek). When thinking is enabled, MiMo requires assistant messages
+carrying `tool_calls` to pass `reasoning_content` back verbatim — omitting it
+is rejected with HTTP 400 — so nca keeps it on the wire in that mode.
 
 Thinking is toggled with a `thinking: {"type": "enabled" | "disabled"}` field in
 the request body. MiMo accepts **both** states (unlike GLM-5.3, there is no
 lock): nca sends `"disabled"` when `[model] enable_thinking = false` (the
 default, matching MiMo's own quickstart) and `"enabled"` when it is true.
 
-Like GLM, thinking shares the `max_tokens` output budget. When
-`enable_thinking = true`, nca floors `max_tokens` to 131072 (the documented
-output window) so the model cannot exhaust the cap mid-reasoning and return an
-empty `content` with `finish_reason: "length"`. With thinking off the configured
-value stands (though the 128K-class capability clamp may still raise it on the
-wire, since all MiMo v2.6 models have a 131072-token output window).
+Two wire details follow MiMo's docs instead of the generic OpenAI-compat
+format: the output cap is sent as `max_completion_tokens` (`max_tokens` is
+undocumented on MiMo, and undefined parameters may be filtered or rejected),
+and `stream_options` is omitted — MiMo streams a final usage-only chunk before
+`[DONE]` natively, so no opt-in is needed.
+
+Like GLM, thinking shares the output budget. When `enable_thinking = true`,
+nca floors the cap at 131072 (the documented output window) so the model cannot
+exhaust it mid-reasoning and return an empty `content` with
+`finish_reason: "length"`. With thinking off the configured value stands
+(though the 128K-class capability clamp may still raise it on the wire, since
+all MiMo v2.6 models have a 131072-token output window).
 
 ## Switching Providers
 

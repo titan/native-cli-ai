@@ -461,13 +461,17 @@ async fn real_parser_agrees_with_reference_on_whole_block() {
     use nca_common::message::Message;
 
     use crate::provider::Provider;
-    use crate::provider::openai_compat::{CompatProfile, OpenAiCompatProvider};
+    use crate::provider::openai_compat::{
+        CompatProfile, OpenAiCompatProvider, ReasoningWirePolicy,
+    };
     use crate::provider::test_support::spawn_sse_server;
 
     const PROFILE: CompatProfile = CompatProfile {
         name: "conformance",
         endpoint_suffix: "v1/chat/completions",
-        strip_reasoning: false,
+        reasoning: ReasoningWirePolicy::Keep,
+        send_stream_options: true,
+        use_max_completion_tokens: false,
     };
 
     for (name, bytes) in OPENAI_FIXTURES {

@@ -4,7 +4,9 @@
 mod tests {
     use crate::cache_keepalive::KeepaliveSnapshot;
     use crate::provider::factory::build_provider_for;
-    use crate::provider::openai_compat::{CompatProfile, OpenAiCompatProvider};
+    use crate::provider::openai_compat::{
+        CompatProfile, OpenAiCompatProvider, ReasoningWirePolicy,
+    };
     use crate::provider::test_support::{
         collect_chunks, spawn_sse_server, spawn_sse_server_with_body,
     };
@@ -16,7 +18,9 @@ mod tests {
     const ZHIPUAI_PROFILE: CompatProfile = CompatProfile {
         name: "zhipuai",
         endpoint_suffix: "chat/completions",
-        strip_reasoning: false,
+        reasoning: ReasoningWirePolicy::Keep,
+        send_stream_options: true,
+        use_max_completion_tokens: false,
     };
 
     #[tokio::test]

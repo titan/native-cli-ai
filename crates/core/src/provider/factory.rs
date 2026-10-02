@@ -9,37 +9,47 @@ use super::anthropic::AnthropicProvider;
 use super::fallback::{FallbackEntry, FallbackProvider};
 use super::kimi::KimiProvider;
 use super::minimax::MiniMaxProvider;
-use super::openai_compat::{CompatProfile, OpenAiCompatProvider};
+use super::openai_compat::{CompatProfile, OpenAiCompatProvider, ReasoningWirePolicy};
 use super::{Provider, ProviderError};
 
 const OPENAI_PROFILE: CompatProfile = CompatProfile {
     name: "OpenAI",
     endpoint_suffix: "v1/chat/completions",
-    strip_reasoning: false,
+    reasoning: ReasoningWirePolicy::Keep,
+    send_stream_options: true,
+    use_max_completion_tokens: false,
 };
 
 const OPENROUTER_PROFILE: CompatProfile = CompatProfile {
     name: "OpenRouter",
     endpoint_suffix: "v1/chat/completions",
-    strip_reasoning: false,
+    reasoning: ReasoningWirePolicy::Keep,
+    send_stream_options: true,
+    use_max_completion_tokens: false,
 };
 
 const ZHIPUAI_PROFILE: CompatProfile = CompatProfile {
     name: "ZhipuAI",
     endpoint_suffix: "chat/completions",
-    strip_reasoning: false,
+    reasoning: ReasoningWirePolicy::Keep,
+    send_stream_options: true,
+    use_max_completion_tokens: false,
 };
 
 const DEEPSEEK_PROFILE: CompatProfile = CompatProfile {
     name: "DeepSeek",
     endpoint_suffix: "chat/completions",
-    strip_reasoning: true,
+    reasoning: ReasoningWirePolicy::Strip,
+    send_stream_options: true,
+    use_max_completion_tokens: false,
 };
 
 const MIMO_PROFILE: CompatProfile = CompatProfile {
     name: "MiMo",
     endpoint_suffix: "chat/completions",
-    strip_reasoning: true,
+    reasoning: ReasoningWirePolicy::StripUnlessThinking,
+    send_stream_options: false,
+    use_max_completion_tokens: true,
 };
 
 /// Build the configured provider for the current workspace (uses `config.provider.default`).

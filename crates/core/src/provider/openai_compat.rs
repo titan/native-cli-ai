@@ -626,14 +626,32 @@ fn to_openai_messages(
     Ok(out)
 }
 
+/// How [`Provider::prepare_messages_for_request`] treats
+/// `reasoning_content` on assistant messages being re-uploaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningWirePolicy {
+    /// Serialize reasoning_content as-is (default OpenAI-compat behavior).
+    Keep,
+    /// Always strip reasoning_content before re-upload (DeepSeek).
+    Strip,
+    /// Strip only when thinking is not "enabled" (MiMo: pass-back is
+    /// mandatory for tool-call turns once thinking is on).
+    StripUnlessThinking,
+}
+
 /// Static profile describing the unique aspects of an OpenAI-compatible provider.
 pub struct CompatProfile {
     /// Human-readable provider name (for error messages and stream labels).
     pub name: &'static str,
     /// Provider-specific endpoint suffix appended to base_url.
     pub endpoint_suffix: &'static str,
-    /// Whether prepare_messages_for_request should strip reasoning_content.
-    pub strip_reasoning: bool,
+    /// How prepare_messages_for_request treats reasoning_content.
+    pub reasoning: ReasoningWirePolicy,
+    /// Whether to send `stream_options: {include_usage: true}` on the wire.
+    pub send_stream_options: bool,
+    /// Whether to send the output cap as `max_completion_tokens` instead of
+    /// `max_tokens`.
+    pub use_max_completion_tokens: bool,
 }
 
 /// Generic OpenAI-compatible provider parameterized by a CompatProfile.
@@ -645,7 +663,9 @@ pub struct OpenAiCompatProvider {
     temperature: f32,
     base_url: String,
     endpoint_suffix: &'static str,
-    strip_reasoning: bool,
+    reasoning: ReasoningWirePolicy,
+    send_stream_options: bool,
+    use_max_completion_tokens: bool,
     /// Vendor-specific request-body override merged into every
     /// chat/keepalive request body (e.g. ZhipuAI's
     /// `thinking: {"type": "enabled" | "disabled"}`).
@@ -701,7 +721,9 @@ impl OpenAiCompatProvider {
             temperature: compat.temperature(),
             base_url: compat.base_url().to_string(),
             endpoint_suffix: profile.endpoint_suffix,
-            strip_reasoning: profile.strip_reasoning,
+            reasoning: profile.reasoning,
+            send_stream_options: profile.send_stream_options,
+            use_max_completion_tokens: profile.use_max_completion_tokens,
             thinking: None,
         })
     }
@@ -722,6 +744,38 @@ impl OpenAiCompatProvider {
             self.endpoint_suffix
         )
     }
+
+    /// Whether the vendor `thinking` override is present and set to
+    /// `"enabled"`. `None` (no override) and any other type value count as
+    /// disabled.
+    fn thinking_enabled(&self) -> bool {
+        self.thinking
+            .as_ref()
+            .is_some_and(|t| t.get("type").and_then(Value::as_str) == Some("enabled"))
+    }
+
+    /// Apply profile-specific wire-format tweaks to a request body built by
+    /// [`openai_request_body`]: rename `max_tokens` to
+    /// `max_completion_tokens` and/or drop `stream_options`.
+    ///
+    /// MiMo documents `max_completion_tokens` ([1, 131072]) but not
+    /// `max_tokens`, and does not document `stream_options` — its docs warn
+    /// that undefined parameters may be filtered or rejected. Both call
+    /// sites (`chat()` and `keepalive_ping()`) route through here so the two
+    /// wire paths cannot drift.
+    fn apply_profile_wire(&self, body: &mut Value) {
+        if self.use_max_completion_tokens
+            && let Some(map) = body.as_object_mut()
+            && let Some(max) = map.remove("max_tokens")
+        {
+            map.insert("max_completion_tokens".into(), max);
+        }
+        if !self.send_stream_options
+            && let Some(map) = body.as_object_mut()
+        {
+            map.remove("stream_options");
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -731,7 +785,16 @@ impl Provider for OpenAiCompatProvider {
         messages: &mut Vec<Message>,
         _workspace_root: &Path,
     ) -> Result<(), ProviderError> {
-        if self.strip_reasoning {
+        let strip = match self.reasoning {
+            ReasoningWirePolicy::Keep => false,
+            ReasoningWirePolicy::Strip => true,
+            // MiMo: once thinking is enabled, assistant messages carrying
+            // tool_calls MUST pass reasoning_content back verbatim (omitting
+            // it is a guaranteed 400); with thinking off, stripping saves
+            // context like DeepSeek.
+            ReasoningWirePolicy::StripUnlessThinking => !self.thinking_enabled(),
+        };
+        if strip {
             for msg in messages.iter_mut() {
                 msg.reasoning_content = None;
             }
@@ -765,6 +828,7 @@ impl Provider for OpenAiCompatProvider {
             self.temperature,
             workspace_root,
         )?;
+        self.apply_profile_wire(&mut body);
         if let Some(thinking) = &self.thinking {
             body["thinking"] = thinking.clone();
         };
@@ -825,6 +889,7 @@ impl Provider for OpenAiCompatProvider {
             self.temperature,
             &snapshot.workspace_root,
         )?;
+        self.apply_profile_wire(&mut body);
         if let Some(thinking) = &self.thinking {
             body["thinking"] = thinking.clone();
         };

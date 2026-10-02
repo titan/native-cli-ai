@@ -7,14 +7,18 @@ mod tests {
     use nca_common::tool::ToolDefinition;
     use serde_json::json;
 
-    use crate::provider::openai_compat::{CompatProfile, OpenAiCompatProvider};
+    use crate::provider::openai_compat::{
+        CompatProfile, OpenAiCompatProvider, ReasoningWirePolicy,
+    };
     use crate::provider::test_support::{collect_chunks, spawn_sse_server};
     use crate::provider::{Provider, StreamChunk};
 
     const OPENAI_PROFILE: CompatProfile = CompatProfile {
         name: "OpenAI",
         endpoint_suffix: "v1/chat/completions",
-        strip_reasoning: false,
+        reasoning: ReasoningWirePolicy::Keep,
+        send_stream_options: true,
+        use_max_completion_tokens: false,
     };
 
     fn build_provider(config: &NcaConfig) -> OpenAiCompatProvider {

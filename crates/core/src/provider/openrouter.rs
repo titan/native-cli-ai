@@ -2,7 +2,9 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::provider::openai_compat::{CompatProfile, OpenAiCompatProvider};
+    use crate::provider::openai_compat::{
+        CompatProfile, OpenAiCompatProvider, ReasoningWirePolicy,
+    };
     use crate::provider::test_support::{collect_chunks, spawn_sse_server};
     use crate::provider::{Provider, StreamChunk};
     use nca_common::config::NcaConfig;
@@ -11,7 +13,9 @@ mod tests {
     const OPENROUTER_PROFILE: CompatProfile = CompatProfile {
         name: "openrouter",
         endpoint_suffix: "v1/chat/completions",
-        strip_reasoning: false,
+        reasoning: ReasoningWirePolicy::Keep,
+        send_stream_options: true,
+        use_max_completion_tokens: false,
     };
 
     #[tokio::test]

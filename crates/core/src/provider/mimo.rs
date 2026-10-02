@@ -4,17 +4,22 @@
 mod tests {
     use crate::cache_keepalive::KeepaliveSnapshot;
     use crate::provider::factory::build_provider_for;
-    use crate::provider::openai_compat::{CompatProfile, OpenAiCompatProvider};
+    use crate::provider::openai_compat::{
+        CompatProfile, OpenAiCompatProvider, ReasoningWirePolicy,
+    };
     use crate::provider::test_support::{collect_chunks, spawn_sse_server_with_body};
     use crate::provider::{Provider, StreamChunk};
     use nca_common::config::{NcaConfig, ProviderKind};
     use nca_common::message::Message;
     use std::path::{Path, PathBuf};
 
+    // Mirrors the factory's MIMO_PROFILE (wire format must stay in sync).
     const MIMO_PROFILE: CompatProfile = CompatProfile {
         name: "mimo",
         endpoint_suffix: "chat/completions",
-        strip_reasoning: true,
+        reasoning: ReasoningWirePolicy::StripUnlessThinking,
+        send_stream_options: false,
+        use_max_completion_tokens: true,
     };
 
     #[tokio::test]
@@ -94,7 +99,22 @@ mod tests {
                 serde_json::json!({ "type": "disabled" }),
                 "body: {request_body}"
             );
-            assert_eq!(parsed["max_tokens"], 131_072, "body: {request_body}");
+            // MiMo wire format: the output cap travels as
+            // max_completion_tokens (documented; max_tokens is not), and
+            // stream_options is omitted (undocumented — the final usage
+            // chunk arrives natively). max_completion_tokens is the 8192
+            // default at the factory (thinking off → no factory floor), but
+            // the capability clamp in chat() raises it to 131072 anyway —
+            // mimo-v2.6 is a 128K-class model.
+            assert_eq!(
+                parsed["max_completion_tokens"], 131_072,
+                "body: {request_body}"
+            );
+            assert!(parsed.get("max_tokens").is_none(), "body: {request_body}");
+            assert!(
+                parsed.get("stream_options").is_none(),
+                "body: {request_body}"
+            );
             assert_eq!(parsed["model"], "mimo-v2.6-pro", "body: {request_body}");
         });
 
@@ -139,8 +159,18 @@ mod tests {
                 serde_json::json!({ "type": "enabled" }),
                 "body: {request_body}"
             );
-            // Default 8192 max_tokens must be floored to 131072 end-to-end.
-            assert_eq!(parsed["max_tokens"], 131_072, "body: {request_body}");
+            // Default 8192 max_tokens must be floored to 131072 end-to-end,
+            // carried as max_completion_tokens (no max_tokens, no
+            // stream_options — the MiMo wire format).
+            assert_eq!(
+                parsed["max_completion_tokens"], 131_072,
+                "body: {request_body}"
+            );
+            assert!(parsed.get("max_tokens").is_none(), "body: {request_body}");
+            assert!(
+                parsed.get("stream_options").is_none(),
+                "body: {request_body}"
+            );
             assert_eq!(parsed["model"], "mimo-v2.6-pro", "body: {request_body}");
         });
 
@@ -168,9 +198,12 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_strips_reasoning_content() {
-        // MiMo streams DeepSeek-style reasoning_content (response-only
-        // signal): prepare_messages_for_request must strip it before
-        // re-upload, mirroring the DeepSeek profile.
+        // MiMo streams DeepSeek-style reasoning_content, and this provider is
+        // built via `from_config` WITHOUT `.with_thinking` — `thinking` is
+        // None, which StripUnlessThinking treats as thinking-disabled, so
+        // prepare_messages_for_request must strip before re-upload (context
+        // savings, mirroring the DeepSeek profile). The pass-back-preserving
+        // branch only activates once thinking = {"type": "enabled"}.
         let mut config = NcaConfig::default();
         config.provider.mimo.api_key = Some("test".into());
         let provider = OpenAiCompatProvider::from_config(
@@ -202,6 +235,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepare_keeps_reasoning_content_when_thinking_enabled() {
+        // Mirror of `prepare_strips_reasoning_content` for the thinking-enabled
+        // branch: MiMo's API requires reasoning_content pass-back on assistant
+        // messages carrying tool_calls once thinking = {"type": "enabled"}
+        // (missing it is a hard HTTP 400), so StripUnlessThinking must KEEP it.
+        let mut config = NcaConfig::default();
+        config.provider.mimo.api_key = Some("test".into());
+        let provider = OpenAiCompatProvider::from_config(
+            &config.provider.mimo,
+            config.model.max_tokens,
+            MIMO_PROFILE,
+            reqwest::header::HeaderMap::new(),
+        )
+        .expect("provider")
+        .with_thinking(serde_json::json!({ "type": "enabled" }));
+
+        let mut assistant = Message::assistant("response").with_reasoning("thinking...".into());
+        assistant.tool_calls = Some(vec![nca_common::message::MessageToolCall {
+            id: "call_1".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({}),
+        }]);
+        let mut messages = vec![
+            Message::user("hello"),
+            assistant,
+            Message::tool("call_1", "result"),
+        ];
+
+        provider
+            .prepare_messages_for_request(&mut messages, Path::new("."))
+            .await
+            .expect("prepare");
+
+        // reasoning_content must survive on the assistant tool-call message
+        assert_eq!(
+            messages[1].reasoning_content.as_deref(),
+            Some("thinking...")
+        );
+        // Other fields unchanged
+        assert_eq!(messages[1].content.to_summary_text(), "response");
+        let tool_calls = messages[1].tool_calls.as_ref().expect("tool_calls kept");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_1");
+        assert_eq!(tool_calls[0].name, "read");
+        // User/tool messages unaffected
+        assert!(messages[0].reasoning_content.is_none());
+        assert!(messages[2].reasoning_content.is_none());
+    }
+
+    #[tokio::test]
     async fn mimo_keepalive_body_merges_thinking_override() {
         // keepalive_ping must merge the same `thinking` override as chat
         // (max_tokens is hardcoded to 1 there). Pins the second merge site in
@@ -222,8 +305,15 @@ mod tests {
                 serde_json::json!({ "type": "disabled" }),
                 "body: {request_body}"
             );
-            // Keepalive hardcodes max_tokens = 1 to minimise output cost.
-            assert_eq!(parsed["max_tokens"], 1, "body: {request_body}");
+            // Keepalive hardcodes max_tokens = 1 to minimise output cost —
+            // renamed to max_completion_tokens on the MiMo wire (1 is within
+            // the documented [1, 131072] range), with stream_options omitted.
+            assert_eq!(parsed["max_completion_tokens"], 1, "body: {request_body}");
+            assert!(parsed.get("max_tokens").is_none(), "body: {request_body}");
+            assert!(
+                parsed.get("stream_options").is_none(),
+                "body: {request_body}"
+            );
             assert_eq!(parsed["model"], "mimo-v2.6-pro", "body: {request_body}");
         });
 
