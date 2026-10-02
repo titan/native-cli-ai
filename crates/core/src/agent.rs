@@ -335,7 +335,8 @@ impl AgentLoop {
 ///   `elided_events`. A degenerate batch can then no longer park the turn's
 ///   stream loop on per-call notices — the incident's "7,642 ToolCallStarted
 ///   then nothing" shape.
-/// - **Must-deliver** events keep the blocking `send().await`: losing one
+/// - **Must-deliver** events block on [`send_with_stall_alarm`] (never
+///   dropping, never timing out, alarming while stalled): losing one
 ///   would corrupt the replay projection (`MessageRecorded`), break bracket
 ///   parity (`Step*`/`TurnCompleted`/`ToolCallCompleted`), orphan an
 ///   interactive oneshot (`ApprovalRequested`/`QuestionRequested`), or hide
@@ -361,11 +362,69 @@ pub(crate) async fn emit_classified(
     }
     let pending = elided_events.swap(0, Ordering::Relaxed);
     if pending > 0 {
-        let _ = event_tx
-            .send(AgentEvent::EventsElided { count: pending })
-            .await;
+        send_with_stall_alarm(event_tx, AgentEvent::EventsElided { count: pending }).await;
     }
-    let _ = event_tx.send(event).await;
+    send_with_stall_alarm(event_tx, event).await;
+}
+
+/// How long a guaranteed event send waits between stall alarms while the
+/// consumer refuses to drain the bounded channel.
+const EVENT_STALL_ALARM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Blocking send that never drops and never times out — but screams at
+/// [`EVENT_STALL_ALARM_INTERVAL`] while the consumer refuses to drain.
+/// Used by [`emit_classified`] for must-deliver events and by the runtime's
+/// event fanout for must-deliver parent forwards.
+///
+/// Cancel-safety (why `reserve()`, not `send()`): `Sender::send` moves the
+/// value into its future, so wrapping it in `timeout` and dropping the
+/// future on expiry would LOSE the event — there is no way to get the moved
+/// value back. `reserve()` is documented cancel-safe by tokio (a dropped
+/// permit acquisition reserves nothing), and the resulting `Permit` sends
+/// infallibly with capacity already held. This is the only correct shape
+/// for a timeout-wrapped guaranteed send.
+///
+/// Channel-closed behaves like the fire-and-forget sends elsewhere
+/// (`let _ = send()`): return silently.
+pub async fn send_with_stall_alarm(
+    event_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+    event: AgentEvent,
+) {
+    let mut stalled_for = std::time::Duration::ZERO;
+    loop {
+        match tokio::time::timeout(EVENT_STALL_ALARM_INTERVAL, event_tx.reserve()).await {
+            Ok(Ok(permit)) => {
+                // Capacity is reserved: infallible and instantaneous.
+                permit.send(event);
+                return;
+            }
+            // Channel closed — fire-and-forget parity.
+            Ok(Err(_closed)) => return,
+            Err(_elapsed) => {
+                stalled_for += EVENT_STALL_ALARM_INTERVAL;
+                tracing::error!(
+                    stalled_secs = stalled_for.as_secs(),
+                    kind = event_kind_label(&event),
+                    "event_channel_stalled: consumer not draining; still waiting (never dropping)"
+                );
+                // Re-arm: `reserve()` cancelled above reserved nothing, so
+                // the event is still solely ours and undelivered.
+            }
+        }
+    }
+}
+
+/// Stable discriminant label for diagnostics (the stall alarm): the variant
+/// name without payload, taken from the leading identifier of the Debug
+/// repr (e.g. `MessageRecorded { .. }` → `"MessageRecorded"`). Only runs
+/// on the alarm cadence — once per 30s per stuck send — so the formatting
+/// cost is irrelevant.
+fn event_kind_label(event: &AgentEvent) -> String {
+    let dbg = format!("{event:?}");
+    let end = dbg
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(dbg.len());
+    dbg[..end].to_string()
 }
 
 /// Ensure every assistant message carrying `tool_calls` is followed by a
@@ -1242,5 +1301,72 @@ mod tests {
             "nothing was elided — only droppable kinds ever are"
         );
         assert_eq!(agent.elided_events.load(Ordering::SeqCst), 0);
+    }
+
+    /// Stall-alarm reserve loop (event-consumer-liveness Chunk 2): against a
+    /// full buffer with no consumer, the send stays pending across many
+    /// 30s alarm boundaries — no panic, no loss, no duplicate — then
+    /// delivers exactly once and returns as soon as the consumer drains.
+    /// Paused time makes the multi-boundary stall instantaneous.
+    #[tokio::test(start_paused = true)]
+    async fn send_with_stall_alarm_survives_stall_and_delivers_exactly_once() {
+        use std::time::Duration;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(1);
+        // Occupy the single buffer slot so `reserve()` has something to wait on.
+        tx.send(AgentEvent::Checkpoint {
+            phase: "filler".into(),
+            detail: String::new(),
+            turn: 0,
+        })
+        .await
+        .expect("fill buffer");
+
+        let sender = tx.clone();
+        let task = tokio::spawn(async move {
+            send_with_stall_alarm(
+                &sender,
+                AgentEvent::Error {
+                    message: "boom".into(),
+                },
+            )
+            .await;
+        });
+
+        // Let the spawned task park on `reserve()`, then cross exactly one
+        // alarm boundary (interval is 30s; +1s margin).
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        tokio::time::advance(Duration::from_secs(31)).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(
+            !task.is_finished(),
+            "must stay pending while the consumer refuses to drain"
+        );
+        // The stalled send must not have pre-empted or duplicated the
+        // buffered filler: the buffer still holds exactly it, and the only
+        // way to observe that without unblocking the send is that the task
+        // is still parked (checked above) — consuming here would wake it.
+
+        // Many more boundaries: the re-arm loop is stable — no panic, no
+        // loss, no double-send.
+        tokio::time::advance(Duration::from_secs(300)).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(!task.is_finished(), "still pending after ~10 more alarms");
+
+        // Consumer drains: the filler first (it was buffered), then exactly
+        // one delivery of the guaranteed event.
+        let filler = rx.recv().await.expect("filler");
+        assert!(matches!(filler, AgentEvent::Checkpoint { .. }));
+        let got = rx.recv().await.expect("exactly one delivery");
+        assert!(
+            matches!(got, AgentEvent::Error { .. }),
+            "the original event survives the stall intact"
+        );
+        assert!(rx.try_recv().is_err(), "no duplicate delivery");
+
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("helper returns once delivered")
+            .expect("task join");
     }
 }

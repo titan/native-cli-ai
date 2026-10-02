@@ -12,32 +12,58 @@ pub(crate) type QuestionPendingMap =
     Arc<Mutex<HashMap<String, oneshot::Sender<QuestionSelection>>>>;
 type EventFanoutCallback = Box<dyn Fn(&EventEnvelope) + Send>;
 
-/// Maps a child session event to a parent-visible activity line (sidebar + transcript).
+/// Delivery class for a parent-forwarded child event
+/// (event-consumer-liveness, Chunk 1). Decides how the fanout forwards it
+/// when the parent's bounded event channel is full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForwardClass {
+    /// Activity noise (tool starts, checkpoints). May elide under a stalled
+    /// parent; elisions are counted and summarized by an `EventsElided`
+    /// forward flushed before the next must-deliver forward.
+    Droppable,
+    /// Child notices the parent must never miss (errors, nested spawns).
+    /// Never elided — the fanout blocks on them (with a stall alarm) until
+    /// the parent drains.
+    MustDeliver,
+}
+
+/// Maps a child session event to a parent-visible activity line (sidebar +
+/// transcript), tagged with its [`ForwardClass`]. Mapping semantics are
+/// unchanged from the pre-classification version; only the class tag is new.
+///
+/// Invariant: child must-deliver loss is never acceptable — an elided error
+/// or nested-spawn notice would silently hide a child failure from the
+/// parent's UI — while activity noise may elide under a stalled parent
+/// (the parent sees one `EventsElided` summary instead of the noise).
 pub(crate) fn map_child_event_for_parent_broadcast(
     child_session_id: &str,
     event: &AgentEvent,
-) -> Option<AgentEvent> {
+) -> Option<(AgentEvent, ForwardClass)> {
+    let child_activity = |phase: String, detail: String| AgentEvent::ChildSessionActivity {
+        child_session_id: child_session_id.to_string(),
+        phase,
+        detail,
+    };
     match event {
-        AgentEvent::ToolCallStarted { tool, input, .. } => Some(AgentEvent::ChildSessionActivity {
-            child_session_id: child_session_id.to_string(),
-            phase: tool.clone(),
-            detail: tool_input_one_line(input),
-        }),
-        AgentEvent::Checkpoint { phase, detail, .. } => Some(AgentEvent::ChildSessionActivity {
-            child_session_id: child_session_id.to_string(),
-            phase: phase.clone(),
-            detail: truncate_child_detail(detail, 120),
-        }),
-        AgentEvent::ChildSessionSpawned { task, .. } => Some(AgentEvent::ChildSessionActivity {
-            child_session_id: child_session_id.to_string(),
-            phase: "nested_subagent".to_string(),
-            detail: truncate_child_detail(task, 120),
-        }),
-        AgentEvent::Error { message } => Some(AgentEvent::ChildSessionActivity {
-            child_session_id: child_session_id.to_string(),
-            phase: "error".to_string(),
-            detail: truncate_child_detail(message, 160),
-        }),
+        AgentEvent::ToolCallStarted { tool, input, .. } => Some((
+            child_activity(tool.clone(), tool_input_one_line(input)),
+            ForwardClass::Droppable,
+        )),
+        AgentEvent::Checkpoint { phase, detail, .. } => Some((
+            child_activity(phase.clone(), truncate_child_detail(detail, 120)),
+            ForwardClass::Droppable,
+        )),
+        AgentEvent::ChildSessionSpawned { task, .. } => Some((
+            child_activity(
+                "nested_subagent".to_string(),
+                truncate_child_detail(task, 120),
+            ),
+            ForwardClass::MustDeliver,
+        )),
+        AgentEvent::Error { message } => Some((
+            child_activity("error".to_string(), truncate_child_detail(message, 160)),
+            ForwardClass::MustDeliver,
+        )),
         _ => None,
     }
 }
@@ -112,12 +138,47 @@ pub fn spawn_event_fanout(
     tokio::spawn(async move {
         let mut writer = crate::event_log::EventLogWriter::open(&log_path).await;
 
+        // Parent-forward elision ledger (event-consumer-liveness Chunk 1).
+        // The fanout is a single task, so a plain `u64` needs no atomicity.
+        // Droppable forwards that hit a full parent channel elide into this
+        // counter; the next must-deliver forward flushes it as one
+        // `EventsElided` summary first. Invariant: child must-deliver loss
+        // is never acceptable — an elided error or nested-spawn notice would
+        // silently hide a child failure from the parent's UI — while
+        // activity noise may elide under a stalled parent. A must-deliver
+        // forward that blocks parks this loop (and transitively the child's
+        // turn) until the parent drains: acceptable by design (rare
+        // events), and `send_with_stall_alarm` screams every 30s while it
+        // happens instead of parking silently.
+        let mut elided_forwards: u64 = 0;
+
         while let Some(event) = event_rx.recv().await {
             let id = writer.next_id();
             if let Some((ref child_id, ref ptx)) = parent_forward
-                && let Some(fwd) = map_child_event_for_parent_broadcast(child_id, &event)
+                && let Some((fwd, class)) = map_child_event_for_parent_broadcast(child_id, &event)
             {
-                let _ = ptx.send(fwd).await;
+                match class {
+                    ForwardClass::Droppable => match ptx.try_send(fwd) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            elided_forwards += 1;
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+                    },
+                    ForwardClass::MustDeliver => {
+                        if elided_forwards > 0 {
+                            nca_core::agent::send_with_stall_alarm(
+                                ptx,
+                                AgentEvent::EventsElided {
+                                    count: elided_forwards,
+                                },
+                            )
+                            .await;
+                            elided_forwards = 0;
+                        }
+                        nca_core::agent::send_with_stall_alarm(ptx, fwd).await;
+                    }
+                }
             }
             let envelope = EventEnvelope::new(id, event);
             if let Some(ref tx) = ipc_tx {
@@ -502,5 +563,164 @@ mod tests {
 
         let _ = cmd_tx.send(AgentCommand::Shutdown);
         task.abort();
+    }
+
+    // ── event-consumer-liveness Chunk 1: classified parent forwards ────
+
+    fn nonempty_log_lines(log_path: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(log_path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.to_string())
+            .collect()
+    }
+
+    /// Droppable forwards elide under a stalled parent instead of parking
+    /// the fanout: the loop keeps draining its own channel, every child
+    /// event stays durable, and exactly channel-capacity forwards land.
+    #[tokio::test]
+    async fn fanout_elides_droppable_forwards_when_parent_stalls() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("events.jsonl");
+        let (event_tx, event_rx) = mpsc::channel(64);
+        // Stalled parent: capacity 2, receiver never drained during the run.
+        let (ptx, mut prx) = mpsc::channel(2);
+        let mut task = spawn_event_fanout(
+            event_rx,
+            log_path.clone(),
+            None,
+            None,
+            Some(("child-1".to_string(), ptx)),
+            None,
+        );
+
+        for i in 0..10 {
+            event_tx
+                .send(AgentEvent::ToolCallStarted {
+                    call_id: format!("c{i}"),
+                    tool: "read".to_string(),
+                    input: serde_json::json!({ "path": "x" }),
+                })
+                .await
+                .expect("send child event");
+        }
+        drop(event_tx);
+
+        // Clean exit (not the drain-abort path): the loop never parked on a
+        // droppable forward despite the undrained parent.
+        let exited = tokio::time::timeout(std::time::Duration::from_secs(5), &mut task).await;
+        assert!(
+            exited.is_ok(),
+            "fanout must drain and exit cleanly despite the stalled parent"
+        );
+
+        // Log completeness: all 10 events hit disk.
+        let lines = nonempty_log_lines(&log_path);
+        assert_eq!(lines.len(), 10, "all events logged: {lines:?}");
+        assert!(lines.iter().all(|l| l.contains("ToolCallStarted")));
+
+        // Exactly capacity(2) forwards landed; the other 8 elided.
+        assert!(matches!(
+            prx.try_recv(),
+            Ok(AgentEvent::ChildSessionActivity { .. })
+        ));
+        assert!(matches!(
+            prx.try_recv(),
+            Ok(AgentEvent::ChildSessionActivity { .. })
+        ));
+        assert!(
+            prx.try_recv().is_err(),
+            "8 forwards elided; nothing else was delivered"
+        );
+    }
+
+    /// Must-deliver forwards never elide: a stalled parent parks the fanout
+    /// (before the event is logged), then recovery flushes the elision
+    /// summary ahead of the error forward, and the parked event becomes
+    /// durable once the parent drains.
+    #[tokio::test]
+    async fn fanout_parks_on_must_deliver_forward_then_recovers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("events.jsonl");
+        let (event_tx, event_rx) = mpsc::channel(64);
+        let (ptx, mut prx) = mpsc::channel(1);
+        let mut task = spawn_event_fanout(
+            event_rx,
+            log_path.clone(),
+            None,
+            None,
+            Some(("child-2".to_string(), ptx)),
+            None,
+        );
+
+        // 3 droppable forwards against capacity 1: first lands, two elide.
+        for i in 0..3 {
+            event_tx
+                .send(AgentEvent::ToolCallStarted {
+                    call_id: format!("c{i}"),
+                    tool: "read".to_string(),
+                    input: serde_json::json!({}),
+                })
+                .await
+                .expect("send child event");
+        }
+        // Must-deliver: parks the loop BEFORE the Error is logged (the
+        // forward precedes the append), with the stall alarm screaming
+        // every 30s — by design, not a deadlock.
+        event_tx
+            .send(AgentEvent::Error {
+                message: "child exploded".to_string(),
+            })
+            .await
+            .expect("send error event");
+        drop(event_tx);
+
+        // Bounded wall wait until the three droppables are durable — proves
+        // the loop drained them and is now parked on the Error forward.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while nonempty_log_lines(&log_path).len() < 3 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let lines = nonempty_log_lines(&log_path);
+        assert_eq!(
+            lines.len(),
+            3,
+            "droppables durable; Error parked behind the must-deliver forward: {lines:?}"
+        );
+        assert!(
+            !task.is_finished(),
+            "fanout must stay parked on the must-deliver forward"
+        );
+
+        // Parent finally drains: elision summary flushes first, then the
+        // error forward itself — in that order.
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), prx.recv())
+            .await
+            .expect("first forward")
+            .expect("parent channel open");
+        assert!(
+            matches!(&first, AgentEvent::ChildSessionActivity { phase, .. } if phase == "read")
+        );
+        let second = tokio::time::timeout(std::time::Duration::from_secs(2), prx.recv())
+            .await
+            .expect("elision summary")
+            .expect("parent channel open");
+        assert!(matches!(second, AgentEvent::EventsElided { count: 2 }));
+        let third = tokio::time::timeout(std::time::Duration::from_secs(2), prx.recv())
+            .await
+            .expect("error forward")
+            .expect("parent channel open");
+        assert!(
+            matches!(&third, AgentEvent::ChildSessionActivity { phase, .. } if phase == "error")
+        );
+
+        // Parked send completes: the Error becomes durable and the loop
+        // exits cleanly once its own senders are gone.
+        let exited = tokio::time::timeout(std::time::Duration::from_secs(5), &mut task).await;
+        assert!(exited.is_ok(), "fanout exits after the parent drains");
+        let lines = nonempty_log_lines(&log_path);
+        assert_eq!(lines.len(), 4, "Error became durable: {lines:?}");
+        assert!(lines[3].contains("child exploded"));
     }
 }
