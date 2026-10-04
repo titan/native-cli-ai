@@ -178,6 +178,7 @@ async fn spawn_gated_child(
             registry: Some(registry.clone()),
             provider: Some(provider),
             plugins: None,
+            escaped_providers: Default::default(),
         },
         Some(event_tx),
     ));

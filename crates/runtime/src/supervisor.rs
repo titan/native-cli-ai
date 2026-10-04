@@ -18,6 +18,7 @@ use crate::plugin_host::PluginHost;
 use crate::pty::PtyManager;
 use crate::session_store::SessionStore;
 use crate::subagent_registry::{SubagentRegistry, subagent_control_consumer};
+use crate::wake_scheduler::WAKE_PROMPT_PREFIX;
 use chrono::Utc;
 use nca_common::config::{
     AgentProfileConfig, NcaConfig, PlanEntry, ProviderKind, SandboxConfig, SandboxMode,
@@ -38,7 +39,8 @@ use nca_core::middleware::default_chain;
 use nca_core::plugin::PluginRegistry;
 use nca_core::provider::Provider;
 use nca_core::provider::ProviderError;
-use nca_core::provider::factory::build_provider_with_events;
+use nca_core::provider::factory::build_provider_with_tracker;
+use nca_core::provider::fallback::FallbackProvider;
 use nca_core::skills::{SkillCatalog, SkillFilterHandle, effective_skills_for_profile};
 use nca_core::tools::AskQuestionTool;
 use nca_core::tools::InvokeSkillTool;
@@ -148,6 +150,20 @@ pub struct Supervisor {
     /// future second mutation entry (IPC extension, attach protocol) fails
     /// loudly instead of silently racing the turn driver's provider calls.
     turn_in_flight: Arc<AtomicBool>,
+    /// Concrete handle to the session's [`FallbackProvider`] wrapper, when
+    /// fallback wrapping is active (`None` for bare providers and injected
+    /// test providers). Owned HERE — not inside the agent loop — because the
+    /// agent holds a plain `Arc<dyn Provider>` and the two wrapper lifecycle
+    /// hooks need the concrete type, downcast-free:
+    ///
+    /// - the chain-global retry-budget reset at each new EXTERNAL user turn
+    ///   ([`Self::run_turn_with_images`]);
+    /// - the escaped-provider set read by the subagent spawn path (child
+    ///   chains avoid providers this session already failed over from).
+    ///
+    /// Refreshed whenever the provider is rebuilt (`apply_agent_profile`,
+    /// `apply_nca_config`).
+    fallback: Option<Arc<FallbackProvider>>,
     /// Spawn-time config snapshot shared with the subagent spawn consumer
     /// (live handle, not a wiring-time clone — the old clone froze the
     /// provider/model routing at consumer-creation time, so children spawned
@@ -534,16 +550,19 @@ async fn persist_mounted_paths(workspace_root: &Path, paths: Vec<PathBuf>) {
 /// Resolve the session's provider: an injected provider wins verbatim (no
 /// fallback wrapping — test seams own their entire provider behavior), else
 /// build from config with fallback wrapping and event notifications.
+/// Returns the concrete [`FallbackProvider`] handle alongside the trait
+/// object when wrapping is active, so the supervisor can reset the
+/// chain-global retry budget per external turn and read the escaped set.
 /// `create` uses this so tests can supply a mock `Provider`
 /// and skip `build_provider` entirely.
 fn resolve_provider(
     injected: Option<Arc<dyn Provider>>,
     config: &NcaConfig,
     event_tx: Option<tokio::sync::mpsc::Sender<AgentEvent>>,
-) -> Result<Arc<dyn Provider>, ProviderError> {
+) -> Result<nca_core::provider::factory::ProviderWithFallback, ProviderError> {
     match injected {
-        Some(provider) => Ok(provider),
-        None => build_provider_with_events(config, event_tx),
+        Some(provider) => Ok((provider, None)),
+        None => build_provider_with_tracker(config, event_tx),
     }
 }
 
@@ -689,7 +708,7 @@ impl Supervisor {
         // wrapper can emit ProviderFallback notifications on it from the
         // first turn onward.
         let (event_tx, event_rx) = mpsc::channel(256);
-        let provider = resolve_provider(cfg.provider, &config, Some(event_tx.clone()))?;
+        let (provider, fallback) = resolve_provider(cfg.provider, &config, Some(event_tx.clone()))?;
         let fs: Arc<dyn WorkspaceFs> = Arc::new(RealFs::new(workspace_root.clone()));
         let fs_for_supervisor = fs.clone();
         // Restore mounts persisted in the workspace-local config. A missing or
@@ -1029,6 +1048,7 @@ impl Supervisor {
             turn_commit_wired,
             restart_ghosts: Vec::new(),
             turn_in_flight,
+            fallback,
             live_config,
             skill_filter,
         };
@@ -1358,6 +1378,19 @@ impl Supervisor {
         Arc::clone(&self.live_config)
     }
 
+    /// Live escaped-provider handle for the subagent spawn consumer:
+    /// providers this session has already escaped via a fallback switch
+    /// (canonical display names), which freshly spawned children drop from
+    /// their own fallback chains. `None` when fallback is disabled or the
+    /// provider was injected — children then keep their chain verbatim.
+    /// The handle is shared with the live [`FallbackProvider`] instance, so
+    /// a spawn AFTER a later switch sees the fresh set.
+    pub fn fallback_escaped_handle(&self) -> Option<Arc<Mutex<HashSet<String>>>> {
+        self.fallback
+            .as_ref()
+            .map(|fallback| fallback.escaped_providers_handle())
+    }
+
     /// Re-point the shared spawn-time config snapshot at the current
     /// `self.config`. Called after every successful provider/config rebuild
     /// (`apply_agent_profile`, `apply_nca_config`). Poison-tolerant: a
@@ -1406,6 +1439,27 @@ impl Supervisor {
         attachments: &[nca_common::message::ImageAttachment],
     ) -> Result<String, ProviderError> {
         let _turn_fence = TurnInFlightGuard::acquire(Arc::clone(&self.turn_in_flight));
+
+        // Retry-budget turn reset (T1-2). Semantics: omos foreground-fallback
+        // "Retry Budget and Exhaustion" — only a genuine EXTERNAL user turn
+        // re-arms the chain-global same-model retry budget; internal replays
+        // and wake-injected prompts must not.
+        //
+        // Seam choice (downcast-free, supervisor-owned): the provider lives
+        // behind `Arc<dyn Provider>` inside the agent loop, so the supervisor
+        // calls the concrete `FallbackProvider` handle it kept from the
+        // build (see the `fallback` field) instead of threading a reset
+        // trait through the agent. Discriminating external from internal:
+        // every entry point into `run_turn` is external EXCEPT the wake
+        // channel, and the wake scheduler stamps every injected prompt with
+        // `WAKE_PROMPT_PREFIX` — that prefix is the discriminator. The
+        // overflow-retry inside this method re-enters `agent.run_turn`, not
+        // this method, so it never re-arms the budget mid-descent either.
+        if !prompt.trim_start().starts_with(WAKE_PROMPT_PREFIX)
+            && let Some(fallback) = self.fallback.as_ref()
+        {
+            fallback.reset_for_new_turn();
+        }
         if !attachments.is_empty()
             && !nca_common::model_caps::model_accepts_native_images(
                 self.config.provider.default,
@@ -2067,12 +2121,14 @@ impl Supervisor {
         }
 
         // Rebuild provider if config changed.
-        let provider = build_provider_with_events(&effective, self.agent.event_sender())?;
+        let (provider, fallback) =
+            build_provider_with_tracker(&effective, self.agent.event_sender())?;
         self.config = config;
         self.model = effective.model.default_model.clone();
         let m = self.model.clone();
         self.agent.model = m;
         self.agent.replace_provider(provider);
+        self.fallback = fallback;
         self.agent
             .set_keepalive_profile(cache_keepalive::resolve_profile(effective.provider.default));
         self.agent.approval.set_mode(effective.permissions.mode);
@@ -2408,7 +2464,7 @@ impl Supervisor {
         if self.is_turn_in_flight() {
             return Err(turn_in_flight_err());
         }
-        let provider = build_provider_with_events(&config, self.agent.event_sender())?;
+        let (provider, fallback) = build_provider_with_tracker(&config, self.agent.event_sender())?;
         // Live mounts win: callers may pass a snapshot taken before a `/mount`,
         // and adopting it verbatim lets the next whole-config save erase the
         // persisted `extra_paths` (see mount_config_persistence regression).
@@ -2419,6 +2475,7 @@ impl Supervisor {
         self.base_config = config.clone();
         self.config = config;
         self.model = self.config.provider.active_model().to_string();
+        self.fallback = fallback;
         let provider_kind = self.config.provider.default;
         let m = self.model.clone();
         let agent = self.agent_mut();
@@ -3676,18 +3733,28 @@ mod tests {
 
     #[test]
     fn resolve_provider_uses_injected_verbatim_else_builds() {
-        // (a) injected provider is returned verbatim — `build_provider` skipped.
+        // (a) injected provider is returned verbatim — `build_provider` skipped
+        //     and no fallback tracker is exposed (test seams own everything).
         let mock: Arc<dyn Provider> = Arc::new(StubProvider);
-        let injected = match resolve_provider(Some(mock.clone()), &NcaConfig::default(), None) {
-            Ok(p) => p,
-            Err(e) => panic!("injected provider should be used verbatim, got: {e}"),
-        };
+        let (injected, tracker) =
+            match resolve_provider(Some(mock.clone()), &NcaConfig::default(), None) {
+                Ok(pair) => pair,
+                Err(e) => panic!("injected provider should be used verbatim, got: {e}"),
+            };
         assert!(Arc::ptr_eq(&injected, &mock));
+        assert!(
+            tracker.is_none(),
+            "injected providers carry no fallback tracker"
+        );
 
         // (b) no injection → builds from config (DeepSeek default needs a key).
+        //     Fallback disabled by default → still no tracker.
         let mut with_key = NcaConfig::default();
         with_key.provider.deepseek.api_key = Some("test-key".into());
-        assert!(resolve_provider(None, &with_key, None).is_ok());
+        assert!(matches!(
+            resolve_provider(None, &with_key, None),
+            Ok((_, None))
+        ));
 
         // (c) no injection + keyless config → loud configuration error.
         // DeepSeek (the default) validates its key lazily at request time, so

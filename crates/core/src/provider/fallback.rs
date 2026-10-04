@@ -23,13 +23,33 @@
 //!   provider — except for the empty-completion class, where the empty
 //!   stream is forwarded as-is so the driver's existing empty-response
 //!   policy (bounded retries, then a loud error) stays in charge.
+//! - **Retry budget (chain-global).** `[fallback] max_retries = N` absorbs
+//!   failover-class failures 1..N on the current model — redialing the SAME
+//!   provider once per absorbed failure, spaced by the shared throttle
+//!   clock — and failure N+1 (and every later one, on any model) advances
+//!   the chain. Switching models does not re-arm the budget; only a new
+//!   external user turn does ([`FallbackProvider::reset_for_new_turn`],
+//!   called by the supervisor). `max_retries = 0` (the default) switches
+//!   immediately, exactly like the pre-budget behavior. Permanent
+//!   usage/quota failures ([`is_permanent_usage_error`]: 402 / billing /
+//!   expired-plan wording) never charge the budget and advance at once.
+//! - **Exhaustion is sticky within a turn descent.** Once the chain is
+//!   spent (error class), the aggregate error is cached: every later
+//!   `chat()` on this instance returns it immediately instead of
+//!   replaying the whole chain against dead providers.
+//! - **Escapes are recorded for child avoidance.** Every switch records the
+//!   provider it advanced away from ([`FallbackProvider::escaped_providers`]);
+//!   the subagent spawn path drops those providers from freshly built
+//!   child fallback chains.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use nca_common::config::ProviderKind;
 use nca_common::event::AgentEvent;
 use nca_common::message::Message;
 use nca_common::tool::ToolDefinition;
@@ -60,6 +80,20 @@ const CONTENT_MODERATION_MARKERS: [&str; 4] = [
 /// malformed message lists). Deterministic client-side rejections: retrying
 /// the identical request on another provider reproduces the same guard.
 const LOCAL_GUARD_PREFIX: &str = "refusing to send";
+
+/// Body/message-substring markers for permanent usage/quota failures:
+/// billing-side account states the current model cannot recover from
+/// within the turn (omos `isPermanentUsageQuotaError` parity, kept tight).
+const PERMANENT_USAGE_MARKERS: [&str; 8] = [
+    "insufficient balance",
+    "billing",
+    "plan expired",
+    "package expired",
+    "plan has expired",
+    "package has expired",
+    "quota exhausted",
+    "permanently exhausted",
+];
 
 /// Whether `err` is failover-class: retrying the step on the next provider
 /// of the fallback chain is reasonable.
@@ -95,6 +129,34 @@ pub fn is_failoverable(err: &ProviderError) -> bool {
 fn is_content_moderation(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
     CONTENT_MODERATION_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// Whether `err` is a permanent usage/quota failure — payment required, an
+/// exhausted plan/package, or explicit quota exhaustion. Such failures skip
+/// the same-model retry budget entirely (no amount of redialing recovers a
+/// dead account) and advance the fallback chain immediately.
+///
+/// Typed status wins where [`ProviderError`] carries one (HTTP 402);
+/// otherwise the markers are matched case-insensitively against the HTTP
+/// body or transport message. Kept deliberately tight: a false positive
+/// merely switches providers one hop early; a false negative burns one
+/// redial on a dead account. Ordinary 429 / short-term rate-limit wording
+/// is deliberately NOT permanent.
+pub fn is_permanent_usage_error(err: &ProviderError) -> bool {
+    match err {
+        ProviderError::Http { status: 402, .. } => true,
+        ProviderError::Http { body, .. } => contains_permanent_marker(body),
+        ProviderError::RequestFailed(msg) => contains_permanent_marker(msg),
+        _ => false,
+    }
+}
+
+/// Case-insensitive check of `text` against [`PERMANENT_USAGE_MARKERS`].
+fn contains_permanent_marker(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    PERMANENT_USAGE_MARKERS
         .iter()
         .any(|marker| lower.contains(marker))
 }
@@ -204,6 +266,115 @@ pub struct FallbackEntry {
     pub provider: Arc<dyn Provider>,
 }
 
+/// Chain-global state shared between the `chat()`-level loop and the spawned
+/// stream forwarder of one [`FallbackProvider`] instance: the retry budget,
+/// the post-exhaustion cache, and the escaped-provider record.
+struct FallbackState {
+    /// `[fallback] max_retries` — immutable for the instance. 0 preserves
+    /// the switch-immediately behavior.
+    max_retries: u32,
+    /// Failures absorbed so far in this descent. Chain-global: incremented
+    /// for every absorbed failure on ANY model and only cleared by
+    /// [`FallbackProvider::reset_for_new_turn`].
+    absorbed: AtomicU32,
+    /// Post-exhaustion cache: once the chain is spent (error class), the
+    /// aggregate error is recorded here and every later `chat()` returns it
+    /// without replaying the walk. Cleared only by a new external turn.
+    exhausted: Mutex<Option<ProviderError>>,
+    /// Providers this instance has escaped (a switch advanced away from
+    /// them), as canonical display names. Deliberately NOT cleared by
+    /// [`FallbackProvider::reset_for_new_turn`] — a provider the session
+    /// already escaped stays avoided for the session's children.
+    escaped: Arc<Mutex<HashSet<String>>>,
+}
+
+impl FallbackState {
+    fn new(max_retries: u32) -> Self {
+        Self {
+            max_retries,
+            absorbed: AtomicU32::new(0),
+            exhausted: Mutex::new(None),
+            escaped: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    /// Try to charge one same-model absorption against the budget. Returns
+    /// `false` when the chain-global budget is already spent (in which case
+    /// nothing is charged). Atomic so concurrent `chat()` calls on one
+    /// instance can never overshoot the budget.
+    fn try_absorb(&self) -> bool {
+        self.absorbed
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |absorbed| {
+                (absorbed < self.max_retries).then(|| absorbed + 1)
+            })
+            .is_ok()
+    }
+
+    /// Failures absorbed so far in this descent (diagnostics/logs).
+    fn absorbed(&self) -> u32 {
+        self.absorbed.load(Ordering::SeqCst)
+    }
+
+    /// Record the aggregate error of a spent chain (error class only — the
+    /// empty-completion class forwards `Done` and stays driver-owned).
+    fn record_exhausted(&self, err: ProviderError) {
+        *lock_or_recover(&self.exhausted) = Some(err);
+    }
+
+    /// The recorded terminal error, when the chain is spent.
+    fn cached_exhausted(&self) -> Option<ProviderError> {
+        lock_or_recover(&self.exhausted).clone()
+    }
+
+    /// Record `from` — the model a switch advanced away from — as escaped,
+    /// when its provider is recognizable. This is the same `from` value the
+    /// corresponding [`AgentEvent::ProviderFallback`] carries; recording it
+    /// here (rather than in the supervisor) keeps the set exactly in sync
+    /// with the events without tapping the single-consumer event channel.
+    fn record_escaped(&self, from: &str) {
+        if let Some(key) = escaped_provider_key(from)
+            && !lock_or_recover(&self.escaped).contains(key)
+        {
+            lock_or_recover(&self.escaped).insert(key.to_string());
+        }
+    }
+
+    /// Per-external-turn reset: clears the absorbed budget and the
+    /// exhaustion cache. The throttle clock (anti-storm, cross-turn by
+    /// design) and the escaped-provider record are deliberately untouched.
+    fn reset_for_new_turn(&self) {
+        self.absorbed.store(0, Ordering::SeqCst);
+        *lock_or_recover(&self.exhausted) = None;
+    }
+}
+
+/// Lock a std `Mutex`, recovering from poison (all guarded state here is
+/// advisory and single-writer in practice; a panic elsewhere must not wedge
+/// failover).
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Canonical provider display name for a fallback `from`/entry name, when
+/// recognizable — e.g. `ZhipuAI(glm-5.3-flash)` → `ZhipuAI`. Unrecognizable
+/// names (test doubles like `Primary`) map to `None` and are not recorded.
+fn escaped_provider_key(from: &str) -> Option<&'static str> {
+    let base = from.split('(').next()?.trim();
+    ProviderKind::parse_display_name(base).map(|kind| kind.display_name())
+}
+
+/// The model currently being tried: display name, provider handle, and the
+/// model string it is dialed with (the session model for the primary,
+/// empty — "use your configured model" — for chain entries).
+struct CurrentModel {
+    name: String,
+    provider: Arc<dyn Provider>,
+    model: String,
+}
+
 /// A [`Provider`] that delegates to a primary provider and, on
 /// failover-class failures with zero delivered content, retries the step on
 /// an ordered chain of alternates. Built by
@@ -218,18 +389,22 @@ pub struct FallbackProvider {
     primary_name: String,
     fallbacks: Vec<FallbackEntry>,
     throttle: Throttle,
+    state: Arc<FallbackState>,
     event_tx: Option<mpsc::Sender<AgentEvent>>,
 }
 
 impl FallbackProvider {
-    /// Wrap `primary` with `fallbacks` (in order). Notifications are sent on
-    /// `event_tx` when present; without one they degrade to `tracing` only.
+    /// Wrap `primary` with `fallbacks` (in order). `max_retries` is the
+    /// chain-global same-model absorption budget (`[fallback] max_retries`,
+    /// 0 = switch immediately). Notifications are sent on `event_tx` when
+    /// present; without one they degrade to `tracing` only.
     pub fn new(
         primary: Arc<dyn Provider>,
         primary_name: String,
         fallbacks: Vec<FallbackEntry>,
         initial_retry_delay_ms: u64,
         retry_delay_ms: u64,
+        max_retries: u32,
         event_tx: Option<mpsc::Sender<AgentEvent>>,
     ) -> Self {
         Self {
@@ -237,8 +412,34 @@ impl FallbackProvider {
             primary_name,
             fallbacks,
             throttle: Throttle::new(initial_retry_delay_ms, retry_delay_ms),
+            state: Arc::new(FallbackState::new(max_retries)),
             event_tx,
         }
+    }
+
+    /// Reset the chain-global retry budget and exhaustion cache for a new
+    /// EXTERNAL user turn. The supervisor calls this at each new user
+    /// message (see `Supervisor::run_turn_with_images`); internal replays
+    /// and wake-injected prompts must NOT reset it — a fresh descent is what
+    /// re-arms absorption. The anti-storm throttle clock and the
+    /// escaped-provider record are deliberately preserved.
+    pub fn reset_for_new_turn(&self) {
+        self.state.reset_for_new_turn();
+    }
+
+    /// Snapshot of providers this instance has escaped via failover, as
+    /// canonical display names. Consulted when spawning child sessions so
+    /// their fallback chains avoid providers the parent already left.
+    pub fn escaped_providers(&self) -> HashSet<String> {
+        lock_or_recover(&self.state.escaped).clone()
+    }
+
+    /// Live handle to the escaped-provider set, for spawn consumers that
+    /// need a per-spawn snapshot (see
+    /// `nca_runtime`'s subagent spawn path). Shares the exact set this
+    /// instance records at each switch.
+    pub fn escaped_providers_handle(&self) -> Arc<Mutex<HashSet<String>>> {
+        Arc::clone(&self.state.escaped)
     }
 
     /// Display names of the fallback chain, in order (diagnostics/tests).
@@ -246,25 +447,29 @@ impl FallbackProvider {
         self.fallbacks.iter().map(|e| e.name.as_str()).collect()
     }
 
-    /// Spawn the stream forwarder: forwards chunks from `current`
+    /// Spawn the stream forwarder: forwards chunks from the current model
     /// downstream, guarding the zero-content rule, and — while no content
-    /// has been delivered — fails over to `remaining` on failover-class
-    /// errors and empty completions.
+    /// has been delivered — applies the recovery policy ([`recover`]: absorb
+    /// on the same model while budget remains, else advance the chain) on
+    /// failover-class errors and empty completions.
     #[allow(clippy::too_many_arguments)]
     fn spawn_forwarder(
-        current: mpsc::Receiver<StreamChunk>,
+        current: CurrentModel,
+        current_rx: mpsc::Receiver<StreamChunk>,
         remaining: Vec<FallbackEntry>,
         messages: Vec<Message>,
         tools: Vec<ToolDefinition>,
         workspace_root: PathBuf,
         attempted: Vec<String>,
         failures: Vec<String>,
+        state: Arc<FallbackState>,
         throttle: Throttle,
         event_tx: Option<mpsc::Sender<AgentEvent>>,
     ) -> mpsc::Receiver<StreamChunk> {
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(async move {
             let mut current = current;
+            let mut current_rx = current_rx;
             let mut remaining: VecDeque<FallbackEntry> = remaining.into();
             let mut attempted = attempted;
             let mut failures = failures;
@@ -276,7 +481,7 @@ impl FallbackProvider {
             let mut held_finish: Option<String> = None;
 
             loop {
-                let Some(chunk) = current.recv().await else {
+                let Some(chunk) = current_rx.recv().await else {
                     // Inner channel closed without Done/Error (provider bug):
                     // propagate the close downstream, same as pre-fallback.
                     return;
@@ -327,34 +532,39 @@ impl FallbackProvider {
                             let _ = tx.send(StreamChunk::Done).await;
                             return;
                         }
-                        // Empty completion: fail over; if the chain is
-                        // exhausted, forward the empty stream verbatim so
-                        // the driver's empty-response policy fails loudly.
-                        match advance(
+                        // Empty completion: recover (advance — the empty
+                        // class never charges the retry budget); if the chain
+                        // is exhausted, forward the empty stream verbatim so
+                        // the driver's empty-response policy fails loudly. No
+                        // exhausted-cache record for this class: the driver
+                        // owns empty-completion retries.
+                        match recover(
+                            &mut current,
                             &mut remaining,
                             &messages,
                             &tools,
                             &workspace_root,
-                            "empty completion".to_string(),
+                            FailureCause::EmptyCompletion,
                             &mut attempted,
                             &mut failures,
+                            &state,
                             &throttle,
                             &event_tx,
                         )
                         .await
                         {
-                            AdvanceOutcome::Stream(next) => {
-                                current = next;
+                            Recovered::Stream(next) => {
+                                current_rx = next;
                                 // Drop the failed generation's held Finish:
                                 // its completion never happened.
                                 held_finish = None;
                             }
-                            AdvanceOutcome::Exhausted => {
+                            Recovered::Exhausted => {
                                 flush_finish(&tx, &mut held_finish).await;
                                 let _ = tx.send(StreamChunk::Done).await;
                                 return;
                             }
-                            AdvanceOutcome::Fatal(err) => {
+                            Recovered::Fatal(err) => {
                                 flush_finish(&tx, &mut held_finish).await;
                                 let _ = tx.send(StreamChunk::Error(err)).await;
                                 return;
@@ -367,40 +577,37 @@ impl FallbackProvider {
                             let _ = tx.send(StreamChunk::Error(err)).await;
                             return;
                         }
-                        let reason = format!(
-                            "{}: {}",
-                            reason_label(&err),
-                            truncate_bytes_safe(&err.to_string(), 160)
-                        );
-                        let from = attempted.last().cloned().unwrap_or_default();
+                        let from = current.name.clone();
                         failures.push(fail_line(&from, &err));
-                        match advance(
+                        match recover(
+                            &mut current,
                             &mut remaining,
                             &messages,
                             &tools,
                             &workspace_root,
-                            reason,
+                            FailureCause::Error(err),
                             &mut attempted,
                             &mut failures,
+                            &state,
                             &throttle,
                             &event_tx,
                         )
                         .await
                         {
-                            AdvanceOutcome::Stream(next) => {
-                                current = next;
+                            Recovered::Stream(next) => {
+                                current_rx = next;
                                 // Drop the failed generation's held Finish:
                                 // its completion never happened.
                                 held_finish = None;
                             }
-                            AdvanceOutcome::Exhausted => {
+                            Recovered::Exhausted => {
                                 flush_finish(&tx, &mut held_finish).await;
-                                let _ = tx
-                                    .send(StreamChunk::Error(aggregate(&attempted, &failures)))
-                                    .await;
+                                let aggregate_err = aggregate(&attempted, &failures);
+                                state.record_exhausted(aggregate_err.clone());
+                                let _ = tx.send(StreamChunk::Error(aggregate_err)).await;
                                 return;
                             }
-                            AdvanceOutcome::Fatal(fatal) => {
+                            Recovered::Fatal(fatal) => {
                                 flush_finish(&tx, &mut held_finish).await;
                                 let _ = tx.send(StreamChunk::Error(fatal)).await;
                                 return;
@@ -421,9 +628,42 @@ async fn flush_finish(tx: &mpsc::Sender<StreamChunk>, held: &mut Option<String>)
     }
 }
 
-/// Outcome of trying to obtain a stream from the next provider(s).
-enum AdvanceOutcome {
-    /// A provider produced a stream: continue forwarding from it.
+/// Why the current model is being recovered from: a failover-class error
+/// (retryable or permanent) or an empty completion (driver-policy class —
+/// never absorbed).
+enum FailureCause {
+    Error(ProviderError),
+    EmptyCompletion,
+}
+
+impl FailureCause {
+    /// Whether this cause may charge the same-model retry budget. Permanent
+    /// usage/quota failures never absorb — no redial recovers a dead
+    /// account — and the empty-completion class is driver-owned.
+    fn absorbable(&self) -> bool {
+        match self {
+            FailureCause::Error(err) => !is_permanent_usage_error(err),
+            FailureCause::EmptyCompletion => false,
+        }
+    }
+
+    /// Notification reason for the next switch: failure class + short text.
+    fn reason(&self) -> String {
+        match self {
+            FailureCause::Error(err) => format!(
+                "{}: {}",
+                reason_label(err),
+                truncate_bytes_safe(&err.to_string(), 160)
+            ),
+            FailureCause::EmptyCompletion => "empty completion".to_string(),
+        }
+    }
+}
+
+/// Outcome of the recovery walk.
+enum Recovered {
+    /// A provider produced a stream (same model after an absorbed failure,
+    /// or the next chain entry): continue forwarding from it.
     Stream(mpsc::Receiver<StreamChunk>),
     /// The chain ran out of providers.
     Exhausted,
@@ -431,28 +671,69 @@ enum AdvanceOutcome {
     Fatal(ProviderError),
 }
 
-/// Walk `remaining` until a stream is obtained. Each switch is throttled and
-/// announced (event + log). Failover-class chat() errors continue the walk;
-/// non-failover errors stop it verbatim.
+/// Recovery policy shared by the `chat()`-level loop and the stream
+/// forwarder, applied whenever the CURRENT model just failed with `cause`
+/// (its failure line already recorded by the caller):
+///
+/// - **Absorb while budget remains.** A failover-class, non-permanent
+///   failure with `absorbed < max_retries` is absorbed — the budget is
+///   CHAIN-GLOBAL, so switching models does not re-arm it — and the SAME
+///   provider is redialed once per absorbed failure, spaced by the shared
+///   throttle clock. `max_retries = 0` skips straight to advancement
+///   (pre-budget behavior). A same-model redial emits no
+///   [`AgentEvent::ProviderFallback`]: no provider switch happened.
+/// - **Permanent usage/quota failures fast-fail**: no absorption, advance
+///   immediately.
+/// - **Advance the chain** once absorption is exhausted or disallowed: each
+///   switch is throttled, announced (event + log), and records the escaped
+///   provider. Failover-class errors from the new model continue the walk
+///   (with the same absorb/advance decision); non-failover errors stop it
+///   verbatim.
 #[allow(clippy::too_many_arguments)]
-async fn advance(
+async fn recover(
+    current: &mut CurrentModel,
     remaining: &mut VecDeque<FallbackEntry>,
     messages: &[Message],
     tools: &[ToolDefinition],
     workspace_root: &Path,
-    mut reason: String,
+    mut cause: FailureCause,
     attempted: &mut Vec<String>,
     failures: &mut Vec<String>,
+    state: &FallbackState,
     throttle: &Throttle,
     event_tx: &Option<mpsc::Sender<AgentEvent>>,
-) -> AdvanceOutcome {
+) -> Recovered {
     loop {
+        if cause.absorbable() && state.try_absorb() {
+            throttle.wait_and_mark().await;
+            tracing::warn!(
+                provider = %current.name,
+                absorbed = state.absorbed(),
+                budget = state.max_retries,
+                "[fallback] absorbing failure; retrying same provider"
+            );
+            match current
+                .provider
+                .chat(messages, tools, &current.model, workspace_root)
+                .await
+            {
+                Ok(stream) => return Recovered::Stream(stream),
+                Err(err) if is_failoverable(&err) => {
+                    failures.push(fail_line(&current.name, &err));
+                    cause = FailureCause::Error(err);
+                    continue;
+                }
+                Err(err) => return Recovered::Fatal(err),
+            }
+        }
+        // Budget spent, permanent failure, or empty completion: advance.
         let Some(entry) = remaining.pop_front() else {
-            return AdvanceOutcome::Exhausted;
+            return Recovered::Exhausted;
         };
         throttle.wait_and_mark().await;
-        let from = attempted.last().cloned().unwrap_or_default();
-        notify_fallback(event_tx, &from, &entry.name, &reason).await;
+        let from = current.name.clone();
+        state.record_escaped(&from);
+        notify_fallback(event_tx, &from, &entry.name, &cause.reason()).await;
         // Empty model string: each fallback provider uses its own
         // `[provider.<name>]` configured model.
         match entry
@@ -462,21 +743,29 @@ async fn advance(
         {
             Ok(stream) => {
                 attempted.push(entry.name.clone());
-                return AdvanceOutcome::Stream(stream);
+                *current = CurrentModel {
+                    name: entry.name,
+                    provider: entry.provider,
+                    model: String::new(),
+                };
+                return Recovered::Stream(stream);
             }
             Err(err) if is_failoverable(&err) => {
                 attempted.push(entry.name.clone());
                 failures.push(fail_line(&entry.name, &err));
-                // The next notification (if the walk continues) names THIS
+                // The current model is now the failed entry: a later
+                // absorbable failure may retry IT (budget permitting), and
+                // the next notification (if the walk continues) names THIS
                 // failure, not the one that started the walk.
-                reason = format!(
-                    "{}: {}",
-                    reason_label(&err),
-                    truncate_bytes_safe(&err.to_string(), 160)
-                );
+                *current = CurrentModel {
+                    name: entry.name,
+                    provider: entry.provider,
+                    model: String::new(),
+                };
+                cause = FailureCause::Error(err);
                 continue;
             }
-            Err(err) => return AdvanceOutcome::Fatal(err),
+            Err(err) => return Recovered::Fatal(err),
         }
     }
 }
@@ -526,11 +815,23 @@ impl Provider for FallbackProvider {
         model: &str,
         workspace_root: &Path,
     ) -> Result<mpsc::Receiver<StreamChunk>, ProviderError> {
+        // Sticky exhaustion: once the chain is spent (error class), every
+        // later chat() on this instance returns the recorded aggregate
+        // immediately — replaying the walk would hammer dead providers.
+        // Cleared only by `reset_for_new_turn` (a new external user turn).
+        if let Some(err) = self.state.cached_exhausted() {
+            return Err(err);
+        }
         let mut attempted = vec![self.primary_name.clone()];
         let mut failures: Vec<String> = Vec::new();
+        let mut current = CurrentModel {
+            name: self.primary_name.clone(),
+            provider: Arc::clone(&self.primary),
+            model: model.to_string(),
+        };
 
-        let current = match self
-            .primary
+        let current_rx = match current
+            .provider
             .chat(messages, tools, model, workspace_root)
             .await
         {
@@ -539,32 +840,31 @@ impl Provider for FallbackProvider {
                 if !is_failoverable(&err) {
                     return Err(err);
                 }
-                failures.push(fail_line(&self.primary_name, &err));
-                let reason = format!(
-                    "{}: {}",
-                    reason_label(&err),
-                    truncate_bytes_safe(&err.to_string(), 160)
-                );
+                failures.push(fail_line(&current.name, &err));
                 let mut remaining: VecDeque<FallbackEntry> =
                     self.fallbacks.iter().cloned().collect();
-                match advance(
+                match recover(
+                    &mut current,
                     &mut remaining,
                     messages,
                     tools,
                     workspace_root,
-                    reason,
+                    FailureCause::Error(err),
                     &mut attempted,
                     &mut failures,
+                    &self.state,
                     &self.throttle,
                     &self.event_tx,
                 )
                 .await
                 {
-                    AdvanceOutcome::Stream(stream) => stream,
-                    AdvanceOutcome::Exhausted => {
-                        return Err(aggregate(&attempted, &failures));
+                    Recovered::Stream(stream) => stream,
+                    Recovered::Exhausted => {
+                        let err = aggregate(&attempted, &failures);
+                        self.state.record_exhausted(err.clone());
+                        return Err(err);
                     }
-                    AdvanceOutcome::Fatal(err) => return Err(err),
+                    Recovered::Fatal(err) => return Err(err),
                 }
             }
         };
@@ -572,12 +872,14 @@ impl Provider for FallbackProvider {
         let remaining: Vec<FallbackEntry> = self.fallbacks.to_vec();
         Ok(Self::spawn_forwarder(
             current,
+            current_rx,
             remaining,
             messages.to_vec(),
             tools.to_vec(),
             workspace_root.to_path_buf(),
             attempted,
             failures,
+            Arc::clone(&self.state),
             self.throttle.clone(),
             self.event_tx.clone(),
         ))
@@ -762,6 +1064,7 @@ mod tests {
             fallbacks,
             0, // initial delay: instant first switch (keeps tests fast)
             0, // retry gap: instant subsequent switches
+            0, // max_retries: switch immediately (pre-budget behavior)
             event_tx,
         )
     }
@@ -1299,6 +1602,7 @@ mod tests {
             ],
             0,   // first switch: instant
             400, // subsequent switches: 400ms apart
+            0,   // max_retries: no same-model absorption
             None,
         );
 
@@ -1406,6 +1710,426 @@ mod tests {
         assert!(
             drain_fallbacks(&mut event_rx).is_empty(),
             "chain untouched → no switch event"
+        );
+    }
+
+    // ---- T1-2: retry budget, permanent fast-fail, exhaustion, escapes ----
+
+    #[test]
+    fn permanent_usage_error_classification() {
+        // Typed status wins.
+        assert!(is_permanent_usage_error(&ProviderError::Http {
+            status: 402,
+            body: "payment required".into(),
+        }));
+        // Body/message markers, case-insensitive.
+        assert!(is_permanent_usage_error(&ProviderError::Http {
+            status: 400,
+            body: "Insufficient Balance".into(),
+        }));
+        assert!(is_permanent_usage_error(&ProviderError::RequestFailed(
+            "billing: card declined".into(),
+        )));
+        assert!(is_permanent_usage_error(&ProviderError::RequestFailed(
+            "coding plan package has expired".into(),
+        )));
+        assert!(is_permanent_usage_error(&ProviderError::RequestFailed(
+            "quota exhausted — permanently exhausted".into(),
+        )));
+        // Ordinary transient classes stay absorbable/failoverable.
+        assert!(!is_permanent_usage_error(&ProviderError::RateLimited {
+            retry_after_ms: 1_000
+        }));
+        assert!(!is_permanent_usage_error(&ProviderError::Http {
+            status: 503,
+            body: "upstream unavailable".into(),
+        }));
+        assert!(!is_permanent_usage_error(&ProviderError::RequestFailed(
+            "rate limit exceeded, retry later".into(),
+        )));
+        assert!(!is_permanent_usage_error(&ProviderError::AuthError(
+            "invalid api key".into()
+        )));
+    }
+
+    #[test]
+    fn escaped_provider_key_parses_display_and_pinned_names() {
+        assert_eq!(escaped_provider_key("DeepSeek"), Some("DeepSeek"));
+        assert_eq!(
+            escaped_provider_key("ZhipuAI(glm-5.3-flash)"),
+            Some("ZhipuAI")
+        );
+        assert_eq!(escaped_provider_key("MiMo"), Some("MiMo"));
+        assert_eq!(
+            escaped_provider_key("Primary"),
+            None,
+            "test doubles parse to none"
+        );
+        assert_eq!(escaped_provider_key(""), None);
+    }
+
+    // Budget = 2: the primary absorbs failures 1 and 2 (redialing itself),
+    // failure 3 advances. max_retries = N absorbs N failures.
+    #[tokio::test]
+    async fn budget_absorbs_failures_then_advances() {
+        let primary = ScriptedProvider::new(vec![
+            ScriptRound::ChatErr(ProviderError::RateLimited { retry_after_ms: 1 }),
+            ScriptRound::ChatErr(ProviderError::RateLimited { retry_after_ms: 1 }),
+            ScriptRound::ChatErr(ProviderError::RateLimited { retry_after_ms: 1 }),
+        ]);
+        let secondary = ScriptedProvider::new(vec![]);
+        let provider = FallbackProvider::new(
+            primary.clone(),
+            "Primary".into(),
+            vec![FallbackEntry {
+                name: "Secondary".into(),
+                provider: secondary.clone(),
+            }],
+            0,
+            0,
+            2,
+            None,
+        );
+        let chunks = collect(
+            provider
+                .chat(&[Message::user("hi")], &[], "m", Path::new("."))
+                .await
+                .expect("secondary stream"),
+        )
+        .await;
+        assert_eq!(text_of(&chunks), "hello…done");
+        assert_eq!(primary.call_count(), 3, "1 initial + 2 absorbed redials");
+        assert_eq!(secondary.call_count(), 1, "only the 3rd failure advances");
+    }
+
+    // The budget is CHAIN-GLOBAL: after it is spent switching away from the
+    // primary, a failure on the SECONDARY advances immediately — it does not
+    // get its own N absorptions (omos: "not cleared on a model switch").
+    #[tokio::test]
+    async fn budget_is_chain_global_not_reset_per_model() {
+        let primary = ScriptedProvider::new(vec![
+            ScriptRound::ChatErr(ProviderError::RateLimited { retry_after_ms: 1 }),
+            ScriptRound::ChatErr(ProviderError::RateLimited { retry_after_ms: 1 }),
+            ScriptRound::ChatErr(ProviderError::RateLimited { retry_after_ms: 1 }),
+        ]);
+        let secondary = ScriptedProvider::new(vec![ScriptRound::ChatErr(ProviderError::Http {
+            status: 503,
+            body: "upstream unavailable".into(),
+        })]);
+        let tertiary = ScriptedProvider::new(vec![]);
+        let provider = FallbackProvider::new(
+            primary,
+            "Primary".into(),
+            vec![
+                FallbackEntry {
+                    name: "Secondary".into(),
+                    provider: secondary.clone(),
+                },
+                FallbackEntry {
+                    name: "Tertiary".into(),
+                    provider: tertiary.clone(),
+                },
+            ],
+            0,
+            0,
+            2,
+            None,
+        );
+        let chunks = collect(
+            provider
+                .chat(&[Message::user("hi")], &[], "m", Path::new("."))
+                .await
+                .expect("tertiary stream"),
+        )
+        .await;
+        assert_eq!(text_of(&chunks), "hello…done");
+        assert_eq!(secondary.call_count(), 1, "no fresh budget after a switch");
+        assert_eq!(tertiary.call_count(), 1);
+    }
+
+    // Permanent usage/quota failures skip absorption entirely: with budget 2
+    // the 429 is absorbed once, the billing failure advances immediately.
+    #[tokio::test]
+    async fn permanent_usage_error_advances_without_absorption() {
+        let primary = ScriptedProvider::new(vec![
+            ScriptRound::ChatErr(ProviderError::RateLimited { retry_after_ms: 1 }),
+            ScriptRound::ChatErr(ProviderError::RequestFailed(
+                "402 Payment Required: insufficient balance".into(),
+            )),
+        ]);
+        let secondary = ScriptedProvider::new(vec![]);
+        let provider = FallbackProvider::new(
+            primary.clone(),
+            "Primary".into(),
+            vec![FallbackEntry {
+                name: "Secondary".into(),
+                provider: secondary.clone(),
+            }],
+            0,
+            0,
+            2,
+            None,
+        );
+        let chunks = collect(
+            provider
+                .chat(&[Message::user("hi")], &[], "m", Path::new("."))
+                .await
+                .expect("secondary stream"),
+        )
+        .await;
+        assert_eq!(text_of(&chunks), "hello…done");
+        assert_eq!(
+            primary.call_count(),
+            2,
+            "429 absorbed once; the permanent failure must not redial"
+        );
+        assert_eq!(secondary.call_count(), 1);
+    }
+
+    // A spent chain caches its aggregate error: the next chat() on the same
+    // instance returns it without touching any provider again.
+    #[tokio::test]
+    async fn exhausted_cache_prevents_chain_replay() {
+        let primary =
+            ScriptedProvider::new(vec![ScriptRound::ChatErr(ProviderError::RateLimited {
+                retry_after_ms: 1,
+            })]);
+        let secondary = ScriptedProvider::new(vec![ScriptRound::ChatErr(ProviderError::Http {
+            status: 503,
+            body: "upstream unavailable".into(),
+        })]);
+        let provider = FallbackProvider::new(
+            primary.clone(),
+            "Primary".into(),
+            vec![FallbackEntry {
+                name: "Secondary".into(),
+                provider: secondary.clone(),
+            }],
+            0,
+            0,
+            0,
+            None,
+        );
+        let first = provider
+            .chat(&[Message::user("hi")], &[], "m", Path::new("."))
+            .await
+            .expect_err("chain exhausts");
+        assert!(matches!(first, ProviderError::FallbackExhausted { .. }));
+        assert_eq!(primary.call_count(), 1);
+        assert_eq!(secondary.call_count(), 1);
+
+        let second = provider
+            .chat(&[Message::user("again")], &[], "m", Path::new("."))
+            .await
+            .expect_err("cached exhaustion returns the same verdict");
+        match (&first, &second) {
+            (
+                ProviderError::FallbackExhausted { chain: c1, .. },
+                ProviderError::FallbackExhausted { chain: c2, .. },
+            ) => assert_eq!(c1, c2),
+            other => panic!("expected cached FallbackExhausted, got {other:?}"),
+        }
+        assert_eq!(primary.call_count(), 1, "exhausted chat() must not redial");
+        assert_eq!(
+            secondary.call_count(),
+            1,
+            "exhausted chat() must not replay the chain"
+        );
+    }
+
+    // A new external turn (reset_for_new_turn) re-arms the budget AND clears
+    // the exhaustion cache: the walk replays from the primary with fresh
+    // absorption. The escaped-provider set survives the reset.
+    #[tokio::test]
+    async fn new_turn_reset_restores_absorption() {
+        let primary = ScriptedProvider::new(vec![
+            ScriptRound::ChatErr(ProviderError::RateLimited { retry_after_ms: 1 }),
+            ScriptRound::ChatErr(ProviderError::RateLimited { retry_after_ms: 1 }),
+            ScriptRound::ChatErr(ProviderError::RateLimited { retry_after_ms: 1 }),
+            // Second descent after the reset: 3 more failures.
+            ScriptRound::ChatErr(ProviderError::RateLimited { retry_after_ms: 1 }),
+            ScriptRound::ChatErr(ProviderError::RateLimited { retry_after_ms: 1 }),
+            ScriptRound::ChatErr(ProviderError::RateLimited { retry_after_ms: 1 }),
+        ]);
+        let secondary = ScriptedProvider::new(vec![
+            ScriptRound::ChatErr(ProviderError::Http {
+                status: 503,
+                body: "upstream unavailable".into(),
+            }),
+            ScriptRound::ChatErr(ProviderError::Http {
+                status: 503,
+                body: "upstream unavailable".into(),
+            }),
+        ]);
+        let provider = FallbackProvider::new(
+            primary.clone(),
+            "DeepSeek".into(),
+            vec![FallbackEntry {
+                name: "Kimi".into(),
+                provider: secondary.clone(),
+            }],
+            0,
+            0,
+            2,
+            None,
+        );
+        let first = provider
+            .chat(&[Message::user("hi")], &[], "m", Path::new("."))
+            .await;
+        assert!(matches!(
+            first,
+            Err(ProviderError::FallbackExhausted { .. })
+        ));
+        assert!(primary.call_count() == 3);
+        assert_eq!(secondary.call_count(), 1);
+        // Kimi failed terminally (chain exhausted) but no switch ever
+        // ADVANCED AWAY from it, so it never appears as a `from` — the
+        // escaped set mirrors the ProviderFallback events exactly.
+        assert_eq!(
+            provider.escaped_providers(),
+            ["DeepSeek".to_string()].into_iter().collect(),
+            "escaped set == the from-values of emitted switches"
+        );
+
+        provider.reset_for_new_turn();
+
+        let second = provider
+            .chat(&[Message::user("new turn")], &[], "m", Path::new("."))
+            .await;
+        assert!(matches!(
+            second,
+            Err(ProviderError::FallbackExhausted { .. })
+        ));
+        assert_eq!(
+            primary.call_count(),
+            6,
+            "budget re-armed: 3 more absorbed redials"
+        );
+        assert_eq!(secondary.call_count(), 2);
+        assert_eq!(
+            provider.escaped_providers(),
+            ["DeepSeek".to_string()].into_iter().collect(),
+            "escapes survive the turn reset by design"
+        );
+    }
+
+    // Mid-stream failures never retry — not even same-model absorption: the
+    // zero-content rule gates everything.
+    #[tokio::test]
+    async fn budget_never_absorbs_a_midstream_failure() {
+        let primary = CraftedProvider::new(vec![
+            StreamChunk::TextDelta("partial ".into()),
+            StreamChunk::Error(ProviderError::Http {
+                status: 502,
+                body: "upstream dropped".into(),
+            }),
+        ]);
+        let secondary = ScriptedProvider::new(vec![]);
+        let provider = FallbackProvider::new(
+            primary.clone(),
+            "Primary".into(),
+            vec![FallbackEntry {
+                name: "Secondary".into(),
+                provider: secondary.clone(),
+            }],
+            0,
+            0,
+            3,
+            None,
+        );
+        let chunks = collect(
+            provider
+                .chat(&[Message::user("hi")], &[], "m", Path::new("."))
+                .await
+                .expect("stream"),
+        )
+        .await;
+        assert_eq!(text_of(&chunks), "partial ");
+        assert_eq!(
+            primary.call_count(),
+            1,
+            "no same-model redial after content"
+        );
+        assert_eq!(secondary.call_count(), 0, "no switch after content");
+    }
+
+    // Empty completions are the driver-policy class: they advance the chain
+    // without charging the budget (no same-model redial), and exhaustion
+    // forwards Done verbatim — no exhausted-cache record, no synthesized
+    // error.
+    #[tokio::test]
+    async fn empty_completion_advances_without_absorbing() {
+        let primary = ScriptedProvider::new(vec![
+            ScriptRound::Stream(&[]),
+            ScriptRound::Stream(&["never"]),
+        ]);
+        let secondary = ScriptedProvider::new(vec![ScriptRound::Stream(&[])]);
+        let provider = FallbackProvider::new(
+            primary.clone(),
+            "Primary".into(),
+            vec![FallbackEntry {
+                name: "Secondary".into(),
+                provider: secondary.clone(),
+            }],
+            0,
+            0,
+            2,
+            None,
+        );
+        let chunks = collect(
+            provider
+                .chat(&[Message::user("hi")], &[], "m", Path::new("."))
+                .await
+                .expect("stream"),
+        )
+        .await;
+        assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
+        assert!(!chunks.iter().any(|c| matches!(c, StreamChunk::Error(_))));
+        assert_eq!(
+            primary.call_count(),
+            1,
+            "empty completions never redial the same model"
+        );
+        assert_eq!(secondary.call_count(), 1);
+    }
+
+    // Every switch records the provider it advanced away from — including
+    // the primary and pinned-model tier names (canonical display name).
+    #[tokio::test]
+    async fn switch_records_escaped_providers() {
+        let primary =
+            ScriptedProvider::new(vec![ScriptRound::ChatErr(ProviderError::RateLimited {
+                retry_after_ms: 1,
+            })]);
+        let secondary = ScriptedProvider::new(vec![]);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let provider = FallbackProvider::new(
+            primary,
+            "ZhipuAI(glm-5.3-flash)".into(),
+            vec![FallbackEntry {
+                name: "Kimi".into(),
+                provider: secondary,
+            }],
+            0,
+            0,
+            0,
+            Some(event_tx),
+        );
+        let chunks = collect(
+            provider
+                .chat(&[Message::user("hi")], &[], "m", Path::new("."))
+                .await
+                .expect("secondary stream"),
+        )
+        .await;
+        assert_eq!(text_of(&chunks), "hello…done");
+        let events = drain_fallbacks(&mut event_rx);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "ZhipuAI(glm-5.3-flash)");
+        assert_eq!(
+            provider.escaped_providers(),
+            ["ZhipuAI".to_string()].into_iter().collect(),
+            "pinned tier names canonicalize to the provider"
         );
     }
 }

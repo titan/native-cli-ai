@@ -971,6 +971,7 @@ async fn run_one_shot(
                 false,
                 None,
                 runtime.plugin_registry(),
+                runtime.fallback_escaped_handle(),
             )
         });
 

@@ -74,18 +74,35 @@ pub fn build_provider_with_events(
     config: &NcaConfig,
     event_tx: Option<tokio::sync::mpsc::Sender<AgentEvent>>,
 ) -> Result<Arc<dyn Provider>, ProviderError> {
+    build_provider_with_tracker(config, event_tx).map(|(provider, _)| provider)
+}
+
+/// [`build_provider_with_events`], additionally returning the concrete
+/// [`FallbackProvider`] handle when fallback wrapping is active (`None`
+/// when disabled or the chain resolves empty). The handle lets the
+/// supervisor reset the chain-global retry budget at each new external
+/// user turn and read the escaped-provider set for child chain avoidance —
+/// without downcasting the `Arc<dyn Provider>` held inside the agent loop.
+pub type ProviderWithFallback = (Arc<dyn Provider>, Option<Arc<FallbackProvider>>);
+
+pub fn build_provider_with_tracker(
+    config: &NcaConfig,
+    event_tx: Option<tokio::sync::mpsc::Sender<AgentEvent>>,
+) -> Result<ProviderWithFallback, ProviderError> {
     let primary = build_provider_for(config, config.provider.default)?;
     let Some(entries) = resolve_fallback_entries(config)? else {
-        return Ok(primary);
+        return Ok((primary, None));
     };
-    Ok(Arc::new(FallbackProvider::new(
+    let fallback = Arc::new(FallbackProvider::new(
         primary,
         config.provider.default.display_name().to_string(),
         entries,
         config.fallback.initial_retry_delay_ms,
         config.fallback.retry_delay_ms,
+        config.fallback.max_retries,
         event_tx,
-    )))
+    ));
+    Ok((Arc::clone(&fallback) as Arc<dyn Provider>, Some(fallback)))
 }
 
 /// Resolve the `[fallback]` chain into built entries. `None` when fallback
@@ -486,6 +503,29 @@ mod tests {
         config.provider.openai.api_key = Some("openai-key".into());
         // enabled defaults to false → chain ignored, build succeeds.
         assert!(build_provider(&config).is_ok());
+    }
+
+    // T1-2: the tracker variant exposes the concrete FallbackProvider handle
+    // exactly when fallback wrapping is active — the supervisor's downcast-free
+    // seam for turn resets and escaped-provider reads.
+    #[test]
+    fn tracker_handle_present_iff_fallback_wrapping() {
+        let mut config = NcaConfig::default();
+        config.provider.deepseek.api_key = Some("deepseek-key".into());
+        config.provider.openai.api_key = Some("openai-key".into());
+
+        // Disabled → no handle.
+        let (_, tracker) = build_provider_with_tracker(&config, None).expect("bare build succeeds");
+        assert!(tracker.is_none());
+
+        // Enabled + resolvable chain → handle present, chain visible on it.
+        config.fallback.enabled = true;
+        config.fallback.chain = vec!["openai".into()];
+        let (_, tracker) =
+            build_provider_with_tracker(&config, None).expect("wrapped build succeeds");
+        let fallback = tracker.expect("active fallback exposes its handle");
+        assert_eq!(fallback.chain_names(), vec!["OpenAI"]);
+        assert!(fallback.escaped_providers().is_empty());
     }
 
     #[test]

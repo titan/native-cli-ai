@@ -58,6 +58,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Prefix stamped on EVERY wake-injected prompt: single-terminal renders,
+/// composite renders, and the restart-ghost sweep. Doubles as the
+/// external/internal turn discriminator for the fallback retry-budget
+/// reset (see `Supervisor::run_turn_with_images`): a prompt without this
+/// prefix is a genuine external user turn.
+pub const WAKE_PROMPT_PREFIX: &str = "[wake] ";
+
 /// Fire-and-forget wake delivery: receives the fully rendered wake text.
 /// The CLI closure must never be awaited, must not block, and must not
 /// panic; delivery failure is the closure's business (e.g. `try_send`
@@ -195,12 +202,13 @@ fn drain_notes(inner: &Inner) -> Option<(Vec<TerminalNote>, u32)> {
 fn render_wake(notes: &[TerminalNote], overflow: u32) -> String {
     if let [note] = notes {
         return format!(
-            "[wake] Background task {} reached {}: {}. Reconcile (task_status or /jobs) and continue.",
+            "{WAKE_PROMPT_PREFIX}Background task {} reached {}: {}. Reconcile (task_status or /jobs) and continue.",
             note.child_ref, note.state, note.summary
         );
     }
     let total = notes.len() + overflow as usize;
-    let mut text = format!("[wake] {total} background tasks reached terminal states: ");
+    let mut text =
+        format!("{WAKE_PROMPT_PREFIX}{total} background tasks reached terminal states: ");
     for (i, note) in notes.iter().enumerate() {
         if i > 0 {
             text.push_str("; ");

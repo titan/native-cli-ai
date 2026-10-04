@@ -2296,6 +2296,16 @@ pub struct FallbackConfig {
     /// Minimum spacing between consecutive failover switches (anti-storm
     /// throttle), in milliseconds. Default 500.
     pub retry_delay_ms: u64,
+    /// Chain-global retry budget: how many failover-class failures the
+    /// CURRENT model absorbs (redialing the same provider, spaced by the
+    /// throttle clock) before the chain advances to the next provider.
+    /// The budget is chain-global — switching models does not re-arm it
+    /// (omos `foreground-fallback` "Retry Budget and Exhaustion"); only a
+    /// new external user turn resets it. Permanent usage/quota failures
+    /// (402 / billing / expired-plan wording) never charge it and advance
+    /// immediately. Default 0: switch on the first failure (pre-budget
+    /// behavior).
+    pub max_retries: u32,
 }
 
 impl Default for FallbackConfig {
@@ -2305,6 +2315,7 @@ impl Default for FallbackConfig {
             chain: Vec::new(),
             initial_retry_delay_ms: 0,
             retry_delay_ms: 500,
+            max_retries: 0,
         }
     }
 }
@@ -2322,6 +2333,9 @@ impl FallbackConfig {
         }
         if let Some(retry_delay_ms) = partial.retry_delay_ms {
             self.retry_delay_ms = retry_delay_ms;
+        }
+        if let Some(max_retries) = partial.max_retries {
+            self.max_retries = max_retries;
         }
     }
 }
@@ -2973,6 +2987,7 @@ struct PartialFallbackConfig {
     chain: Option<Vec<String>>,
     initial_retry_delay_ms: Option<u64>,
     retry_delay_ms: Option<u64>,
+    max_retries: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -3148,6 +3163,10 @@ mod tests {
         assert!(fallback.chain.is_empty());
         assert_eq!(fallback.initial_retry_delay_ms, 0);
         assert_eq!(fallback.retry_delay_ms, 500);
+        assert_eq!(
+            fallback.max_retries, 0,
+            "budget defaults to switch-immediately"
+        );
     }
 
     #[test]
@@ -3158,6 +3177,7 @@ mod tests {
             chain = ["openai", "zhipuai"]
             initial_retry_delay_ms = 250
             retry_delay_ms = 1000
+            max_retries = 3
         "#;
         let partial: PartialNcaConfig = toml::from_str(raw).expect("parse");
         let mut config = NcaConfig::default();
@@ -3166,6 +3186,7 @@ mod tests {
         assert_eq!(config.fallback.chain, vec!["openai", "zhipuai"]);
         assert_eq!(config.fallback.initial_retry_delay_ms, 250);
         assert_eq!(config.fallback.retry_delay_ms, 1000);
+        assert_eq!(config.fallback.max_retries, 3);
     }
 
     #[test]
@@ -3179,6 +3200,7 @@ mod tests {
         assert!(config.fallback.enabled);
         assert_eq!(config.fallback.chain, vec!["kimi"], "chain untouched");
         assert_eq!(config.fallback.retry_delay_ms, 500, "delays untouched");
+        assert_eq!(config.fallback.max_retries, 0, "budget untouched");
     }
 
     #[test]

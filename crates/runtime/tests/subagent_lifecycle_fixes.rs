@@ -420,6 +420,7 @@ async fn revived_generation_is_cancellable_mid_run() {
             registry: Some(registry.clone()),
             provider: Some(provider.clone() as Arc<dyn Provider>),
             plugins: None,
+            escaped_providers: Default::default(),
         },
         Some(event_tx.clone()),
     ));

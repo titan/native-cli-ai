@@ -174,6 +174,7 @@ fn wire_consumer(
         false,
         wake,
         None,
+        None,
     );
     // Drain the event tap so the bounded channel never back-pressures the
     // child's lifecycle folding.

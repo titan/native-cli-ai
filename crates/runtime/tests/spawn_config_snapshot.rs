@@ -183,6 +183,7 @@ async fn s2_child_spawned_after_switch_uses_new_config() {
         false,
         None,
         None,
+        None,
     );
     // Drain lifecycle events so the bounded channel never backpressures.
     tokio::spawn(async move { while event_rx.recv().await.is_some() {} });

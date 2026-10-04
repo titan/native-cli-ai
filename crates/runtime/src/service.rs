@@ -180,6 +180,7 @@ async fn run_service_session_with_startup(
             false,
             None,
             Some(supervisor.plugin_registry()),
+            supervisor.fallback_escaped_handle(),
         ))
     } else {
         None

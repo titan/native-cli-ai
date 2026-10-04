@@ -56,6 +56,13 @@ pub struct ChildSessionConfig {
     /// instances and appends returned context blocks to the child's task
     /// prompt (host-enforced size cap from `[plugins]`).
     pub plugins: Option<Arc<nca_core::plugin::PluginRegistry>>,
+    /// Providers the PARENT session has already escaped via fallback
+    /// (canonical display names — see `FallbackProvider::escaped_providers`),
+    /// snapshotted at spawn time. `prepare_child_session` drops matching
+    /// entries from the child's `[fallback] chain`; a chain that would be
+    /// emptied is kept verbatim (warn-only) rather than spawning with no
+    /// fallback at all.
+    pub escaped_providers: HashSet<String>,
 }
 
 /// Result of a spawned child session.
@@ -197,6 +204,45 @@ fn strip_child_only_tools(tools: &mut nca_core::tools::ToolRegistry) {
     }
 }
 
+/// Drop `[fallback] chain` entries whose provider is in `escaped`
+/// (canonical display names — see `FallbackProvider::escaped_providers`).
+/// Only CHAIN entries are avoided; the child's primary provider is never
+/// rewritten. When filtering would empty the chain entirely, the ORIGINAL
+/// chain is kept and one warning is logged — a child without any fallback
+/// is worse than one that may retry a provider the parent escaped (which
+/// can also have recovered by then). No-op when nothing is escaped or the
+/// child has no fallback chain.
+pub(crate) fn filter_child_fallback_chain(config: &mut NcaConfig, escaped: &HashSet<String>) {
+    if escaped.is_empty() || !config.fallback.enabled || config.fallback.chain.is_empty() {
+        return;
+    }
+    let original = config.fallback.chain.clone();
+    let mut kept_any = false;
+    config.fallback.chain.retain(|raw| {
+        // Same provider-part split as the factory: `provider` or
+        // `provider:model`. Unparsable entries are the factory's loud
+        // failure, not ours — keep them.
+        let provider_part = raw.split_once(':').map(|(p, _)| p).unwrap_or(raw);
+        let keep = match ProviderKind::from_cli_name(provider_part) {
+            Some(kind) => !escaped.contains(kind.display_name()),
+            None => true,
+        };
+        if keep {
+            kept_any = true;
+        }
+        keep
+    });
+    if !kept_any {
+        tracing::warn!(
+            chain = original.join(", "),
+            escaped = escaped.iter().cloned().collect::<Vec<_>>().join(", "),
+            "[fallback] every child chain entry targets a provider the parent escaped; \
+             keeping the original chain"
+        );
+        config.fallback.chain = original;
+    }
+}
+
 /// Phase 1 of a child spawn: everything up to (but not including) the
 /// first `run_turn` — routing config, image resolution,
 /// `Supervisor::create`, parent-only tool strip
@@ -231,6 +277,13 @@ pub async fn prepare_child_session(
         cfg.provider_override,
         cfg.model_override.as_deref(),
     );
+
+    // T1-2 chain avoidance: drop fallback targets the parent already
+    // escaped BEFORE the child supervisor builds its provider (the chain is
+    // resolved at build time, so filtering the config is the seam). An
+    // injected pre-built provider (`cfg.provider`) bypasses the config
+    // build entirely — the filter is then a harmless no-op.
+    filter_child_fallback_chain(&mut child_config, &cfg.escaped_providers);
 
     // Forward the parent's images only when the routed provider+model accepts
     // native image input; make paths absolute against the PARENT workspace
@@ -1111,6 +1164,7 @@ pub fn spawn_subagent_consumer(
     background_default: bool,
     wake: Option<WakeScheduler>,
     plugins: Option<Arc<nca_core::plugin::PluginRegistry>>,
+    escaped_providers: Option<Arc<Mutex<HashSet<String>>>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(req) = spawn_rx.recv().await {
@@ -1138,6 +1192,13 @@ pub fn spawn_subagent_consumer(
             let child_provider = child_provider.clone();
             let wake = wake.clone();
             let plugins = plugins.clone();
+            // T1-2: snapshot the parent's escaped-provider set at spawn time
+            // (later escapes are the NEXT child's business — a child already
+            // running keeps the chain it was built with).
+            let escaped_providers = escaped_providers
+                .as_ref()
+                .map(|set| set.lock().unwrap_or_else(|p| p.into_inner()).clone())
+                .unwrap_or_default();
 
             // Summary of the parent conversation as of THIS spawn (the
             // supervisor refreshes the mirror at each turn start), so a child
@@ -1164,6 +1225,7 @@ pub fn spawn_subagent_consumer(
                 registry: Some(registry.clone()),
                 provider: child_provider,
                 plugins,
+                escaped_providers,
             };
 
             tokio::spawn(async move {
@@ -1812,6 +1874,61 @@ mod tests {
 
         assert_eq!(refs.len(), 1, "deduped to one attachment: {refs:?}");
         assert_eq!(refs[0].path, absolute);
+    }
+
+    // ── T1-2: child fallback-chain avoidance ─────────────────
+
+    fn config_with_chain(enabled: bool, chain: Vec<&str>) -> NcaConfig {
+        let mut config = NcaConfig::default();
+        config.fallback.enabled = enabled;
+        config.fallback.chain = chain.into_iter().map(String::from).collect();
+        config
+    }
+
+    fn set_of(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn filter_drops_escaped_providers_and_keeps_the_rest() {
+        let mut config = config_with_chain(
+            true,
+            vec!["openai", "zhipuai:glm-5.3-flash", "zhipuai:glm-5.3", "kimi"],
+        );
+        filter_child_fallback_chain(&mut config, &set_of(&["OpenAI", "ZhipuAI"]));
+        assert_eq!(config.fallback.chain, vec!["kimi".to_string()]);
+    }
+
+    #[test]
+    fn filter_emptied_chain_keeps_original_verbatim() {
+        // Every entry targets an escaped provider → keep the original chain
+        // (warn-only) instead of spawning the child with no fallback.
+        let mut config = config_with_chain(true, vec!["openai", "kimi"]);
+        filter_child_fallback_chain(&mut config, &set_of(&["OpenAI", "Kimi"]));
+        assert_eq!(
+            config.fallback.chain,
+            vec!["openai".to_string(), "kimi".to_string()],
+            "empty-after-filter keeps the original chain"
+        );
+    }
+
+    #[test]
+    fn filter_is_noop_without_escapes_or_fallback() {
+        // No escapes → untouched.
+        let mut config = config_with_chain(true, vec!["openai"]);
+        filter_child_fallback_chain(&mut config, &HashSet::new());
+        assert_eq!(config.fallback.chain, vec!["openai".to_string()]);
+
+        // Fallback disabled → untouched even with escapes.
+        let mut config = config_with_chain(false, vec!["openai"]);
+        filter_child_fallback_chain(&mut config, &set_of(&["OpenAI"]));
+        assert_eq!(config.fallback.chain, vec!["openai".to_string()]);
+
+        // Unknown chain entries (the factory's loud failure) are not ours to
+        // drop — kept verbatim.
+        let mut config = config_with_chain(true, vec!["not-a-provider"]);
+        filter_child_fallback_chain(&mut config, &set_of(&["OpenAI"]));
+        assert_eq!(config.fallback.chain, vec!["not-a-provider".to_string()]);
     }
 
     #[test]

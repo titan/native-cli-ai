@@ -184,6 +184,16 @@ impl SessionRuntime {
         Some(self.supervisor.plugin_registry())
     }
 
+    /// Escaped-provider handle for the subagent spawn consumer (T1-2 chain
+    /// avoidance): providers this session failed over away from, dropped
+    /// from freshly spawned children's fallback chains. `None` when
+    /// fallback is disabled.
+    pub fn fallback_escaped_handle(
+        &self,
+    ) -> Option<Arc<std::sync::Mutex<std::collections::HashSet<String>>>> {
+        self.supervisor.fallback_escaped_handle()
+    }
+
     pub fn set_model(&mut self, model: impl Into<String>) {
         let model = model.into();
         self.supervisor.model = model.clone();

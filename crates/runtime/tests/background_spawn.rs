@@ -195,6 +195,7 @@ fn wire_consumer(
         false,
         wake,
         None,
+        None,
     );
     // Collect events on a side task so the tap receiver never blocks the
     // bounded channel; tests scan the collected log at assert time.

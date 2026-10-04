@@ -202,6 +202,7 @@ impl Repl {
                     false,
                     None,
                     self.runtime.plugin_registry(),
+                    self.runtime.fallback_escaped_handle(),
                 ))
             } else {
                 None
@@ -1958,6 +1959,7 @@ impl Repl {
                     self.runtime.config().subagent.background,
                     wake_scheduler.clone(),
                     self.runtime.plugin_registry(),
+                    self.runtime.fallback_escaped_handle(),
                 ))
             } else {
                 None

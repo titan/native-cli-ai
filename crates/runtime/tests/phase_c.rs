@@ -554,6 +554,7 @@ async fn t27_consumer_wiring_routes_child_spawn_into_parent_log() {
         false,
         None,
         None,
+        None,
     );
 
     spawn_tx
