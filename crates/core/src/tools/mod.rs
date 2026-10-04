@@ -6,6 +6,7 @@ pub mod copy_path;
 pub mod create_directory;
 pub mod delete_path;
 pub mod edit_file;
+pub mod edit_match;
 pub mod fetch_url;
 pub mod filesystem;
 pub mod git;

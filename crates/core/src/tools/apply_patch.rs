@@ -3,6 +3,7 @@ use std::sync::Arc;
 use nca_common::tool::{ToolCall, ToolDefinition, ToolResult};
 use serde::Deserialize;
 
+use super::edit_match::{MatchLevel, MatchOutcome, seek_match};
 use super::{ToolCallExt, ToolExecutor};
 use crate::workspace_fs::{WorkspaceFs, sandbox_error_to_tool_result};
 
@@ -34,7 +35,7 @@ impl ToolExecutor for ApplyPatchTool {
         ToolDefinition {
             timeout_ms: None,
             name: "apply_patch".into(),
-            description: "Apply one or more exact string replacements to a file".into(),
+            description: "Apply one or more string replacements to a file (tiered matching: exact substring, then whitespace/unicode-tolerant line levels, then bounded prefix/suffix rescue; ambiguous matches fail)".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -97,19 +98,49 @@ impl ToolExecutor for ApplyPatchTool {
 
         let mut applied = 0_usize;
         let mut errors = Vec::new();
+        let mut level_notes = Vec::new();
 
         for (i, edit) in p.edits.iter().enumerate() {
-            let count = content.matches(&edit.old_text).count();
-            match count {
-                0 => errors.push(format!("edit {}: old_text not found", i + 1)),
-                1 => {
-                    if let Some(idx) = content.find(&edit.old_text) {
-                        content.replace_range(idx..idx + edit.old_text.len(), &edit.new_text);
-                        applied += 1;
+            match seek_match(&content, &edit.old_text) {
+                MatchOutcome::Unique { byte_range, level } => {
+                    content.replace_range(byte_range, &edit.new_text);
+                    applied += 1;
+                    if level != MatchLevel::Exact {
+                        level_notes.push(format!(
+                            "edit {}: matched at {} level",
+                            i + 1,
+                            level.label()
+                        ));
                     }
                 }
-                n => errors.push(format!(
-                    "edit {}: old_text matched {n} times (ambiguous)",
+                MatchOutcome::Rescue { byte_range } => {
+                    content.replace_range(byte_range, &edit.new_text);
+                    applied += 1;
+                    level_notes.push(format!("edit {}: matched via prefix/suffix rescue", i + 1));
+                }
+                MatchOutcome::NotFound => {
+                    errors.push(format!("edit {}: old_text not found", i + 1))
+                }
+                MatchOutcome::Ambiguous {
+                    level: Some(MatchLevel::Exact),
+                    candidates,
+                } => errors.push(format!(
+                    "edit {}: old_text matched {candidates} times (ambiguous)",
+                    i + 1
+                )),
+                MatchOutcome::Ambiguous {
+                    level: Some(level),
+                    candidates,
+                } => errors.push(format!(
+                    "edit {}: old_text matched {candidates} times at {} level (ambiguous)",
+                    i + 1,
+                    level.label()
+                )),
+                MatchOutcome::Ambiguous {
+                    level: None,
+                    candidates,
+                } => errors.push(format!(
+                    "edit {}: old_text anchors matched {candidates} regions (ambiguous rescue)",
                     i + 1
                 )),
             }
@@ -141,17 +172,23 @@ impl ToolExecutor for ApplyPatchTool {
         }
 
         match self.fs.write_file(&p.path, &content).await {
-            Ok(()) => ToolResult {
-                timed_out: false,
-                call_id: call.id.clone(),
-                success: true,
-                output: format!(
+            Ok(()) => {
+                let mut output = format!(
                     "Applied {applied}/{} edits to {path}",
                     p.edits.len(),
                     path = p.path
-                ),
-                error: None,
-            },
+                );
+                if !level_notes.is_empty() {
+                    output.push_str(&format!(" ({})", level_notes.join(", ")));
+                }
+                ToolResult {
+                    timed_out: false,
+                    call_id: call.id.clone(),
+                    success: true,
+                    output,
+                    error: None,
+                }
+            }
             Err(e) => sandbox_error_to_tool_result(&call.id, e),
         }
     }
@@ -633,5 +670,212 @@ mod tests {
 
         assert!(r.success, "chained edits must both apply: {r:?}");
         assert_eq!(read(&dir, "f.txt"), "base !\n");
+    }
+
+    // =====================================================================
+    // ⑤ Tiered matching (omos matching.ts port — `edit_match`)
+    // =====================================================================
+    //
+    // Exact substring behaviour is pinned by the suites above (①–④); these
+    // tests cover the fuzzy ladder, trailing-blank retry, and the bounded
+    // prefix/suffix rescue layered on top of it.
+
+    /// Trailing-whitespace drift on the target line resolves at the
+    /// trim_end level, replaces the whole original line (drifted bytes
+    /// included), and the success message reports the level so the model
+    /// can learn.
+    #[tokio::test]
+    async fn trailing_whitespace_drift_matches_and_reports_trim_end_level() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("f.txt"),
+            "fn main() {\n    let x = 1;   \n}\n",
+        )
+        .unwrap();
+
+        let r = apply(
+            &dir,
+            "f.txt",
+            serde_json::json!([{ "old_text": "    let x = 1;\n", "new_text": "    let x = 2;\n" }]),
+        )
+        .await;
+
+        assert!(r.success, "{r:?}");
+        assert_eq!(read(&dir, "f.txt"), "fn main() {\n    let x = 2;\n}\n");
+        assert!(
+            r.output.contains("edit 1: matched at trim_end level"),
+            "level must be reported: {r:?}"
+        );
+    }
+
+    /// A CRLF file patched with an LF old_text hits at trim_end and only
+    /// rewrites the matched region — unrelated CRLF terminators survive.
+    #[tokio::test]
+    async fn crlf_drift_matches_at_trim_end_and_preserves_unrelated_crlf() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "keep\r\nalpha\r\nbeta\r\n").unwrap();
+
+        let r = apply(
+            &dir,
+            "f.txt",
+            serde_json::json!([{ "old_text": "alpha\nbeta\n", "new_text": "ALPHA\nBETA\n" }]),
+        )
+        .await;
+
+        assert!(r.success, "{r:?}");
+        assert_eq!(read(&dir, "f.txt"), "keep\r\nALPHA\nBETA\n");
+        assert!(r.output.contains("trim_end"), "{r:?}");
+    }
+
+    /// A patch whose old_text ends on a blank line the file does not have
+    /// retries without it and still applies (omos trailing-blank retry).
+    #[tokio::test]
+    async fn eof_blank_line_retry_still_applies_patch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\nb\nc\n").unwrap();
+
+        let r = apply(
+            &dir,
+            "f.txt",
+            serde_json::json!([{ "old_text": "c\n\n", "new_text": "C\n" }]),
+        )
+        .await;
+
+        assert!(r.success, "{r:?}");
+        assert_eq!(read(&dir, "f.txt"), "a\nb\nC\n");
+        assert!(r.output.contains("trim_end"), "{r:?}");
+    }
+
+    /// Fuzzy-level ambiguity fails closed with the level reported, and the
+    /// multi-edit request stays atomic (file untouched).
+    #[tokio::test]
+    async fn fuzzy_ambiguity_fails_atomically_with_level_report() {
+        let original = "foo  \nbar\nfoo\nbar  \n";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), original).unwrap();
+
+        let r = apply(
+            &dir,
+            "f.txt",
+            serde_json::json!([
+                { "old_text": "foo\nbar\n", "new_text": "X\nY\n" }
+            ]),
+        )
+        .await;
+
+        assert!(!r.success, "{r:?}");
+        assert_eq!(read(&dir, "f.txt"), original);
+        assert!(
+            r.error.as_deref().unwrap_or("").contains("trim_end"),
+            "ambiguity must name the fuzzy level: {r:?}"
+        );
+    }
+
+    /// Rescue: anchors (first/last pattern lines) hold while the middle
+    /// drifted — the bounded region between them is replaced and the file's
+    /// final newline survives.
+    #[tokio::test]
+    async fn rescue_rewrites_drifted_middle_region() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("f.txt"),
+            "fn main() {\n    let x = 1;\n    println!(\"hello\");\n}\n",
+        )
+        .unwrap();
+
+        let r = apply(
+            &dir,
+            "f.txt",
+            serde_json::json!([
+                {
+                    "old_text": "fn main() {\n    let y = 2;\n    something_else();\n}",
+                    "new_text": "fn main() {\n    let z = 3;\n}"
+                }
+            ]),
+        )
+        .await;
+
+        assert!(r.success, "rescue must apply: {r:?}");
+        assert_eq!(read(&dir, "f.txt"), "fn main() {\n    let z = 3;\n}\n");
+        assert!(
+            r.output
+                .contains("edit 1: matched via prefix/suffix rescue"),
+            "{r:?}"
+        );
+    }
+
+    /// A middle that drifted beyond the 2m+4 bound is rejected: the rescue
+    /// must not bind anchors across an unbounded gap.
+    #[tokio::test]
+    async fn rescue_out_of_bound_middle_fails_without_touching_file() {
+        let mut content = String::from("START\n");
+        for i in 0..12 {
+            content.push_str(&format!("junk {i}\n"));
+        }
+        content.push_str("END\n");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), &content).unwrap();
+
+        let r = apply(
+            &dir,
+            "f.txt",
+            serde_json::json!([
+                { "old_text": "START\nmiddle\nEND", "new_text": "START\nEND" }
+            ]),
+        )
+        .await;
+
+        assert!(!r.success, "{r:?}");
+        assert_eq!(read(&dir, "f.txt"), content);
+    }
+
+    /// Two anchored rescue regions are ambiguous — fail closed, never guess.
+    #[tokio::test]
+    async fn rescue_with_two_regions_is_ambiguous() {
+        let original = "A\nQ\nB\nA\nR\nB\n";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), original).unwrap();
+
+        let r = apply(
+            &dir,
+            "f.txt",
+            serde_json::json!([{ "old_text": "A\nX\nB", "new_text": "A\nY\nB" }]),
+        )
+        .await;
+
+        assert!(!r.success, "{r:?}");
+        assert_eq!(read(&dir, "f.txt"), original);
+        assert!(
+            r.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("ambiguous rescue"),
+            "{r:?}"
+        );
+    }
+
+    /// Mixed exact + fuzzy multi-edit: fuzzy edits apply in array order
+    /// against the evolving buffer and each fuzzy level is reported.
+    #[tokio::test]
+    async fn multi_edit_reports_each_fuzzy_level() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "fn a() {}\nmid\nfn b() {}\n").unwrap();
+
+        let r = apply(
+            &dir,
+            "f.txt",
+            serde_json::json!([
+                { "old_text": "mid", "new_text": "middle" },
+                { "old_text": "    fn b() {}\n", "new_text": "    fn c() {}\n" }
+            ]),
+        )
+        .await;
+
+        assert!(r.success, "{r:?}");
+        // Fuzzy whole-window semantics: the matched line's original bytes are
+        // replaced by new_text verbatim, so the indentation comes from
+        // new_text (the model's bytes win in the drifted region).
+        assert_eq!(read(&dir, "f.txt"), "fn a() {}\nmiddle\n    fn c() {}\n");
+        assert!(r.output.contains("edit 2: matched at trim level"), "{r:?}");
     }
 }
