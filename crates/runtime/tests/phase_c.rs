@@ -129,6 +129,7 @@ async fn wire_fanout(sup: &mut Supervisor) -> (PathBuf, tokio::task::JoinHandle<
         None,
         None,
         Some(commit_tx),
+        std::time::Duration::ZERO,
     );
     (log_path, fanout)
 }
@@ -434,7 +435,15 @@ async fn t26_buffered_events_not_dropped_at_close() {
 
     // Raw channel + fanout, no supervisor — pins the fanout's drain logic.
     let (tx, rx) = mpsc::channel(64);
-    let fanout = spawn_event_fanout(rx, log_path.clone(), None, None, None, None);
+    let fanout = spawn_event_fanout(
+        rx,
+        log_path.clone(),
+        None,
+        None,
+        None,
+        None,
+        std::time::Duration::ZERO,
+    );
 
     let events = vec![
         AgentEvent::TurnStarted { turn_id: 1 },
@@ -518,7 +527,15 @@ async fn t27_consumer_wiring_routes_child_spawn_into_parent_log() {
 
     let (parent_tx, parent_rx) = mpsc::channel(256);
     let log_path = sessions_dir(ws.path()).join("t27-parent.events.jsonl");
-    let parent_fanout = spawn_event_fanout(parent_rx, log_path.clone(), None, None, None, None);
+    let parent_fanout = spawn_event_fanout(
+        parent_rx,
+        log_path.clone(),
+        None,
+        None,
+        None,
+        None,
+        std::time::Duration::ZERO,
+    );
 
     let (spawn_tx, spawn_rx) = mpsc::channel(4);
     let (reply_tx, reply_rx) = oneshot::channel();

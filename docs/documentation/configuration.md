@@ -107,6 +107,7 @@ history_dir = ".nca/sessions"       # Relative to workspace
 max_turns_per_run = 1024             # Max agent turns per session run
 max_tool_calls_per_turn = 200       # Max tool calls in a single turn
 max_tool_calls_per_message = 32     # Max tool calls executed per assistant message
+step_stall_alarm_secs = 600         # Alarm-only step-liveness watch (0 disables)
 checkpoint_interval = 5             # Save checkpoint every N turns
 last_session_file = ".nca/.last_session"
 auto_compact_on_finish = false      # Auto-summarize when session ends
@@ -120,6 +121,13 @@ auto_compact_on_finish = false      # Auto-summarize when session ends
 > fanned out to every duplicate call_id. Both cases emit an informational `ToolBatchGuarded`
 > event — not a failure. Under event backpressure, high-frequency stream notices may be elided
 > and accounted in a single `EventsElided` summary event.
+
+> **Note — step-liveness watch:** `step_stall_alarm_secs` (default 600, `0` disables) is an
+> alarm-only diagnostic: while a step is open, a session that produces no events at all for
+> the configured interval gets a `step_stalled` notice appended to its event log (repeated
+> each further interval until events resume). It never aborts or interrupts anything. Applies
+> to runtime sessions and subagent children (interactive TUI and one-shot CLI runs are not
+> covered yet). Avoid values below 60 — legitimately silent long-running tools would false-alarm.
 
 ### `[harness]` — System Prompt and Instructions
 

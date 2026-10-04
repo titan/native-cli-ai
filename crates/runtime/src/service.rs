@@ -151,6 +151,9 @@ async fn run_service_session_with_startup(
     }
 
     let commit_tx = handle.take_turn_commit_tx().map(|(tx, _flag)| tx);
+    // Step-liveness watch interval from the live session config (0 disables).
+    let step_stall_alarm =
+        std::time::Duration::from_secs(supervisor.config().session.step_stall_alarm_secs);
     let mut fanout_task = spawn_event_fanout(
         event_rx,
         info.event_log_path.clone(),
@@ -158,6 +161,7 @@ async fn run_service_session_with_startup(
         None,
         None,
         commit_tx,
+        step_stall_alarm,
     );
 
     let subagent_task = if let Some(spawn_rx) = handle.take_spawn_rx() {

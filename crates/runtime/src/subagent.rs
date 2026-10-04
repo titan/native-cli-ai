@@ -461,8 +461,19 @@ pub async fn run_prepared_child(
 
     let commit_tx = handle.take_turn_commit_tx().map(|(tx, _flag)| tx);
     let parent_forward = terminal_tx.clone().map(|tx| (child_id.clone(), tx));
-    let mut fanout =
-        event_rx.map(|rx| spawn_event_fanout(rx, log_path, None, None, parent_forward, commit_tx));
+    // Step-liveness watch interval from the child's own config (0 disables).
+    let step_stall_alarm = Duration::from_secs(sup.config().session.step_stall_alarm_secs);
+    let mut fanout = event_rx.map(|rx| {
+        spawn_event_fanout(
+            rx,
+            log_path,
+            None,
+            None,
+            parent_forward,
+            commit_tx,
+            step_stall_alarm,
+        )
+    });
 
     let result = if images.is_empty() {
         sup.run_turn(&context_prompt).await

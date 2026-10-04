@@ -87,6 +87,10 @@ default = "minimax"
 #                                   # 超出的调用从记录的消息中裁剪（首个保留结果附一行
 #                                   # 守护提示），同一批次内完全相同的调用只执行一次并
 #                                   # 将结果扇出给所有 call_id；默认 32
+# step_stall_alarm_secs = 600       # step 存活看门狗：step 开启期间会话静默超过该秒数时，
+#                                   # 每满一个间隔向事件日志/IPC 追加一条 step_stalled
+#                                   # 警报（纯诊断，绝不中止会话）；0 = 禁用；
+#                                   # 不建议低于 60（静默长任务会误报）；默认 600
 # checkpoint_interval = 5
 # last_session_file = ".nca/.last_session"
 # auto_compact_on_finish = false

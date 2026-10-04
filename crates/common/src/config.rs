@@ -2341,6 +2341,14 @@ pub struct SessionConfig {
     /// `read_file` tool_use blocks and wedged the session).
     #[serde(default = "default_max_tool_calls_per_message")]
     pub max_tool_calls_per_message: usize,
+    /// Step-liveness alarm interval, seconds (0 disables). While a
+    /// `StepStarted` bracket is open, this much event silence makes the
+    /// fanout emit a synthetic `Checkpoint { phase: "step_stalled" }` —
+    /// the only detector for a driver wedged mid-step with no events at
+    /// all (the 2026-10-02 incident class the channel-level alarms cannot
+    /// see: channels healthy, driver stuck inside a step).
+    #[serde(default = "default_step_stall_alarm_secs")]
+    pub step_stall_alarm_secs: u64,
     pub checkpoint_interval: u32,
     /// File that stores the last active session ID for auto-resume.
     pub last_session_file: PathBuf,
@@ -2356,6 +2364,7 @@ impl Default for SessionConfig {
             max_turns_per_run: 1024,
             max_tool_calls_per_turn: 200,
             max_tool_calls_per_message: default_max_tool_calls_per_message(),
+            step_stall_alarm_secs: default_step_stall_alarm_secs(),
             checkpoint_interval: 5,
             last_session_file: PathBuf::from(".nca/.last_session"),
             auto_compact_on_finish: false,
@@ -2717,6 +2726,9 @@ impl SessionConfig {
         if let Some(max_tool_calls_per_message) = partial.max_tool_calls_per_message {
             self.max_tool_calls_per_message = max_tool_calls_per_message;
         }
+        if let Some(step_stall_alarm_secs) = partial.step_stall_alarm_secs {
+            self.step_stall_alarm_secs = step_stall_alarm_secs;
+        }
         if let Some(checkpoint_interval) = partial.checkpoint_interval {
             self.checkpoint_interval = checkpoint_interval;
         }
@@ -2942,6 +2954,7 @@ struct PartialSessionConfig {
     max_turns_per_run: Option<u32>,
     max_tool_calls_per_turn: Option<u32>,
     max_tool_calls_per_message: Option<usize>,
+    step_stall_alarm_secs: Option<u64>,
     checkpoint_interval: Option<u32>,
     last_session_file: Option<PathBuf>,
     auto_compact_on_finish: Option<bool>,
@@ -3022,6 +3035,14 @@ struct PartialWebConfig {
 /// agent loop itself uses until the supervisor wires the config knob in.
 pub const fn default_max_tool_calls_per_message() -> usize {
     32
+}
+
+/// Default for `[session] step_stall_alarm_secs`: 600s (10 minutes). Well
+/// above legitimate quiet windows (long tool runs stream chunks, provider
+/// retries emit notices) so the alarm only fires on true mid-step wedges;
+/// 0 disables the watch.
+pub const fn default_step_stall_alarm_secs() -> u64 {
+    600
 }
 
 fn default_true() -> bool {
@@ -4738,6 +4759,40 @@ host_xdg_runtime = true
         config.merge(old);
         assert_eq!(
             config.session.max_tool_calls_per_message, 32,
+            "missing key keeps the default"
+        );
+    }
+
+    #[test]
+    fn session_step_stall_alarm_secs_default_and_override() {
+        // Default: 600s — above any legitimate quiet window inside a step.
+        assert_eq!(default_step_stall_alarm_secs(), 600);
+        assert_eq!(
+            NcaConfig::default().session.step_stall_alarm_secs,
+            default_step_stall_alarm_secs()
+        );
+
+        // TOML override merges per-key.
+        let partial: PartialNcaConfig =
+            toml::from_str("[session]\nstep_stall_alarm_secs = 30\n").expect("parse");
+        let mut config = NcaConfig::default();
+        config.merge(partial);
+        assert_eq!(config.session.step_stall_alarm_secs, 30);
+
+        // 0 is an explicit disable, not a reset-to-default.
+        let off: PartialNcaConfig =
+            toml::from_str("[session]\nstep_stall_alarm_secs = 0\n").expect("parse off");
+        let mut config = NcaConfig::default();
+        config.merge(off);
+        assert_eq!(config.session.step_stall_alarm_secs, 0);
+
+        // Old configs without the key keep the default (serde default path).
+        let old: PartialNcaConfig =
+            toml::from_str("[session]\nmax_tool_calls_per_turn = 100\n").expect("parse old");
+        let mut config = NcaConfig::default();
+        config.merge(old);
+        assert_eq!(
+            config.session.step_stall_alarm_secs, 600,
             "missing key keeps the default"
         );
     }

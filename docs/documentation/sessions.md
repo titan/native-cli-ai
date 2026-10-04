@@ -196,16 +196,21 @@ history_dir = ".nca/sessions"         # Where sessions are stored
 max_turns_per_run = 1024               # Max turns before session ends
 max_tool_calls_per_turn = 200         # Max tools per single turn
 max_tool_calls_per_message = 32       # Max tool calls executed per assistant message
+step_stall_alarm_secs = 600           # Alarm-only step-liveness watch (0 disables)
 checkpoint_interval = 5               # Checkpoint frequency
 last_session_file = ".nca/.last_session"  # Last session pointer
 auto_compact_on_finish = false        # Summarize on session end
 ```
 
 `max_tool_calls_per_message` (default 32) is a guardrail against degenerate batches: calls past
-the cap receive a synthetic error result, identical duplicates within one batch execute once
-with the result fanned out to each call_id, and an informational `ToolBatchGuarded` event
-reports what was contained. Stream notices elided under event backpressure are accounted in an
-`EventsElided` event.
+the cap are trimmed from the recorded message (with a one-line guard note on the first kept
+result), identical duplicates within one batch execute once with the result fanned out to each
+kept call_id, and an informational `ToolBatchGuarded` event reports what was contained. Stream
+notices elided under event backpressure are accounted in an `EventsElided` event.
+`step_stall_alarm_secs` (default 600) adds an alarm-only step-liveness watch: a session silent
+while a step is open gets a `step_stalled` notice in its event log each interval — diagnostics
+only, never an abort. Applies to runtime sessions and subagent children (TUI bridge and
+one-shot CLI not yet covered).
 
 ## Background Sessions
 

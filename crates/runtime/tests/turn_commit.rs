@@ -93,6 +93,7 @@ async fn wire_fanout(sup: &mut Supervisor) -> (PathBuf, tokio::sync::watch::Rece
         None,
         None,
         Some(commit_tx),
+        std::time::Duration::ZERO,
     );
     (log_path, watch_rx.expect("commit rx"))
 }

@@ -185,6 +185,7 @@ async fn wire_fanout(sup: &mut Supervisor) -> (PathBuf, tokio::task::JoinHandle<
         None,
         None,
         Some(commit_tx),
+        std::time::Duration::ZERO,
     );
     (log_path, fanout)
 }
