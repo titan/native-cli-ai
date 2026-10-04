@@ -6,7 +6,6 @@ use crate::format::format_duration;
 use crate::ipc_pending::{ApprovalPendingMap, QuestionPendingMap};
 use colored::Colorize;
 use nca_common::event::{AgentEvent, EventEnvelope, InteractiveQuestionPayload, QuestionSelection};
-use nca_runtime::event_log::EventLogWriter;
 use nca_runtime::ipc::IpcHandle;
 use nca_runtime::supervisor;
 use std::io::{self, IsTerminal, Write};
@@ -15,7 +14,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::sync::oneshot;
 
-type EventEnvelopeFn = Arc<dyn Fn(&EventEnvelope) + Send + Sync>;
+/// Callback shape the runtime fanout takes (`on_event`), factored per
+/// clippy `type_complexity`.
+type StreamFanoutCallback = Box<dyn Fn(&EventEnvelope) + Send>;
 
 /// Blocking stdin prompt for `--no-tui` human stream when `ask_question` runs.
 fn prompt_question_stdio(q: &InteractiveQuestionPayload) -> io::Result<QuestionSelection> {
@@ -145,10 +146,6 @@ impl Default for StreamStats {
     }
 }
 
-struct IpcRebroadcast {
-    event_tx: tokio::sync::broadcast::Sender<String>,
-}
-
 /// Spawns the stream task: event fanout (disk + IPC + rendering) and command consumer.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_stream_task(
@@ -160,6 +157,7 @@ pub fn spawn_stream_task(
     question_pending: Option<QuestionPendingMap>,
     cancel_tx: Option<oneshot::Sender<()>>,
     commit_tx: Option<tokio::sync::watch::Sender<u64>>,
+    step_stall_alarm: std::time::Duration,
 ) -> tokio::task::JoinHandle<()> {
     let qp = question_pending.clone();
     let (event_tx_ipc, command_rx) = match ipc_handle {
@@ -174,9 +172,23 @@ pub fn spawn_stream_task(
         supervisor::spawn_command_consumer(crx, approval_pending, question_pending, cancel_tx);
     }
 
-    spawn_event_fanout_task(rx, mode, log_path, event_tx_ipc, qp, commit_tx)
+    spawn_event_fanout_task(
+        rx,
+        mode,
+        log_path,
+        event_tx_ipc,
+        qp,
+        commit_tx,
+        step_stall_alarm,
+    )
 }
 
+/// Thin wrapper over [`nca_runtime::session_utils::spawn_event_fanout`]:
+/// the one-shot/REPL stream rides the runtime's canonical fanout (envelope
+/// ids, ipc broadcast, append, TurnCompleted commit + commit_tx signal,
+/// step-liveness watch) with the StreamMode renderer installed as the
+/// `on_event` callback. Delegation also gains the runtime fanout's
+/// commit-on-channel-close durability behavior for free.
 pub fn spawn_event_fanout_task(
     rx: tokio::sync::mpsc::Receiver<AgentEvent>,
     mode: StreamMode,
@@ -184,79 +196,60 @@ pub fn spawn_event_fanout_task(
     event_tx_ipc: Option<tokio::sync::broadcast::Sender<String>>,
     question_pending: Option<QuestionPendingMap>,
     commit_tx: Option<tokio::sync::watch::Sender<u64>>,
+    step_stall_alarm: std::time::Duration,
 ) -> tokio::task::JoinHandle<()> {
     let stats = StreamStats::new();
 
-    let on_event: Option<EventEnvelopeFn> = match mode {
+    let on_event: Option<StreamFanoutCallback> = match mode {
         StreamMode::Off => None,
-        StreamMode::Ndjson => Some(Arc::new(|envelope: &EventEnvelope| {
+        StreamMode::Ndjson => Some(Box::new(|envelope: &EventEnvelope| {
             if let Ok(line) = serde_json::to_string(envelope) {
                 println!("{line}");
             }
         })),
         StreamMode::Human => {
             let stats = stats.clone();
-            Some(Arc::new(move |envelope: &EventEnvelope| {
+            let qp = question_pending;
+            Some(Box::new(move |envelope: &EventEnvelope| {
                 render_event(&envelope.event, &stats);
+
+                // Interactive stdio question flow for `--no-tui` human
+                // streaming. The runtime callback is sync, so the answer
+                // resolves on a detached task instead of parking the
+                // fanout loop: the agent turn is already barrier-blocked
+                // on the question oneshot (no further events can arrive
+                // until it resolves), so detaching only un-blocks log/ipc
+                // during human typing — a strict improvement.
+                if let AgentEvent::QuestionRequested { ref question } = envelope.event
+                    && std::io::stdin().is_terminal()
+                    && let Some(ref pending) = qp
+                {
+                    let q = question.clone();
+                    let qid = q.question_id.clone();
+                    let pending = pending.clone();
+                    tokio::spawn(async move {
+                        if let Ok(Ok(sel)) =
+                            tokio::task::spawn_blocking(move || prompt_question_stdio(&q)).await
+                            && let Ok(mut m) = pending.lock()
+                            && let Some(tx) = m.remove(&qid)
+                        {
+                            let _ = tx.send(sel);
+                        }
+                    });
+                }
             }))
         }
     };
 
-    let ipc_handle_rebuilt = event_tx_ipc.map(|tx| IpcRebroadcast { event_tx: tx });
-
-    tokio::spawn(async move {
-        use nca_common::event::EventEnvelope;
-
-        let mut writer = EventLogWriter::open(&log_path).await;
-        let mut rx = rx;
-        let qp = question_pending;
-        while let Some(event) = rx.recv().await {
-            let id = writer.next_id();
-            let envelope = EventEnvelope::new(id, event.clone());
-
-            if let Some(ref ipc) = ipc_handle_rebuilt {
-                let line = serde_json::to_string(&envelope).unwrap_or_default();
-                let _ = ipc.event_tx.send(line);
-            }
-
-            if let Err(e) = writer.append(&envelope).await {
-                tracing::error!("failed to append event {} to log: {}", id, e);
-            }
-
-            // Durability barrier (P2 Phase B): commit at TurnCompleted and
-            // signal the supervisor's run_turn barrier. Liveness over false
-            // durability — fires even if the append above failed.
-            if let AgentEvent::TurnCompleted { turn_id, .. } = &envelope.event {
-                if let Err(e) = writer.commit().await {
-                    tracing::error!("event-log commit at turn {turn_id} failed: {e}");
-                }
-                if let Some(tx) = &commit_tx {
-                    let _ = tx.send(*turn_id);
-                }
-            }
-
-            if let Some(ref cb) = on_event {
-                cb(&envelope);
-            }
-
-            if let AgentEvent::QuestionRequested { ref question } = event
-                && matches!(mode, StreamMode::Human)
-                && std::io::stdin().is_terminal()
-                && let Some(ref pending) = qp
-            {
-                let q = question.clone();
-                let qid = q.question_id.clone();
-                let pending = pending.clone();
-                if let Ok(Ok(sel)) =
-                    tokio::task::spawn_blocking(move || prompt_question_stdio(&q)).await
-                    && let Ok(mut m) = pending.lock()
-                    && let Some(tx) = m.remove(&qid)
-                {
-                    let _ = tx.send(sel);
-                }
-            }
-        }
-    })
+    nca_runtime::session_utils::spawn_event_fanout(
+        rx,
+        log_path,
+        event_tx_ipc,
+        on_event,
+        None, // no parent forward on the CLI stream path
+        commit_tx,
+        step_stall_alarm,
+    )
 }
 
 // Claude Code-inspired color theme
@@ -887,6 +880,7 @@ mod tests {
             None,
             None,
             Some(commit_tx),
+            std::time::Duration::ZERO,
         );
         tx.send(AgentEvent::TurnStarted { turn_id: 6 })
             .await
@@ -913,5 +907,57 @@ mod tests {
             AgentEvent::TurnCompleted { .. }
         ));
         assert!(*commit_rx.borrow() >= 6, "commit watch carries the turn id");
+    }
+
+    // Delegation pin (fanout consolidation): the wrapper threads a nonzero
+    // step-stall interval through to the runtime fanout — a StepStarted
+    // bracket plus one interval of paused-clock silence must land a
+    // step_stalled alarm in the log the delegated fanout writes. Driving
+    // idioms mirror the runtime watch tests: +50ms overshoot so the alarm
+    // deadline fires first, then a bounded wall wait for the blocking-pool
+    // fs append to become visible.
+    #[tokio::test(start_paused = true)]
+    async fn fanout_task_threads_step_watch_interval() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("log.events.jsonl");
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let mut task = spawn_event_fanout_task(
+            rx,
+            StreamMode::Off,
+            log.clone(),
+            None,
+            None,
+            None,
+            std::time::Duration::from_secs(600),
+        );
+
+        tx.send(AgentEvent::StepStarted {
+            turn_id: 1,
+            step_index: 1,
+        })
+        .await
+        .expect("send step started");
+
+        tokio::time::sleep(std::time::Duration::from_secs(650)).await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let lines = loop {
+            let l: Vec<String> = std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.to_string())
+                .collect();
+            if l.len() >= 2 || std::time::Instant::now() > deadline {
+                break l;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(lines.len(), 2, "step + one alarm: {lines:?}");
+        assert!(lines[1].contains("step_stalled"), "{lines:?}");
+
+        drop(tx);
+        let exited = tokio::time::timeout(std::time::Duration::from_secs(5), &mut task).await;
+        assert!(exited.is_ok(), "delegated fanout drains and exits cleanly");
     }
 }

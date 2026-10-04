@@ -724,6 +724,7 @@ async fn try_main() -> anyhow::Result<()> {
                             runtime.question_pending(),
                             None,
                             runtime.take_turn_commit_tx().map(|(tx, _flag)| tx),
+                            std::time::Duration::from_secs(config.session.step_stall_alarm_secs),
                         );
                         let _ = runtime.run_turn(prompt).await;
                         let mut repl = Repl::new(runtime, cli.safe, true);
@@ -811,6 +812,7 @@ async fn try_main() -> anyhow::Result<()> {
                             runtime.question_pending(),
                             None,
                             runtime.take_turn_commit_tx().map(|(tx, _flag)| tx),
+                            std::time::Duration::from_secs(config.session.step_stall_alarm_secs),
                         );
                     }
                     let mut repl = Repl::new(runtime, cli.safe, cli.run);
@@ -880,6 +882,9 @@ async fn try_main() -> anyhow::Result<()> {
                                 runtime.question_pending(),
                                 None,
                                 runtime.take_turn_commit_tx().map(|(tx, _flag)| tx),
+                                std::time::Duration::from_secs(
+                                    config.session.step_stall_alarm_secs,
+                                ),
                             );
                         }
                         let mut repl = Repl::new(runtime, cli.safe, cli.run);
@@ -941,6 +946,7 @@ async fn run_one_shot(
             runtime.question_pending(),
             None,
             runtime.take_turn_commit_tx().map(|(tx, _flag)| tx),
+            std::time::Duration::from_secs(config.session.step_stall_alarm_secs),
         );
 
         // Wire the parent's own event channel into the spawn consumer so
@@ -1215,6 +1221,9 @@ async fn resume_session(
         } else {
             Some(InteractiveIpcApprovalHandler::new())
         };
+    // Step-liveness watch interval from the live session config (0 disables);
+    // captured before `config` moves into the runtime builder.
+    let step_stall_alarm = std::time::Duration::from_secs(config.session.step_stall_alarm_secs);
     let mut runtime = build_resumed_session_runtime(
         config,
         workspace_root,
@@ -1238,6 +1247,7 @@ async fn resume_session(
                 runtime.question_pending(),
                 None,
                 runtime.take_turn_commit_tx().map(|(tx, _flag)| tx),
+                step_stall_alarm,
             );
         }
         let output = runtime
@@ -1260,6 +1270,7 @@ async fn resume_session(
             runtime.question_pending(),
             None,
             runtime.take_turn_commit_tx().map(|(tx, _flag)| tx),
+            step_stall_alarm,
         );
     }
     let mut repl = Repl::new(runtime, safe, true);

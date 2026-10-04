@@ -1922,6 +1922,9 @@ impl Repl {
         }
 
         let commit_tx = self.runtime.take_turn_commit_tx().map(|(tx, _flag)| tx);
+        // Step-liveness watch interval from the live session config (0 disables).
+        let step_stall_alarm =
+            Duration::from_secs(self.runtime.config().session.step_stall_alarm_secs);
         let _bridge = spawn_tui_bridge(
             rx,
             log_path,
@@ -1930,6 +1933,7 @@ impl Repl {
             question.clone(),
             feedback_tx.clone(),
             commit_tx,
+            step_stall_alarm,
         );
 
         let _spawn_task = {

@@ -129,16 +129,18 @@ pub(crate) async fn drain_event_fanout(task: &mut tokio::task::JoinHandle<()>, l
 /// existing log), broadcasts over IPC, renders to the provided callback,
 /// and fsync-commits at every `TurnCompleted` before signalling `commit_tx`.
 ///
-/// Per-event order is **ipc → append → parent-forward → commit → callback**
-/// (fanout-durability reorder): the append precedes the forward so a
-/// must-deliver forward parked on a stalled parent can never stale the
-/// child's own log — the parked event is already durable if the process
-/// aborts mid-park.
+/// Per-event order is **ipc → on_event → append → parent-forward → commit**
+/// (live-consumer reorder): the callback fires before the append so
+/// live-consumer latency (TUI render, stream renderer) never waits on
+/// per-event disk I/O. The durability invariant — append precedes the
+/// parent-forward — is untouched: a must-deliver forward parked on a
+/// stalled parent can still never stale the child's own log; the parked
+/// event is already durable if the process aborts mid-park.
 ///
 /// `step_stall_alarm` arms a liveness watch (alarm-only, never
 /// interference): while a `StepStarted` bracket is open, that much event
 /// silence fires a synthetic `Checkpoint { phase: "step_stalled" }` through
-/// the fanout's own durable path (ipc + append + callback — never the
+/// the fanout's own durable path (ipc + on_event + append — never the
 /// parent forward, never the event channel), repeating every interval
 /// until events resume. `Duration::ZERO` disables the watch entirely.
 pub fn spawn_event_fanout(
@@ -218,6 +220,15 @@ pub fn spawn_event_fanout(
                         let _ = tx.send(line);
                     }
 
+                    // Live-consumer reorder: the callback (TUI bridge /
+                    // stream renderer) fires BEFORE the append — live
+                    // render latency must not wait on per-event disk I/O.
+                    // The durability invariant (append precedes the
+                    // parent-forward below) is untouched.
+                    if let Some(ref cb) = on_event {
+                        cb(&envelope);
+                    }
+
                     if let Err(e) = writer.append(&envelope).await {
                         tracing::error!("failed to append event {} to log: {}", id, e);
                     }
@@ -264,10 +275,6 @@ pub fn spawn_event_fanout(
                             let _ = tx.send(*turn_id);
                         }
                     }
-
-                    if let Some(ref cb) = on_event {
-                        cb(&envelope);
-                    }
                 }
                 // Step-stall alarm branch. The sleep future is created FRESH
                 // each loop iteration inside this async block — never pinned
@@ -302,7 +309,8 @@ pub fn spawn_event_fanout(
                         turn: turn as u32,
                     };
                     // The alarm rides the fanout's own durable path with a
-                    // fresh envelope id: ipc + append + callback. NO parent
+                    // fresh envelope id: ipc + callback + append (same
+                    // live-consumer reorder as the main loop). NO parent
                     // forward (a Checkpoint maps to droppable activity
                     // anyway) and NEVER the event channel — this loop owns
                     // its receiver; re-sending would deadlock it.
@@ -312,11 +320,11 @@ pub fn spawn_event_fanout(
                         let line = serde_json::to_string(&envelope).unwrap_or_default();
                         let _ = tx.send(line);
                     }
-                    if let Err(e) = writer.append(&envelope).await {
-                        tracing::error!("failed to append event {} to log: {}", id, e);
-                    }
                     if let Some(ref cb) = on_event {
                         cb(&envelope);
+                    }
+                    if let Err(e) = writer.append(&envelope).await {
+                        tracing::error!("failed to append event {} to log: {}", id, e);
                     }
                     // Re-arm from NOW so the alarm REPEATS at the next full
                     // interval instead of firing in a tight loop.
