@@ -6,8 +6,155 @@
 //! - Automatic summarization when context approaches limits
 //! - Preservation of critical messages (system prompt, memory, etc.)
 
-use nca_common::message::{Message, MessageContent, Role};
+use nca_common::message::{Message, MessageContent, MessageToolCall, Role};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+
+/// Name of the tool whose latest snapshot survives auto-summarization.
+const TODO_TOOL_NAME: &str = "update_todos";
+/// Heading under which the preserved todo snapshot is appended to the
+/// summary system message (deterministic content, never LLM-paraphrased).
+const TODO_PRESERVED_HEADING: &str = "### Current todo list (preserved verbatim)";
+/// Hard cap (chars) on the preserved todo snapshot — truncate-protected so a
+/// pathological `update_todos` payload cannot bloat the summary message.
+const TODO_PRESERVED_MAX_CHARS: usize = 4_096;
+
+/// The latest `update_todos` interaction in a message slice.
+///
+/// Anchored on the LAST tool *result* whose matching tool_use called
+/// `update_todos` — the result is the proof the replacement was accepted;
+/// arguments alone (a resultless, in-flight call) are only used as a
+/// degraded fallback. The structured todo list itself lives in the call's
+/// `arguments.todos` (the result text is just a one-line confirmation), so
+/// the preserved snapshot renders both.
+struct TodoSnapshot<'a> {
+    call: &'a MessageToolCall,
+    result: Option<&'a Message>,
+}
+
+fn last_update_todos_snapshot(messages: &[Message]) -> Option<TodoSnapshot<'_>> {
+    let mut todo_calls: HashMap<&str, &MessageToolCall> = HashMap::new();
+    for msg in messages {
+        if let Some(calls) = &msg.tool_calls {
+            for call in calls {
+                if call.name == TODO_TOOL_NAME {
+                    todo_calls.insert(call.id.as_str(), call);
+                }
+            }
+        }
+    }
+    if todo_calls.is_empty() {
+        return None;
+    }
+
+    // Latest result wins: later snapshots supersede earlier ones.
+    let last_result = messages.iter().rev().find(|msg| {
+        msg.role == Role::Tool
+            && msg
+                .tool_call_id
+                .as_deref()
+                .is_some_and(|id| todo_calls.contains_key(id))
+    });
+
+    match last_result {
+        Some(result) => {
+            let call = todo_calls.get(result.tool_call_id.as_deref()?)?;
+            Some(TodoSnapshot {
+                call,
+                result: Some(result),
+            })
+        }
+        // No result at all (should not happen — pairs are invariant): fall
+        // back to the last call's arguments alone.
+        None => {
+            let call = messages
+                .iter()
+                .rev()
+                .flat_map(|m| m.tool_calls.iter().flatten())
+                .find(|c| c.name == TODO_TOOL_NAME)?;
+            Some(TodoSnapshot { call, result: None })
+        }
+    }
+}
+
+/// Render a [`TodoSnapshot`] as deterministic text: the `todos` argument
+/// verbatim (pretty JSON) plus the tool result confirmation line.
+fn render_todo_snapshot(snapshot: &TodoSnapshot<'_>) -> String {
+    let args = snapshot
+        .call
+        .arguments
+        .get("todos")
+        .unwrap_or(&snapshot.call.arguments);
+    let mut out = serde_json::to_string_pretty(args).unwrap_or_else(|_| args.to_string());
+    if let Some(result) = snapshot.result {
+        out.push_str("\n\n(tool result: ");
+        out.push_str(&result.content.to_summary_text());
+        out.push(')');
+    }
+    out
+}
+
+/// Cap a string at `cap` chars, marking truncation.
+fn cap_chars(text: &str, cap: usize) -> String {
+    if text.chars().count() <= cap {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(cap).collect();
+    out.push_str("\n...[truncated]");
+    out
+}
+
+/// Strip every `update_todos` tool_use/tool_result pair except
+/// `keep_call_id` — both members of each pair, so the no-orphaned-results
+/// invariant is preserved. An assistant carrier that loses its last call
+/// keeps its text content with `tool_calls` set to `None`.
+fn strip_older_update_todos_pairs(messages: &[Message], keep_call_id: &str) -> Vec<Message> {
+    let mut drop_ids: HashSet<&str> = HashSet::new();
+    for msg in messages {
+        if let Some(calls) = &msg.tool_calls {
+            for call in calls {
+                if call.name == TODO_TOOL_NAME && call.id != keep_call_id {
+                    drop_ids.insert(call.id.as_str());
+                }
+            }
+        }
+    }
+    if drop_ids.is_empty() {
+        return messages.to_vec();
+    }
+
+    messages
+        .iter()
+        .filter_map(|msg| {
+            if msg.role == Role::Tool
+                && msg
+                    .tool_call_id
+                    .as_deref()
+                    .is_some_and(|id| drop_ids.contains(id))
+            {
+                return None; // drop the tool_result member
+            }
+            let has_dropped_call = msg
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| calls.iter().any(|c| drop_ids.contains(c.id.as_str())));
+            if !has_dropped_call {
+                return Some(msg.clone());
+            }
+            // Drop the tool_use member from the carrier's call list.
+            let mut cloned = msg.clone();
+            let kept: Vec<MessageToolCall> = cloned
+                .tool_calls
+                .take()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|c| !drop_ids.contains(c.id.as_str()))
+                .collect();
+            cloned.tool_calls = (!kept.is_empty()).then_some(kept);
+            Some(cloned)
+        })
+        .collect()
+}
 
 /// Configuration for context management behavior.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,6 +350,11 @@ impl ContextManager {
 
     /// Get messages that should be summarized.
     /// These are the older messages that will be replaced by a summary.
+    ///
+    /// Older `update_todos` tool_use/tool_result pairs are stripped (both
+    /// members, pair integrity preserved); only the latest snapshot stays —
+    /// stale snapshots neither bloat nor drift the summarizer input, and the
+    /// latest one is re-attached verbatim by [`Self::apply_summary`].
     pub fn get_messages_to_summarize(&self, messages: &[Message]) -> Vec<Message> {
         let system_count = Self::count_system_messages(messages);
         let plan = self.get_compaction_plan(messages, system_count);
@@ -210,8 +362,11 @@ impl ContextManager {
         if let Some(range) = plan.summarize_range {
             // Skip system messages, get the middle-old messages
             let start = (range.start).max(system_count);
-
-            messages[start..range.end].to_vec()
+            let slice = &messages[start..range.end];
+            match last_update_todos_snapshot(slice) {
+                Some(snapshot) => strip_older_update_todos_pairs(slice, &snapshot.call.id),
+                None => slice.to_vec(),
+            }
         } else {
             Vec::new()
         }
@@ -232,19 +387,38 @@ impl ContextManager {
         // Adjust to avoid splitting tool_use/tool_result groups.
         let recent_start = Self::adjust_cutoff_for_tool_groups(messages, range.end, system_count);
 
+        // T2-3: the latest update_todos snapshot in the summarized range is
+        // re-attached to the summary system message verbatim (capped) — the
+        // structured todo state survives compaction deterministically,
+        // never LLM-paraphrased. Uses the same range as
+        // `get_messages_to_summarize` so the preserved snapshot is exactly
+        // the one kept there.
+        let summarize_start = range.start.max(system_count);
+        let todo_block =
+            last_update_todos_snapshot(&messages[summarize_start..range.end]).map(|snapshot| {
+                format!(
+                    "\n\n{}\n\n{}",
+                    TODO_PRESERVED_HEADING,
+                    cap_chars(&render_todo_snapshot(&snapshot), TODO_PRESERVED_MAX_CHARS)
+                )
+            });
+
         // Build new message list: system + summary + recent
         let mut result = Vec::with_capacity(system_count + 10);
 
         // Add system messages
         result.extend(messages.iter().take(system_count).cloned());
 
-        // Insert summary as a special system message
-        if !summary.trim().is_empty() {
+        // Insert summary as a special system message. The todo block alone
+        // still warrants a message when the AI returned an empty summary —
+        // dropping it would lose the preserved state.
+        if !summary.trim().is_empty() || todo_block.is_some() {
             result.push(Message {
                 role: Role::System,
                 content: MessageContent::Text(format!(
-                    "## Conversation Summary (Earlier Context)\n\n{}",
-                    summary
+                    "## Conversation Summary (Earlier Context)\n\n{}{}",
+                    summary,
+                    todo_block.unwrap_or_default()
                 )),
                 tool_call_id: None,
                 tool_calls: None,
@@ -614,5 +788,271 @@ mod tests {
         let window = manager.get_sliding_window(&messages, None);
 
         assert_no_orphaned_tool_results(&window);
+    }
+
+    // === T2-3: summarize preserves the latest update_todos snapshot ===
+
+    fn make_todo_call(id: &str, marker: &str) -> MessageToolCall {
+        MessageToolCall {
+            id: id.to_string(),
+            name: "update_todos".into(),
+            arguments: serde_json::json!({
+                "todos": [
+                    {"id": "1", "content": marker, "status": "in_progress"}
+                ]
+            }),
+        }
+    }
+
+    /// History whose summarize range holds an OLD and a NEW update_todos
+    /// pair, with recent traffic after them.
+    fn todo_history() -> Vec<Message> {
+        vec![
+            make_message(Role::System, "system prompt"),
+            make_message(Role::User, "kick off"),
+            // OLD todo snapshot (superseded — must be stripped).
+            Message::assistant_with_tool_calls(
+                "planning v1",
+                vec![make_todo_call("todo-old", "stale-todo-marker")],
+            ),
+            Message::tool(
+                "todo-old",
+                "Updated 1 todos (0 pending, 1 in_progress, 0 completed)",
+            ),
+            make_message(Role::Assistant, "working with v1"),
+            // NEW todo snapshot (must be preserved verbatim).
+            Message::assistant_with_tool_calls(
+                "planning v2",
+                vec![make_todo_call("todo-new", "fresh-todo-marker")],
+            ),
+            Message::tool(
+                "todo-new",
+                "Updated 1 todos (0 pending, 1 in_progress, 0 completed) v2",
+            ),
+            // A non-todo tool pair that must survive untouched in the input.
+            Message::assistant_with_tool_calls(
+                "reading",
+                vec![make_tool_call("read-1", "read_file")],
+            ),
+            Message::tool("read-1", "file contents"),
+            // Recent window (max_retained = 2).
+            make_message(Role::User, "recent question"),
+            make_message(Role::Assistant, "recent answer"),
+        ]
+    }
+
+    fn todo_manager() -> ContextManager {
+        ContextManager::new(
+            ContextManagerConfig {
+                context_window_target: 32_000,
+                max_retained_messages: 2,
+                auto_summarize_threshold: 75,
+                enable_auto_summarize: true,
+                max_message_chars_for_summary: 10_000,
+            },
+            "test-model".to_string(),
+        )
+    }
+
+    fn summary_message(messages: &[Message]) -> &Message {
+        messages
+            .iter()
+            .find(|m| {
+                m.role == Role::System
+                    && m.content.to_summary_text().contains("Conversation Summary")
+            })
+            .expect("summary system message must exist")
+    }
+
+    #[test]
+    fn summarize_preserves_latest_todo_snapshot_verbatim() {
+        let manager = todo_manager();
+        let result = manager.apply_summary(&todo_history(), "AI summary text.");
+
+        // No orphaned tool results after compaction.
+        assert_no_orphaned_tool_results(&result);
+
+        let summary = summary_message(&result).content.to_summary_text();
+        assert!(
+            summary.contains("### Current todo list (preserved verbatim)"),
+            "todo heading must ride along with the summary; got: {summary}"
+        );
+        // Verbatim arguments: the exact pretty-printed todos array.
+        let expected_json = serde_json::to_string_pretty(&serde_json::json!([
+            {"id": "1", "content": "fresh-todo-marker", "status": "in_progress"}
+        ]))
+        .unwrap();
+        assert!(
+            summary.contains(&expected_json),
+            "the LATEST todos argument must be preserved verbatim; got: {summary}"
+        );
+        assert!(
+            summary.contains(
+                "(tool result: Updated 1 todos (0 pending, 1 in_progress, 0 completed) v2)"
+            ),
+            "the latest tool result line must be preserved; got: {summary}"
+        );
+        assert!(
+            !summary.contains("stale-todo-marker"),
+            "only the latest snapshot may be preserved; got: {summary}"
+        );
+    }
+
+    #[test]
+    fn get_messages_to_summarize_strips_older_todo_pairs() {
+        let manager = todo_manager();
+        let input = manager.get_messages_to_summarize(&todo_history());
+
+        // Pair integrity of the stripped input.
+        assert_no_orphaned_tool_results(&input);
+
+        let ids: Vec<&str> = input
+            .iter()
+            .flat_map(|m| m.tool_calls.iter().flatten())
+            .map(|c| c.id.as_str())
+            .collect();
+        assert!(
+            !ids.contains(&"todo-old"),
+            "older update_todos tool_use must be stripped; ids: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"todo-new"),
+            "the latest update_todos tool_use must stay; ids: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"read-1"),
+            "non-todo tool pairs must survive; ids: {ids:?}"
+        );
+
+        let texts: Vec<String> = input.iter().map(|m| m.content.to_summary_text()).collect();
+        assert!(
+            !texts.iter().any(|t| t.contains("stale-todo-marker")),
+            "no older snapshot content may reach the summarizer"
+        );
+        // The old carrier keeps its text with tool_calls cleared.
+        assert!(
+            texts.iter().any(|t| t.contains("planning v1")),
+            "the old carrier's assistant text survives with tool_calls stripped"
+        );
+    }
+
+    #[test]
+    fn summarize_without_todos_leaves_summary_unchanged() {
+        let manager = todo_manager();
+        // No update_todos anywhere in the summarize range.
+        let history = vec![
+            make_message(Role::System, "system prompt"),
+            make_message(Role::User, "old 1"),
+            make_message(Role::Assistant, "old 2"),
+            Message::assistant_with_tool_calls(
+                "reading",
+                vec![make_tool_call("read-9", "read_file")],
+            ),
+            Message::tool("read-9", "file contents"),
+            make_message(Role::User, "recent question"),
+            make_message(Role::Assistant, "recent answer"),
+        ];
+
+        let result = manager.apply_summary(&history, "plain summary.");
+        let summary = summary_message(&result).content.to_summary_text();
+        assert_eq!(
+            summary, "## Conversation Summary (Earlier Context)\n\nplain summary.",
+            "no todo block may be appended when the range has no update_todos"
+        );
+    }
+
+    #[test]
+    fn preserved_todo_snapshot_is_truncation_capped() {
+        let manager = todo_manager();
+        let huge = "x".repeat(20_000);
+        let history = vec![
+            make_message(Role::System, "system prompt"),
+            make_message(Role::User, "kick off"),
+            Message::assistant_with_tool_calls(
+                "planning huge",
+                vec![MessageToolCall {
+                    id: "todo-huge".into(),
+                    name: "update_todos".into(),
+                    arguments: serde_json::json!({
+                        "todos": [
+                            {"id": "1", "content": huge, "status": "pending"}
+                        ]
+                    }),
+                }],
+            ),
+            Message::tool("todo-huge", "Updated 1 todos"),
+            make_message(Role::User, "recent question"),
+            make_message(Role::Assistant, "recent answer"),
+        ];
+
+        let result = manager.apply_summary(&history, "summary.");
+        let summary = summary_message(&result).content.to_summary_text();
+        assert!(
+            summary.contains("...[truncated]"),
+            "oversized snapshots must be capped; got {} chars",
+            summary.chars().count()
+        );
+        // Heading + cap + truncation marker — bounded message.
+        assert!(
+            summary.chars().count() < 4_096 + 512,
+            "summary must stay bounded; got {} chars",
+            summary.chars().count()
+        );
+    }
+
+    #[test]
+    fn summarize_strips_older_todo_call_from_multi_call_carrier() {
+        // An assistant carrier holding BOTH an older update_todos call and a
+        // read_file call: only the todo member may be stripped; the read
+        // pair must survive intact (extend of the orphan invariant).
+        let manager = todo_manager();
+        let history = vec![
+            make_message(Role::System, "system prompt"),
+            make_message(Role::User, "kick off"),
+            Message::assistant_with_tool_calls(
+                "mixed carrier",
+                vec![
+                    make_todo_call("todo-mixed", "stale-todo-marker"),
+                    make_tool_call("read-2", "read_file"),
+                ],
+            ),
+            Message::tool("todo-mixed", "Updated 1 todos"),
+            Message::tool("read-2", "file contents"),
+            // NEW todo snapshot after it (this one is preserved).
+            Message::assistant_with_tool_calls(
+                "planning v2",
+                vec![make_todo_call("todo-latest", "fresh-todo-marker")],
+            ),
+            Message::tool("todo-latest", "Updated 1 todos v2"),
+            make_message(Role::User, "recent question"),
+            make_message(Role::Assistant, "recent answer"),
+        ];
+
+        let input = manager.get_messages_to_summarize(&history);
+        assert_no_orphaned_tool_results(&input);
+
+        let mixed_carrier = input
+            .iter()
+            .find(|m| {
+                m.role == Role::Assistant && m.content.to_summary_text().contains("mixed carrier")
+            })
+            .expect("mixed carrier survives with its text");
+        let carrier_ids: Vec<&str> = mixed_carrier
+            .tool_calls
+            .iter()
+            .flatten()
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(
+            carrier_ids,
+            vec!["read-2"],
+            "only the update_todos member is stripped from the carrier"
+        );
+
+        let result = manager.apply_summary(&history, "summary.");
+        assert_no_orphaned_tool_results(&result);
+        let summary = summary_message(&result).content.to_summary_text();
+        assert!(summary.contains("fresh-todo-marker"));
+        assert!(!summary.contains("stale-todo-marker"));
     }
 }
