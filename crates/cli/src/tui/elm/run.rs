@@ -42,6 +42,7 @@ pub(crate) fn run_nca_model(
     staged_images: Arc<StdMutex<Vec<nca_common::message::ImageAttachment>>>,
     inbox_tx: Option<tokio::sync::mpsc::Sender<nca_core::agent_driver::InboxItem>>,
     busy_flag: Arc<AtomicBool>,
+    kill_all_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
     params: NcaModelParams,
 ) -> anyhow::Result<()> {
     // Setup terminal
@@ -65,6 +66,7 @@ pub(crate) fn run_nca_model(
             staged_images,
             inbox_tx,
             busy_flag,
+            kill_all_tx,
         },
     );
 

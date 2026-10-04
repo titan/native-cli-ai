@@ -2,7 +2,7 @@
 //!
 //! Intercepts key events that apply regardless of focus:
 //! - Ctrl+Q: quit
-//! - Ctrl+X leader key (M/E/L/N/C/S/A/H/Q)
+//! - Ctrl+X leader key (M/E/L/N/C/S/A/H/K/Q)
 //! - Ctrl+C: cancel turn
 //! - Ctrl+L: clear screen
 //! - Ctrl+P: open command palette
@@ -46,6 +46,11 @@ impl GlobalListener {
                 KeyCode::Char('s') | KeyCode::Char('S') => Some(Msg::Cmd(TuiCmd::OpenStatus)),
                 KeyCode::Char('a') | KeyCode::Char('A') => Some(Msg::Cmd(TuiCmd::OpenAgentPicker)),
                 KeyCode::Char('h') | KeyCode::Char('H') => Some(Msg::Cmd(TuiCmd::OpenHelp)),
+                // T2-1 emergency kill-all: batch-cancel every Running
+                // subagent. NOT a TuiCmd — the cmd_rx loop may be blocked
+                // inside run_turn, so this rides its own side channel
+                // (see `NcaModel::process_global_msg`).
+                KeyCode::Char('k') | KeyCode::Char('K') => Some(Msg::KillAllSubagents),
                 KeyCode::Char('q') | KeyCode::Char('Q') => Some(Msg::Quit),
                 _ => None,
             };
@@ -76,5 +81,101 @@ impl GlobalListener {
             (KeyCode::F(2), KeyModifiers::SHIFT) => Some(Msg::Cmd(TuiCmd::CycleModel(false))),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> Msg {
+        Msg::Key(KeyEvent::new(code, modifiers))
+    }
+
+    fn ctrl(c: char) -> Msg {
+        key(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn plain(c: char) -> Msg {
+        key(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    // ── T2-1: Ctrl+X K leader sequence ─────────────────────────────
+
+    #[test]
+    fn leader_then_k_triggers_kill_all() {
+        let mut listener = GlobalListener::new();
+        assert!(listener.on(&ctrl('x')).is_none(), "leader arms silently");
+        match listener.on(&plain('k')) {
+            Some(Msg::KillAllSubagents) => {}
+            other => panic!("Ctrl+X K must trigger kill-all, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn leader_then_uppercase_k_triggers_kill_all() {
+        let mut listener = GlobalListener::new();
+        listener.on(&ctrl('x'));
+        assert!(matches!(
+            listener.on(&key(KeyCode::Char('K'), KeyModifiers::NONE)),
+            Some(Msg::KillAllSubagents)
+        ));
+    }
+
+    #[test]
+    fn any_other_key_cancels_the_leader() {
+        // Leader then an unbound key: the leader is consumed and nothing
+        // fires — a later bare `k` must NOT trigger kill-all (no sticky
+        // leader state).
+        let mut listener = GlobalListener::new();
+        listener.on(&ctrl('x'));
+        assert!(
+            listener.on(&plain('z')).is_none(),
+            "unbound key fires nothing"
+        );
+        assert!(
+            listener.on(&plain('k')).is_none(),
+            "leader was cancelled — bare k is inert"
+        );
+    }
+
+    #[test]
+    fn bare_k_without_leader_is_inert() {
+        let mut listener = GlobalListener::new();
+        assert!(
+            listener.on(&plain('k')).is_none(),
+            "kill-all needs the Ctrl+X leader"
+        );
+    }
+
+    #[test]
+    fn existing_leader_keys_still_work_after_the_addition() {
+        // No regression in the leader table.
+        let mut listener = GlobalListener::new();
+        listener.on(&ctrl('x'));
+        assert!(matches!(
+            listener.on(&plain('m')),
+            Some(Msg::Cmd(TuiCmd::OpenModelPicker))
+        ));
+        let mut listener = GlobalListener::new();
+        listener.on(&ctrl('x'));
+        assert!(matches!(listener.on(&plain('q')), Some(Msg::Quit)));
+    }
+
+    #[test]
+    fn second_keypress_ends_the_sequence_exactly_once() {
+        // The leader is single-shot: k, k after one Ctrl+X fires once,
+        // then the sequence is over.
+        let mut listener = GlobalListener::new();
+        listener.on(&ctrl('x'));
+        assert!(matches!(
+            listener.on(&plain('k')),
+            Some(Msg::KillAllSubagents)
+        ));
+        assert!(
+            listener.on(&plain('k')).is_none(),
+            "the second k is a fresh (leaderless) keypress"
+        );
     }
 }

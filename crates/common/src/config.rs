@@ -721,6 +721,10 @@ fn default_subagent_background() -> bool {
     true
 }
 
+fn default_subagent_stall_timeout_secs() -> u64 {
+    300
+}
+
 fn default_wake_enabled() -> bool {
     true
 }
@@ -790,6 +794,15 @@ pub struct SubagentConfig {
     /// Max wait for a `task_status`/`task_result` reply, milliseconds.
     #[serde(default = "default_subagent_result_timeout_ms")]
     pub result_timeout_ms: u64,
+    /// Stalled-child watchdog (T1-3): a `Running` child with no observed
+    /// activity for this many seconds — and no pending interaction or
+    /// in-flight control operation — is folded to `Failed` ("stalled")
+    /// through the normal terminal path and reported through the wake
+    /// channel, so an unattended background run never wedges silently.
+    /// `0` disables the watchdog. Scan cadence is
+    /// `clamp(stall_timeout/3, 10s..60s)`.
+    #[serde(default = "default_subagent_stall_timeout_secs")]
+    pub stall_timeout_secs: u64,
     /// Wake scheduler settings for background children (P3).
     #[serde(default)]
     pub wake: WakeConfig,
@@ -800,6 +813,7 @@ impl Default for SubagentConfig {
         Self {
             background: default_subagent_background(),
             result_timeout_ms: default_subagent_result_timeout_ms(),
+            stall_timeout_secs: default_subagent_stall_timeout_secs(),
             wake: WakeConfig::default(),
         }
     }
@@ -882,6 +896,9 @@ impl SubagentConfig {
         }
         if let Some(result_timeout_ms) = partial.result_timeout_ms {
             self.result_timeout_ms = result_timeout_ms;
+        }
+        if let Some(stall_timeout_secs) = partial.stall_timeout_secs {
+            self.stall_timeout_secs = stall_timeout_secs;
         }
         if let Some(wake) = partial.wake {
             self.wake.merge(wake);
@@ -2018,6 +2035,13 @@ pub struct PermissionConfig {
     pub allow: Vec<String>,
     pub deny: Vec<String>,
     pub ask: Vec<String>,
+    /// Globally disabled tool names (T2-4), removed from every
+    /// `ToolRegistry` at construction AFTER registration and BEFORE any
+    /// per-profile `allowed_tools` allowlist (disable wins over allow).
+    /// Unknown names warn but never fail config load (omos lesson:
+    /// all-unknown lists are treated as unset).
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
     /// P5 sandbox configuration (Landlock backend, resolved at exec time).
     #[serde(default)]
     pub sandbox: SandboxConfig,
@@ -2171,6 +2195,9 @@ impl PermissionConfig {
         }
         if let Some(ask) = partial.ask {
             self.ask = ask;
+        }
+        if let Some(disabled_tools) = partial.disabled_tools {
+            self.disabled_tools = disabled_tools;
         }
         if let Some(sandbox) = partial.sandbox {
             self.sandbox.merge(sandbox);
@@ -2781,6 +2808,7 @@ struct PartialNcaConfig {
 struct PartialSubagentConfig {
     background: Option<bool>,
     result_timeout_ms: Option<u64>,
+    stall_timeout_secs: Option<u64>,
     wake: Option<PartialWakeConfig>,
 }
 
@@ -2945,6 +2973,7 @@ struct PartialPermissionConfig {
     allow: Option<Vec<String>>,
     deny: Option<Vec<String>>,
     ask: Option<Vec<String>>,
+    disabled_tools: Option<Vec<String>>,
     sandbox: Option<PartialSandboxConfig>,
 }
 
@@ -3267,6 +3296,58 @@ mod tests {
         let json = serde_json::to_string(&config).expect("serialize");
         let back: NcaConfig = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.subagent.result_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn subagent_stall_timeout_defaults_to_300_and_zero_disables_via_merge() {
+        let config = NcaConfig::default();
+        assert_eq!(
+            config.subagent.stall_timeout_secs, 300,
+            "stalled-child watchdog defaults to a 5-minute no-activity bound"
+        );
+
+        // Field-level serde default matches Default impl; `0` disables.
+        let mut config = NcaConfig::default();
+        let partial: PartialNcaConfig = toml::from_str("[subagent]\n").expect("parse");
+        config.merge(partial);
+        assert_eq!(config.subagent.stall_timeout_secs, 300);
+
+        let partial: PartialNcaConfig =
+            toml::from_str("[subagent]\nstall_timeout_secs = 0\n").expect("parse");
+        let mut config = NcaConfig::default();
+        config.merge(partial);
+        assert_eq!(config.subagent.stall_timeout_secs, 0);
+
+        // Round-trip (config file writes).
+        let json = serde_json::to_string(&config).expect("serialize");
+        let back: NcaConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.subagent.stall_timeout_secs, 0);
+    }
+
+    #[test]
+    fn permissions_disabled_tools_default_empty_and_merge_wholesale() {
+        let config = NcaConfig::default();
+        assert!(
+            config.permissions.disabled_tools.is_empty(),
+            "no tools are disabled by default"
+        );
+
+        let partial: PartialNcaConfig =
+            toml::from_str("[permissions]\ndisabled_tools = [\"fetch_url\", \"web_search\"]\n")
+                .expect("parse");
+        let mut config = NcaConfig::default();
+        config.permissions.disabled_tools = vec!["bogus_stale".into()];
+        config.merge(partial);
+        assert_eq!(
+            config.permissions.disabled_tools,
+            vec!["fetch_url".to_string(), "web_search".to_string()],
+            "disabled_tools merges wholesale (replace, not append)"
+        );
+
+        // Round-trip (config file writes).
+        let json = serde_json::to_string(&config).expect("serialize");
+        let back: NcaConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.permissions.disabled_tools.len(), 2);
     }
 
     #[test]

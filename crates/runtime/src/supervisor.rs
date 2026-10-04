@@ -860,6 +860,13 @@ impl Supervisor {
         tools.register(Box::new(UpdateTodosTool::new(event_tx.clone(), todo_store)));
 
         // Apply tool gating from the agent profile (if any).
+        //
+        // T2-4 ordering contract: the global `[permissions]` disabled_tools
+        // pass runs AFTER registration and BEFORE the per-profile allowlist,
+        // so a disabled tool stays gone even when a profile allowlists it
+        // (disable wins over allow). Unknown names warn inside the pass and
+        // never fail startup.
+        tools.apply_disabled_tools(&config.permissions.disabled_tools);
         if let Some(ref profile) = agent_profile
             && let Some(ref allowed) = profile.allowed_tools
         {

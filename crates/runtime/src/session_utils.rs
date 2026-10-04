@@ -13,6 +13,29 @@ pub(crate) type QuestionPendingMap =
     Arc<Mutex<HashMap<String, oneshot::Sender<QuestionSelection>>>>;
 type EventFanoutCallback = Box<dyn Fn(&EventEnvelope) + Send>;
 
+/// Last-activity heartbeat for the stalled-child watchdog (T1-3): fired
+/// by a child session's event fanout for EVERY observed child event —
+/// proof of life, regardless of whether the event maps to a
+/// parent-visible forward. Typically closes over the parent's
+/// [`crate::subagent_registry::SubagentRegistry`] and the child id
+/// ([`SubagentRegistry::note_activity`]).
+pub type ActivityHeartbeat = Arc<dyn Fn() + Send + Sync>;
+
+/// Parent-forward wiring for a CHILD session's event fanout: the child's
+/// identity, the parent's bounded event channel, and (optionally) the
+/// T1-3 liveness heartbeat stamped for every observed child event.
+#[derive(Clone)]
+pub struct ParentForward {
+    /// Child session id — tags forwarded activity events and keys the
+    /// heartbeat.
+    pub child_id: String,
+    /// Parent's bounded event channel (forward target).
+    pub tx: mpsc::Sender<AgentEvent>,
+    /// Liveness heartbeat (T1-3). `None` only in tests that exercise
+    /// forwarding without a registry; production child runs always stamp.
+    pub heartbeat: Option<ActivityHeartbeat>,
+}
+
 /// Delivery class for a parent-forwarded child event
 /// (event-consumer-liveness, Chunk 1). Decides how the fanout forwards it
 /// when the parent's bounded event channel is full.
@@ -148,7 +171,7 @@ pub fn spawn_event_fanout(
     log_path: PathBuf,
     ipc_tx: Option<tokio::sync::broadcast::Sender<String>>,
     on_event: Option<EventFanoutCallback>,
-    parent_forward: Option<(String, mpsc::Sender<AgentEvent>)>,
+    parent_forward: Option<ParentForward>,
     commit_tx: Option<TurnCommitTx>,
     step_stall_alarm: Duration,
 ) -> tokio::task::JoinHandle<()> {
@@ -190,6 +213,15 @@ pub fn spawn_event_fanout(
                 maybe = event_rx.recv() => {
                     let Some(event) = maybe else { break };
                     stalled_for = Duration::ZERO;
+                    // T1-3 liveness heartbeat: every observed child event
+                    // is proof of life, BEFORE any mapping/elision — a
+                    // busy child whose activity forwards elide under
+                    // parent backpressure must not read as stalled.
+                    if let Some(ref forward) = parent_forward
+                        && let Some(ref heartbeat) = forward.heartbeat
+                    {
+                        heartbeat();
+                    }
                     let now = tokio::time::Instant::now();
                     match &event {
                         AgentEvent::StepStarted { turn_id, step_index } => {
@@ -236,12 +268,12 @@ pub fn spawn_event_fanout(
                     // Forward AFTER the append (durability reorder): a
                     // must-deliver forward that parks here leaves the event
                     // already durable — abort-safe, never staled.
-                    if let Some((ref child_id, ref ptx)) = parent_forward
+                    if let Some(ref forward) = parent_forward
                         && let Some((fwd, class)) =
-                            map_child_event_for_parent_broadcast(child_id, &envelope.event)
+                            map_child_event_for_parent_broadcast(&forward.child_id, &envelope.event)
                     {
                         match class {
-                            ForwardClass::Droppable => match ptx.try_send(fwd) {
+                            ForwardClass::Droppable => match forward.tx.try_send(fwd) {
                                 Ok(()) => {}
                                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                                     elided_forwards += 1;
@@ -251,7 +283,7 @@ pub fn spawn_event_fanout(
                             ForwardClass::MustDeliver => {
                                 if elided_forwards > 0 {
                                     nca_core::agent::send_with_stall_alarm(
-                                        ptx,
+                                        &forward.tx,
                                         AgentEvent::EventsElided {
                                             count: elided_forwards,
                                         },
@@ -259,7 +291,7 @@ pub fn spawn_event_fanout(
                                     .await;
                                     elided_forwards = 0;
                                 }
-                                nca_core::agent::send_with_stall_alarm(ptx, fwd).await;
+                                nca_core::agent::send_with_stall_alarm(&forward.tx, fwd).await;
                             }
                         }
                     }
@@ -693,6 +725,60 @@ mod tests {
 
     // ── event-consumer-liveness Chunk 1: classified parent forwards ────
 
+    /// T1-3: the fanout fires the liveness heartbeat for EVERY observed
+    /// child event — including events that map to NO parent forward at
+    /// all (e.g. `TokensStreamed`), so a busy child can never read as
+    /// stalled just because its visible activity elided.
+    #[tokio::test]
+    async fn fanout_fires_heartbeat_for_every_child_event() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("events.jsonl");
+        let (event_tx, event_rx) = mpsc::channel(64);
+        let (ptx, _prx) = mpsc::channel(16);
+        let beats = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&beats);
+        let forward = ParentForward {
+            child_id: "child-1".to_string(),
+            tx: ptx,
+            heartbeat: Some(Arc::new(move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })),
+        };
+        let mut task = spawn_event_fanout(
+            event_rx,
+            log_path,
+            None,
+            None,
+            Some(forward),
+            None,
+            Duration::ZERO,
+        );
+
+        // One forwardable event + two that map to NO forward.
+        event_tx
+            .send(AgentEvent::ToolCallStarted {
+                call_id: "c0".into(),
+                tool: "read_file".into(),
+                input: serde_json::json!("path"),
+            })
+            .await
+            .expect("send");
+        for _ in 0..2 {
+            event_tx
+                .send(AgentEvent::TokensStreamed { delta: "x".into() })
+                .await
+                .expect("send");
+        }
+        drop(event_tx);
+        crate::session_utils::drain_event_fanout(&mut task, "heartbeat test").await;
+
+        assert_eq!(
+            beats.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "every observed child event fired the heartbeat"
+        );
+    }
+
     fn nonempty_log_lines(log_path: &std::path::Path) -> Vec<String> {
         std::fs::read_to_string(log_path)
             .unwrap_or_default()
@@ -717,7 +803,11 @@ mod tests {
             log_path.clone(),
             None,
             None,
-            Some(("child-1".to_string(), ptx)),
+            Some(ParentForward {
+                child_id: "child-1".to_string(),
+                tx: ptx,
+                heartbeat: None,
+            }),
             None,
             Duration::ZERO,
         );
@@ -777,7 +867,11 @@ mod tests {
             log_path.clone(),
             None,
             None,
-            Some(("child-2".to_string(), ptx)),
+            Some(ParentForward {
+                child_id: "child-2".to_string(),
+                tx: ptx,
+                heartbeat: None,
+            }),
             None,
             Duration::ZERO,
         );

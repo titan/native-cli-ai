@@ -27,6 +27,11 @@ pub(crate) enum Msg {
     Cmd(TuiCmd),
     /// Direct question answer — bypasses cmd_tx because run_turn is blocked.
     QuestionAnswer(QuestionSelection),
+    /// Emergency kill-all (Ctrl+X K, T2-1): batch-cancel every Running
+    /// subagent NOW. Rides its own side channel (`SideEffectChannels::
+    /// kill_all_tx`), never `cmd_tx` — the whole point is working while
+    /// the cmd_rx loop is blocked inside a long `run_turn`.
+    KillAllSubagents,
     /// Raw input for the active question — parsed and routed by the model.
     QuestionSubmit(String),
     /// Raw input for the active approval — parsed and routed by the model.

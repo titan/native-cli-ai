@@ -628,6 +628,8 @@ mod job_line_tests {
             inbox_tx: None,
             cancel_reason: None,
             specialist: None,
+            last_activity: tokio::time::Instant::now(),
+            interaction_pending: false,
         }
     }
 

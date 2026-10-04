@@ -93,6 +93,12 @@ pub(crate) struct SideEffectChannels {
     pub inbox_tx: Option<tokio::sync::mpsc::Sender<nca_core::agent_driver::InboxItem>>,
     /// Authoritative busy flag shared with the cmd_rx loop (see feedback.rs).
     pub busy_flag: Arc<AtomicBool>,
+    /// Emergency kill-all trigger (T2-1, Ctrl+X K): `()` per request. The
+    /// receiving task (wired in `repl.rs`) runs the supervisor-side batch
+    /// cancel of all Running children and surfaces the summary toast —
+    /// deliberately NOT the cmd queue, which may be blocked inside
+    /// `run_turn` while runaway children need killing.
+    pub kill_all_tx: Option<UnboundedSender<()>>,
 }
 
 // ── NcaModel ─────────────────────────────────────────────────────
@@ -872,6 +878,27 @@ impl NcaModel {
                 }
                 let _ = self.cmd_tx.send(Msg::Cmd(cmd));
             }
+            Msg::KillAllSubagents => {
+                // T2-1: emergency batch-cancel of every Running child.
+                // Never routed through cmd_tx — the cmd_rx loop may be
+                // blocked inside run_turn (that's the emergency), so the
+                // side channel's dedicated task performs the cancel and
+                // pushes the summary toast.
+                match self.side_effects.kill_all_tx.as_ref() {
+                    Some(tx) => {
+                        let _ = tx.send(());
+                        self.components.transcript.push_system(
+                            "kill-all requested — cancelling running background tasks…".to_string(),
+                        );
+                    }
+                    None => {
+                        self.components
+                            .transcript
+                            .push_error("kill-all unavailable in this mode".to_string());
+                    }
+                }
+                self.redraw = true;
+            }
             Msg::Redraw => {
                 self.redraw = true;
             }
@@ -1154,6 +1181,7 @@ mod tests {
             staged_images: Arc::new(StdMutex::new(Vec::new())),
             inbox_tx: None,
             busy_flag: Arc::new(AtomicBool::new(false)),
+            kill_all_tx: None,
         };
         let model = NcaModel::new(bridge_rx, _cmd_tx, side_effects);
         (model, bridge_tx)
@@ -1165,6 +1193,50 @@ mod tests {
             content: content.into(),
             steering: false,
         })
+    }
+
+    // ── T2-1: Ctrl+X K kill-all side channel ─────────────────────────
+
+    #[test]
+    fn kill_all_msg_fires_the_side_channel_and_echoes_in_transcript() {
+        let (mut model, _bridge_tx) = test_model();
+        let (kill_tx, mut kill_rx) = mpsc::unbounded_channel::<()>();
+        model.side_effects.kill_all_tx = Some(kill_tx);
+
+        model.process_global_msg(Msg::KillAllSubagents);
+
+        assert_eq!(
+            kill_rx.try_recv(),
+            Ok(()),
+            "the kill-all msg must reach the dedicated side channel"
+        );
+        assert!(
+            kill_rx.try_recv().is_err(),
+            "exactly one trigger per keypress"
+        );
+        match model.components.transcript.blocks.last() {
+            Some(crate::tui::state::DisplayBlock::System(line)) => assert!(
+                line.contains("kill-all requested"),
+                "immediate feedback echoes into the transcript: {line}"
+            ),
+            other => panic!("expected a System echo block, got {other:?}"),
+        }
+        assert!(model.redraw, "the echo forces a redraw");
+    }
+
+    #[test]
+    fn kill_all_msg_without_channel_reports_unavailable() {
+        // REPL/one-shot modes wire no kill-all channel: the key is a no-op
+        // beyond an honest error line (never a panic, never cmd_tx).
+        let (mut model, _bridge_tx) = test_model();
+        model.process_global_msg(Msg::KillAllSubagents);
+        match model.components.transcript.blocks.last() {
+            Some(crate::tui::state::DisplayBlock::ErrorLine(line)) => assert!(
+                line.contains("unavailable"),
+                "reports unavailability: {line}"
+            ),
+            other => panic!("expected an ErrorLine, got {other:?}"),
+        }
     }
 
     // The bridge drain is two-tier: live bursts are consumed at most

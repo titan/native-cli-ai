@@ -130,6 +130,33 @@ impl ToolRegistry {
         self.tools.retain(|t| t.definition().name != name);
     }
 
+    /// Remove every tool named in `disabled` (T2-4 global `[permissions]
+    /// disabled_tools`). Runs at registry construction AFTER registration
+    /// and BEFORE any per-profile [`Self::restrict_to`] allowlist, so a
+    /// disabled tool stays gone even when a profile allowlists it —
+    /// disable always wins over allow. Names matching no registered tool
+    /// are collected into one `tracing::warn` (never a config-load
+    /// failure — an all-unknown list is treated as unset, omos lesson).
+    pub fn apply_disabled_tools(&mut self, disabled: &[String]) {
+        if disabled.is_empty() {
+            return;
+        }
+        let mut unknown: Vec<&str> = Vec::new();
+        for name in disabled {
+            let before = self.tools.len();
+            self.unregister(name);
+            if self.tools.len() == before {
+                unknown.push(name.as_str());
+            }
+        }
+        if !unknown.is_empty() {
+            tracing::warn!(
+                unknown = unknown.join(", "),
+                "[permissions] disabled_tools names no registered tool (ignored)"
+            );
+        }
+    }
+
     /// Retain only tools whose name is in `allowed`; remove all others.
     /// Used by agent profiles to enforce tool gating.
     pub fn restrict_to(&mut self, allowed: &[String]) {
@@ -382,6 +409,65 @@ mod tests {
         reg.restrict_to(&["nonexistent".into()]);
 
         assert!(reg.definitions().is_empty());
+    }
+
+    // ── T2-4: global disabled_tools ─────────────────────────────
+
+    #[test]
+    fn apply_disabled_tools_removes_named_tools_from_listing() {
+        let mut reg = stub_registry(&["read_file", "write_file", "delete_path"]);
+        reg.apply_disabled_tools(&["write_file".into()]);
+
+        let names: Vec<String> = reg.definitions().iter().map(|d| d.name.clone()).collect();
+        assert_eq!(names, vec!["read_file", "delete_path"]);
+    }
+
+    #[test]
+    fn apply_disabled_tools_with_unknown_names_is_treated_as_unset() {
+        // omos lesson: an all-unknown list must behave exactly like unset —
+        // warn (one tracing line), never fail, never drop real tools.
+        let mut reg = stub_registry(&["read_file", "write_file"]);
+        reg.apply_disabled_tools(&["not_a_tool".into(), "also_not_a_tool".into()]);
+
+        let names: Vec<String> = reg.definitions().iter().map(|d| d.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec!["read_file", "write_file"],
+            "unknown names remove nothing"
+        );
+
+        // Mixed: the known name is removed, the unknown ones are ignored.
+        reg.apply_disabled_tools(&["write_file".into(), "ghost".into()]);
+        let names: Vec<String> = reg.definitions().iter().map(|d| d.name.clone()).collect();
+        assert_eq!(names, vec!["read_file"]);
+    }
+
+    #[test]
+    fn disabled_tools_win_over_profile_allowlist() {
+        // Ordering contract: apply_disabled_tools runs at construction,
+        // restrict_to afterwards — a profile that allowlists a globally
+        // disabled tool must not resurrect it.
+        let mut reg = stub_registry(&["read_file", "write_file", "search_code"]);
+        reg.apply_disabled_tools(&["write_file".into()]);
+        reg.restrict_to(&[
+            "read_file".into(),
+            "write_file".into(),
+            "search_code".into(),
+        ]);
+
+        let names: Vec<String> = reg.definitions().iter().map(|d| d.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec!["read_file", "search_code"],
+            "disable wins over allow"
+        );
+    }
+
+    #[test]
+    fn apply_disabled_tools_empty_is_a_noop() {
+        let mut reg = stub_registry(&["read_file"]);
+        reg.apply_disabled_tools(&[]);
+        assert_eq!(reg.definitions().len(), 1);
     }
 
     #[test]

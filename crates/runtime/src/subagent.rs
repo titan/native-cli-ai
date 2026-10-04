@@ -513,7 +513,38 @@ pub async fn run_prepared_child(
     let log_path = handle.event_log_path.clone();
 
     let commit_tx = handle.take_turn_commit_tx().map(|(tx, _flag)| tx);
-    let parent_forward = terminal_tx.clone().map(|tx| (child_id.clone(), tx));
+    // T1-3 liveness heartbeat: the parent registry's activity stamp for
+    // this child, fired by the fanout for EVERY observed child event —
+    // the signal the stalled-child watchdog reads. Built only when the
+    // run is registry-tracked (a child spawned without a registry — tests
+    // — has no watchdog either).
+    let heartbeat = registry.as_ref().map(|reg| {
+        let reg = Arc::clone(reg);
+        let id = child_id.clone();
+        Arc::new(move || reg.note_activity(&id)) as crate::session_utils::ActivityHeartbeat
+    });
+    let parent_forward = match (&heartbeat, terminal_tx.as_ref()) {
+        (beat, Some(tx)) => Some(crate::session_utils::ParentForward {
+            child_id: child_id.clone(),
+            tx: tx.clone(),
+            heartbeat: beat.clone(),
+        }),
+        // Registry-tracked child with no parent event channel (not a
+        // production shape — every spawn consumer passes the session
+        // event channel): forward into a dead channel (sends land in
+        // Closed, i.e. no forwards, same as before T1-3) so the
+        // heartbeat still reaches the fanout and the watchdog reads true
+        // liveness instead of false-stalling a live child.
+        (Some(beat), None) => {
+            let (dead_tx, _) = mpsc::channel(1);
+            Some(crate::session_utils::ParentForward {
+                child_id: child_id.clone(),
+                tx: dead_tx,
+                heartbeat: Some(Arc::clone(beat)),
+            })
+        }
+        (None, None) => None,
+    };
     // Step-liveness watch interval from the child's own config (0 disables).
     let step_stall_alarm = Duration::from_secs(sup.config().session.step_stall_alarm_secs);
     let mut fanout = event_rx.map(|rx| {
@@ -1166,7 +1197,31 @@ pub fn spawn_subagent_consumer(
     plugins: Option<Arc<nca_core::plugin::PluginRegistry>>,
     escaped_providers: Option<Arc<Mutex<HashSet<String>>>>,
 ) -> tokio::task::JoinHandle<()> {
+    // T1-3 stalled-child watchdog: one scan task per spawn consumer
+    // (= per parent session), reading the timeout from the LIVE config
+    // snapshot once at wiring time (a mid-session config reload keeps the
+    // cadence it started with — same contract as the wake scheduler's
+    // interval, resolved at wiring in the CLI layer). Registry folds,
+    // status events, and wake notifications only; see `stall_watch`.
+    //
+    // Spawned INSIDE the consumer task and aborted at loop end: the
+    // watchdog holds a clone of the parent event channel, and a detached
+    // one would keep that channel open past the consumer's death — the
+    // parent fanout's drain-on-close (drop all senders → fanout drains →
+    // exits) would never fire.
     tokio::spawn(async move {
+        let stall_timeout_secs = {
+            let guard = config
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.subagent.stall_timeout_secs
+        };
+        let watchdog = crate::stall_watch::spawn_stall_watchdog(
+            Arc::clone(&registry),
+            wake.clone(),
+            event_tx.clone(),
+            Duration::from_secs(stall_timeout_secs),
+        );
         while let Some(req) = spawn_rx.recv().await {
             let parent_session_id = parent_session_id.clone();
             let workspace_root = workspace_root.clone();
@@ -1452,6 +1507,12 @@ pub fn spawn_subagent_consumer(
                     }
                 }
             });
+        }
+        // Spawn channel closed (session teardown): stop the watchdog so
+        // its event-channel clone stops holding the parent fanout open
+        // (drain-on-close) — see the comment at the watchdog spawn.
+        if let Some(watchdog) = watchdog {
+            watchdog.abort();
         }
     })
 }

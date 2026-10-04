@@ -1979,6 +1979,59 @@ impl Repl {
         let answer_for_tui = answer_tx.clone();
         drop(answer_tx);
 
+        // T2-1 emergency kill-all (Ctrl+X K): dedicated side channel — the
+        // cmd_rx loop may be blocked inside run_turn while runaway
+        // children need killing, so this task performs the batch cancel
+        // directly against the supervisor's registry and surfaces the
+        // summary toast. Same per-child path as `task_cancel`
+        // (`cancel_all_running` → `handle_cancel_request`: lease, identity
+        // fence, cooperative flag flip, reason bookkeeping), never a
+        // second abort mechanism.
+        let (kill_all_tx, mut kill_all_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        {
+            let registry = self.runtime.subagent_registry();
+            let kill_fb = Arc::clone(&tui_feedback);
+            tokio::spawn(async move {
+                while kill_all_rx.recv().await.is_some() {
+                    let outcomes = nca_runtime::subagent_registry::cancel_all_running(
+                        &registry,
+                        "kill-all (Ctrl+X K)",
+                    )
+                    .await;
+                    let cancelled = outcomes.iter().filter(|(_, r)| r.ok).count();
+                    let failures: Vec<&(String, _)> =
+                        outcomes.iter().filter(|(_, r)| !r.ok).collect();
+                    for (id, resp) in &failures {
+                        tracing::warn!(
+                            child = %id,
+                            note = resp.note.as_deref(),
+                            "kill-all: cancel failed"
+                        );
+                    }
+                    if outcomes.is_empty() {
+                        kill_fb.push_system("kill-all: no running background tasks".into());
+                    } else if failures.is_empty() {
+                        kill_fb.push_system(format!(
+                            "kill-all: cancelled {cancelled} background task(s)"
+                        ));
+                    } else {
+                        kill_fb.push_error(format!(
+                            "kill-all: {cancelled} cancelled, {} failed — {}",
+                            failures.len(),
+                            failures
+                                .iter()
+                                .map(|(id, r)| format!(
+                                    "{id} ({})",
+                                    r.note.as_deref().unwrap_or("no detail")
+                                ))
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        ));
+                    }
+                }
+            });
+        }
+
         let (approval_tx, mut approval_rx) =
             tokio::sync::mpsc::unbounded_channel::<ApprovalAnswer>();
         let approval_dispatch = approval.clone();
@@ -2036,6 +2089,7 @@ impl Repl {
                 Arc::clone(&staged_images),
                 Some(inbox_tx),
                 Arc::clone(&busy_flag),
+                Some(kill_all_tx),
                 params,
             )
         });

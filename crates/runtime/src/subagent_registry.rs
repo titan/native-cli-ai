@@ -47,6 +47,19 @@ pub struct SubagentRegistryEntry {
     /// Specialist agent name the child was spawned with (revive rebuilds
     /// its config routing from this).
     pub specialist: Option<String>,
+    /// Last-activity heartbeat (T1-3 stalled-child watchdog): stamped at
+    /// spawn/revive and refreshed by the child's event fanout for EVERY
+    /// observed child event. `tokio::time::Instant` (not std) so the
+    /// paused-clock watchdog tests can drive it. Runtime-only state,
+    /// never persisted.
+    pub last_activity: tokio::time::Instant,
+    /// True while the child is legitimately blocked on a pending
+    /// approval/question — a legal wait the stalled-child watchdog must
+    /// skip. Children are structurally non-interactive today
+    /// (`BypassPermissions` + `AutoDenyHandler` + parent-only tool strip),
+    /// so nothing sets this in production yet; the latch guards the seam
+    /// for any future interactive-child path.
+    pub interaction_pending: bool,
 }
 
 /// In-memory projection of spawned child tasks, keyed by child session id
@@ -58,6 +71,29 @@ pub struct SubagentRegistry {
     /// Session ids with an in-flight mutating control operation (see
     /// [`SubagentRegistry::try_acquire_lease`]).
     control_leases: Arc<Mutex<HashSet<String>>>,
+}
+
+/// Shared terminal-fold body of [`SubagentRegistry::record_terminal`] and
+/// [`SubagentRegistry::record_terminal_if_running`] (same entry mutation,
+/// same invariants): set the terminal state, keep the richer existing
+/// summary when the new one is `None`, and clear live handles + the spent
+/// cancel reason. Caller holds the entries lock.
+fn fold_entry_terminal(
+    entry: &mut SubagentRegistryEntry,
+    state: ChildSessionState,
+    result_summary: Option<String>,
+) {
+    entry.state = state;
+    if result_summary.is_some() {
+        entry.result_summary = result_summary;
+    }
+    // Terminal tasks have no live handles; the cancel reason has been
+    // folded into the terminal result_summary by the caller.
+    entry.cancel_flag = None;
+    entry.inbox_tx = None;
+    entry.cancel_reason = None;
+    // A terminal child cannot be interaction-blocked.
+    entry.interaction_pending = false;
 }
 
 impl SubagentRegistry {
@@ -94,6 +130,8 @@ impl SubagentRegistry {
             inbox_tx: None,
             cancel_reason: None,
             specialist: None,
+            last_activity: tokio::time::Instant::now(),
+            interaction_pending: false,
         });
     }
 
@@ -178,6 +216,48 @@ impl SubagentRegistry {
         entry.cancel_reason = reason;
     }
 
+    /// Refresh a tracked child's last-activity heartbeat (T1-3). Called by
+    /// the child's event fanout for EVERY observed child event — proof of
+    /// life, whether or not the event is parent-visible. No-op for unknown
+    /// ids (e.g. a heartbeat racing the registry fold at resume).
+    pub fn note_activity(&self, child_session_id: &str) {
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(entry) = entries
+            .iter_mut()
+            .find(|e| e.session_id == child_session_id)
+        else {
+            return;
+        };
+        entry.last_activity = tokio::time::Instant::now();
+    }
+
+    /// Mark a tracked child as blocked on a pending approval/question (a
+    /// legal wait the stalled-child watchdog skips), or clear the flag.
+    /// See `SubagentRegistryEntry::interaction_pending` — children are
+    /// structurally non-interactive today, so this is a guarded seam.
+    pub fn set_interaction_pending(&self, child_session_id: &str, pending: bool) {
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(entry) = entries
+            .iter_mut()
+            .find(|e| e.session_id == child_session_id)
+        else {
+            return;
+        };
+        entry.interaction_pending = pending;
+    }
+
+    /// Whether a mutating control lease (cancel/revive) is currently held
+    /// for this task — the stalled-child watchdog skips such entries: a
+    /// control operation in flight is legitimate activity, and stall-
+    /// flagging mid-revive would race the revive's own cancel-wait.
+    pub fn has_control_lease(&self, session_id: &str) -> bool {
+        let held = self
+            .control_leases
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        held.contains(session_id)
+    }
+
     /// Drop a child's live control handles (and any spent cancel reason).
     /// Called automatically by [`Self::record_terminal`] — terminal tasks
     /// have no live handles — and safe to call directly/idempotently.
@@ -212,15 +292,33 @@ impl SubagentRegistry {
         else {
             return;
         };
-        entry.state = state;
-        if result_summary.is_some() {
-            entry.result_summary = result_summary;
+        fold_entry_terminal(entry, state, result_summary);
+    }
+
+    /// [`Self::record_terminal`], but the transition fires ONLY while the
+    /// entry is still `Running` — the exactly-once seam the stalled-child
+    /// watchdog (T1-3) uses. Checking and mutating under the SAME lock
+    /// makes the transition idempotent against both the watchdog's own
+    /// re-scans (already-terminal entries are skipped) and a REAL terminal
+    /// fold racing the scan (a child that finished while the watchdog was
+    /// about to declare it stalled keeps its true terminal state). Returns
+    /// the post-transition entry when the transition fired, `None`
+    /// otherwise.
+    pub fn record_terminal_if_running(
+        &self,
+        child_session_id: &str,
+        state: ChildSessionState,
+        result_summary: Option<String>,
+    ) -> Option<SubagentRegistryEntry> {
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = entries
+            .iter_mut()
+            .find(|e| e.session_id == child_session_id)?;
+        if entry.state != ChildSessionState::Running {
+            return None;
         }
-        // Terminal tasks have no live handles; the cancel reason has been
-        // folded into the terminal result_summary by the caller.
-        entry.cancel_flag = None;
-        entry.inbox_tx = None;
-        entry.cancel_reason = None;
+        fold_entry_terminal(entry, state, result_summary);
+        Some(entry.clone())
     }
 
     /// Fold a revive transition: the entry flips back to `Running` with a
@@ -241,6 +339,11 @@ impl SubagentRegistry {
         entry.generation += 1;
         entry.result_summary = None;
         entry.cancel_reason = None;
+        // A revived child starts a fresh liveness clock (T1-3): the
+        // previous generation's silence must not immediately stall-flag
+        // the new run.
+        entry.last_activity = tokio::time::Instant::now();
+        entry.interaction_pending = false;
         Some(entry.generation)
     }
 
@@ -288,16 +391,32 @@ impl SubagentRegistry {
                 if result_summary.is_some() {
                     entry.result_summary = result_summary.clone();
                 }
+                // Observed lifecycle event = activity (T1-3 heartbeat).
+                entry.last_activity = tokio::time::Instant::now();
             }
             AgentEvent::ChildSessionCompleted {
                 child_session_id,
                 status,
                 ..
-            } => self.record_terminal(
-                child_session_id,
-                ChildSessionState::from_spawn_status(status),
-                None,
-            ),
+            } => {
+                // Observed lifecycle event = activity (T1-3 heartbeat),
+                // stamped BEFORE the fold (the entry lookup below can early-
+                // return for unknown ids).
+                {
+                    let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Some(entry) = entries
+                        .iter_mut()
+                        .find(|e| e.session_id == *child_session_id)
+                    {
+                        entry.last_activity = tokio::time::Instant::now();
+                    }
+                }
+                self.record_terminal(
+                    child_session_id,
+                    ChildSessionState::from_spawn_status(status),
+                    None,
+                )
+            }
             _ => {}
         }
     }
@@ -948,6 +1067,33 @@ async fn handle_cancel_request(
     // documents that the abort itself is asynchronous and un-leased).
     drop(_lease);
     response
+}
+
+/// Batch-cancel every `Running` child in the registry (T2-1 emergency
+/// kill-all, `Ctrl+X K` in the TUI). This is the SAME per-child path as a
+/// `task_cancel` request — [`handle_cancel_request`] with its control
+/// lease, identity fence, cooperative flag flip, and reason bookkeeping —
+/// never a second abort mechanism. Terminal (or non-running) entries are
+/// not targets; an entry whose lease is held by an in-flight control
+/// operation reports `ok = false` with that note instead of blocking the
+/// batch. Returns `(child_session_id, response)` per target in registry
+/// (spawn) order so callers can log failures per session and summarize.
+pub async fn cancel_all_running(
+    registry: &SubagentRegistry,
+    reason: &str,
+) -> Vec<(String, SubagentControlResponse)> {
+    let targets: Vec<String> = registry
+        .list()
+        .into_iter()
+        .filter(|entry| entry.state == ChildSessionState::Running)
+        .map(|entry| entry.session_id.clone())
+        .collect();
+    let mut outcomes = Vec::with_capacity(targets.len());
+    for session_id in targets {
+        let response = handle_cancel_request(registry, &session_id, Some(reason.to_string())).await;
+        outcomes.push((session_id, response));
+    }
+    outcomes
 }
 
 /// `task_result` reply for a registry-known task: running tasks report
@@ -2265,5 +2411,78 @@ mod tests {
             Some("another control operation is in flight for this task")
         );
         assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    // ── T2-1: emergency kill-all (batch cancel) ───────────────────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_all_running_cancels_every_running_child_and_collects_outcomes() {
+        let registry = Arc::new(SubagentRegistry::new());
+        // Two running children with real handles, one terminal task, one
+        // never-registered id — only the running pair are targets.
+        let (flag_a, _rx_a) = running_child_with_inbox(&registry, "run-a", 16);
+        let (flag_b, _rx_b) = running_child_with_inbox(&registry, "run-b", 16);
+        registry.record_spawned("parent", "done-c", "t", "/ws".into(), None);
+        registry.record_terminal("done-c", ChildSessionState::Completed, Some("ok".into()));
+
+        let outcomes = cancel_all_running(&registry, "kill-all (Ctrl+X K)").await;
+
+        assert_eq!(outcomes.len(), 2, "only Running entries are targeted");
+        assert_eq!(outcomes[0].0, "run-a");
+        assert_eq!(outcomes[1].0, "run-b");
+        for (_, resp) in &outcomes {
+            assert!(resp.ok, "running targets must accept the cancel: {resp:?}");
+        }
+        // Same per-child semantics as task_cancel: flag flipped, reason
+        // recorded (folded into a later terminal summary), state still
+        // Running until the child aborts cooperatively.
+        assert!(flag_a.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(flag_b.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            registry
+                .get("run-a")
+                .and_then(|e| e.cancel_reason)
+                .as_deref(),
+            Some("kill-all (Ctrl+X K)")
+        );
+        assert_eq!(
+            registry.get("run-a").map(|e| e.state),
+            Some(ChildSessionState::Running)
+        );
+        assert_eq!(
+            registry.get("done-c").map(|e| e.state),
+            Some(ChildSessionState::Completed),
+            "terminal entries are untouched"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_all_running_reports_leased_child_as_failure_not_block() {
+        let registry = Arc::new(SubagentRegistry::new());
+        let (free_flag, _rx1) = running_child_with_inbox(&registry, "free", 16);
+        let (leased_flag, _rx2) = running_child_with_inbox(&registry, "leased", 16);
+        // An in-flight control operation holds the lease on `leased` — the
+        // batch must NOT block on it; that child reports failure.
+        let _lease = registry.try_acquire_lease("leased").expect("lease");
+
+        let outcomes = cancel_all_running(&registry, "kill-all").await;
+
+        assert_eq!(outcomes.len(), 2);
+        let by_id = |id: &str| {
+            outcomes
+                .iter()
+                .find(|(sid, _)| sid == id)
+                .map(|(_, r)| r.clone())
+                .expect("outcome present")
+        };
+        assert!(by_id("free").ok);
+        assert!(free_flag.load(std::sync::atomic::Ordering::SeqCst));
+        let leased = by_id("leased");
+        assert!(!leased.ok, "leased child reports failure: {leased:?}");
+        assert_eq!(
+            leased.note.as_deref(),
+            Some("another control operation is in flight for this task")
+        );
+        assert!(!leased_flag.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

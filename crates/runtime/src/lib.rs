@@ -13,6 +13,7 @@ pub mod sandbox;
 pub mod service;
 pub mod session_store;
 pub mod session_utils;
+pub mod stall_watch;
 pub mod subagent;
 pub mod subagent_registry;
 pub mod supervisor;
