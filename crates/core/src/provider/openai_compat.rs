@@ -647,6 +647,15 @@ pub struct CompatProfile {
     pub endpoint_suffix: &'static str,
     /// How prepare_messages_for_request treats reasoning_content.
     pub reasoning: ReasoningWirePolicy,
+    /// Model-name marker implying thinking mode for providers whose thinking
+    /// is carried by the MODEL NAME rather than a `thinking` wire field
+    /// (DeepSeek: `deepseek-reasoner`). When the configured model contains
+    /// this marker, thinking is considered enabled — relevant only for
+    /// `StripUnlessThinking` policies: DeepSeek's thinking-mode API REQUIRES
+    /// `reasoning_content` pass-back on assistant history (omitting it is a
+    /// 400: "Then `reasoning_content` in the thinking mode must be passed
+    /// back to the API"), exactly like MiMo's thinking-on contract.
+    pub thinking_model_marker: Option<&'static str>,
     /// Whether to send `stream_options: {include_usage: true}` on the wire.
     pub send_stream_options: bool,
     /// Whether to send the output cap as `max_completion_tokens` instead of
@@ -664,6 +673,9 @@ pub struct OpenAiCompatProvider {
     base_url: String,
     endpoint_suffix: &'static str,
     reasoning: ReasoningWirePolicy,
+    /// Model-name marker implying thinking mode (DeepSeek `deepseek-reasoner`);
+    /// see [`CompatProfile::thinking_model_marker`].
+    thinking_model_marker: Option<&'static str>,
     send_stream_options: bool,
     use_max_completion_tokens: bool,
     /// Vendor-specific request-body override merged into every
@@ -722,6 +734,7 @@ impl OpenAiCompatProvider {
             base_url: compat.base_url().to_string(),
             endpoint_suffix: profile.endpoint_suffix,
             reasoning: profile.reasoning,
+            thinking_model_marker: profile.thinking_model_marker,
             send_stream_options: profile.send_stream_options,
             use_max_completion_tokens: profile.use_max_completion_tokens,
             thinking: None,
@@ -745,13 +758,21 @@ impl OpenAiCompatProvider {
         )
     }
 
-    /// Whether the vendor `thinking` override is present and set to
-    /// `"enabled"`. `None` (no override) and any other type value count as
-    /// disabled.
+    /// Whether thinking mode is active for the provider's configured model:
+    /// either the vendor `thinking` override is present and `"enabled"`, or
+    /// the profile carries a [`CompatProfile::thinking_model_marker`] and the
+    /// configured model name contains it (DeepSeek `deepseek-reasoner`).
+    /// `None` (no override) and any other type value count as disabled.
     fn thinking_enabled(&self) -> bool {
-        self.thinking
+        if self
+            .thinking
             .as_ref()
             .is_some_and(|t| t.get("type").and_then(Value::as_str) == Some("enabled"))
+        {
+            return true;
+        }
+        self.thinking_model_marker
+            .is_some_and(|marker| self.model.contains(marker))
     }
 
     /// Apply profile-specific wire-format tweaks to a request body built by
@@ -788,12 +809,13 @@ impl Provider for OpenAiCompatProvider {
         let strip = match self.reasoning {
             ReasoningWirePolicy::Keep => false,
             ReasoningWirePolicy::Strip => true,
-            // MiMo: once thinking is enabled, assistant messages carrying
-            // tool_calls MUST pass reasoning_content back verbatim (omitting
-            // it is a guaranteed 400); with thinking off, stripping saves
-            // context like DeepSeek.
             ReasoningWirePolicy::StripUnlessThinking => !self.thinking_enabled(),
         };
+        // StripUnlessThinking providers (MiMo, DeepSeek): once thinking is
+        // active, assistant messages carrying tool_calls MUST pass
+        // reasoning_content back verbatim (omitting it is a guaranteed 400);
+        // with thinking off, stripping saves context (DeepSeek deepseek-chat,
+        // MiMo thinking disabled).
         if strip {
             for msg in messages.iter_mut() {
                 msg.reasoning_content = None;

@@ -16,6 +16,7 @@ const OPENAI_PROFILE: CompatProfile = CompatProfile {
     name: "OpenAI",
     endpoint_suffix: "v1/chat/completions",
     reasoning: ReasoningWirePolicy::Keep,
+    thinking_model_marker: None,
     send_stream_options: true,
     use_max_completion_tokens: false,
 };
@@ -24,6 +25,7 @@ const OPENROUTER_PROFILE: CompatProfile = CompatProfile {
     name: "OpenRouter",
     endpoint_suffix: "v1/chat/completions",
     reasoning: ReasoningWirePolicy::Keep,
+    thinking_model_marker: None,
     send_stream_options: true,
     use_max_completion_tokens: false,
 };
@@ -34,8 +36,9 @@ const ZHIPUAI_PROFILE: CompatProfile = CompatProfile {
     // GLM thinking models stream `reasoning_content`, but the API treats it
     // as output-only: echoing it back inside assistant history is rejected
     // with a 400, killing multi-turn tool loops (subagents) mid-flight.
-    // Strip before re-upload, mirroring the DeepSeek contract.
+    // Strip before re-upload (opposite of DeepSeek/MiMo thinking contracts).
     reasoning: ReasoningWirePolicy::Strip,
+    thinking_model_marker: None,
     send_stream_options: true,
     use_max_completion_tokens: false,
 };
@@ -43,7 +46,16 @@ const ZHIPUAI_PROFILE: CompatProfile = CompatProfile {
 const DEEPSEEK_PROFILE: CompatProfile = CompatProfile {
     name: "DeepSeek",
     endpoint_suffix: "chat/completions",
-    reasoning: ReasoningWirePolicy::Strip,
+    // DeepSeek's contract is MODE-DEPENDENT and changed with the thinking
+    // API: thinking models (deepseek-reasoner; marker below) REQUIRE
+    // reasoning_content pass-back on assistant history (omitting it is a
+    // 400: "Then `reasoning_content` in the thinking mode must be passed
+    // back to the API"); non-thinking models (deepseek-chat) reject the
+    // field / waste tokens on it, so it is stripped there. Same shape as
+    // MiMo's StripUnlessThinking. (History: the pre-2026-10 documented
+    // contract was output-only for ALL models — that flipped.)
+    reasoning: ReasoningWirePolicy::StripUnlessThinking,
+    thinking_model_marker: Some("reasoner"),
     send_stream_options: true,
     use_max_completion_tokens: false,
 };
@@ -52,6 +64,7 @@ const MIMO_PROFILE: CompatProfile = CompatProfile {
     name: "MiMo",
     endpoint_suffix: "chat/completions",
     reasoning: ReasoningWirePolicy::StripUnlessThinking,
+    thinking_model_marker: None,
     send_stream_options: false,
     use_max_completion_tokens: true,
 };

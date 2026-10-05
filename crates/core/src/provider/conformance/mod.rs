@@ -470,6 +470,7 @@ async fn real_parser_agrees_with_reference_on_whole_block() {
         name: "conformance",
         endpoint_suffix: "v1/chat/completions",
         reasoning: ReasoningWirePolicy::Keep,
+        thinking_model_marker: None,
         send_stream_options: true,
         use_max_completion_tokens: false,
     };

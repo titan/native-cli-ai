@@ -18,6 +18,7 @@ mod tests {
         name: "mimo",
         endpoint_suffix: "chat/completions",
         reasoning: ReasoningWirePolicy::StripUnlessThinking,
+        thinking_model_marker: None,
         send_stream_options: false,
         use_max_completion_tokens: true,
     };

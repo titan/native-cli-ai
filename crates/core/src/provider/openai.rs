@@ -17,6 +17,7 @@ mod tests {
         name: "OpenAI",
         endpoint_suffix: "v1/chat/completions",
         reasoning: ReasoningWirePolicy::Keep,
+        thinking_model_marker: None,
         send_stream_options: true,
         use_max_completion_tokens: false,
     };

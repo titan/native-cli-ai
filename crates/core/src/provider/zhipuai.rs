@@ -19,6 +19,7 @@ mod tests {
         name: "zhipuai",
         endpoint_suffix: "chat/completions",
         reasoning: ReasoningWirePolicy::Strip,
+        thinking_model_marker: None,
         send_stream_options: true,
         use_max_completion_tokens: false,
     };

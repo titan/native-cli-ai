@@ -52,7 +52,7 @@ Infrastructure modules in the same directory:
 - `test_support.rs` / `validate.rs` — test harness helpers and provider config validation.
 
 - `core` depends on `genai 0.5` (multi-provider LLM library) and `rmcp 1.7` (MCP client).
-- `prepare_messages_for_request()` is the hook for provider-specific message rewriting (e.g. DeepSeek strips `reasoning_content`).
+- `prepare_messages_for_request()` is the hook for provider-specific message rewriting (e.g. provider-conditional `reasoning_content` handling).
 - **Provider fallback** (`[fallback]`, default off): `factory::build_provider_with_events` wraps the primary in `provider::fallback::FallbackProvider` — tight failover classes (429/5xx/408/network/content-moderation 400/empty completion), zero-content mid-stream rule (never retry after any chunk was delivered), per-instance throttle (`initial_retry_delay_ms`/`retry_delay_ms`), loud `ProviderError::FallbackExhausted` on chain end, and an `AgentEvent::ProviderFallback` notification per switch (never silent).
 - Never hard-code a model name. Always read from config (`common::config::NcaConfig`).
 - Empty completions must fail loudly (never silently succeed).
@@ -108,7 +108,7 @@ The system has several size guards to prevent context window overflow:
 - `list_directory` capped at 1000 entries.
 - Skill descriptions clipped to 120 chars in system prompt index.
 - Skills index capped at 4000 chars in `harness.rs`.
-- `reasoning_content` from DeepSeek is stripped before re-upload (response-only signal, ~500 tokens saved per turn).
+- `reasoning_content` wire contracts are MODE- AND PROVIDER-SPECIFIC (verify against the CURRENT API docs before changing): DeepSeek thinking models (`deepseek-reasoner`) REQUIRE pass-back on assistant history (omitting is a 400 since the 2026-10 thinking API; `deepseek-chat` strips to save ~500 tokens/turn); ZhipuAI GLM treats it as output-only (echoing is a 400); MiMo requires pass-back only when thinking is enabled; OpenAI/OpenRouter keep as-is. Encoded in `ReasoningWirePolicy` + `CompatProfile`.
 - Cost tracker includes cache token accounting (cache_read priced at 1/50 of normal input).
 
 ## TUI Architecture
