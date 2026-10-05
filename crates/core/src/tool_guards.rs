@@ -26,6 +26,16 @@ const STRONG_HINT_THRESHOLD: u32 = 5;
 /// Escalation threshold for the hard stop.
 const STOP_THRESHOLD: u32 = 8;
 
+/// Progress-gated count decay: when a key repeats only after at least this
+/// many NOVEL (first-time) calls were recorded since its last occurrence,
+/// the repeat is treated as fresh (count resets to 1) instead of climbing.
+/// This distinguishes "looping without progress" (alternating A/B/A/B never
+/// accrues enough novel calls to decay) from "the same call became useful
+/// again after real progress" — e.g. a research session re-running a search
+/// after several OTHER queries landed new context. Without decay, the
+/// session-lifetime count hard-stops legitimate late repeats at 8.
+const PROGRESS_DECAY_NOVEL: u32 = 4;
+
 /// Wait tools whose contract is "end this turn now" (P4 wait-guard, after
 /// oh-my-opencode-slim's tool-loop-guard #1139). A repeat within one turn is
 /// always degenerate: the first result already told the model to stop calling
@@ -61,13 +71,24 @@ pub enum RepeatAction {
 /// Keys are `hash(tool_name + canonical serde_json serialization of input)`.
 /// The recent-calls window is capped at [`RECENT_CALLS_CAP`] entries with FIFO
 /// eviction; eviction is **lazy**: dropping a key from the window never resets
-/// a survivor's running count, and a key re-recorded after eviction resumes
-/// its historical count. Counts live for the lifetime of the guard.
+/// a survivor's running count. Counts live for the lifetime of the guard,
+/// EXCEPT they are reset by progress-gated decay: a key repeated only after
+/// at least [`PROGRESS_DECAY_NOVEL`] novel (first-time) calls since its last
+/// occurrence restarts fresh — repeats without intervening progress keep
+/// climbing, which is the actual loop signal.
 pub struct RepeatCallGuard {
     /// Running call count per canonical key (persists across evictions).
     counts: HashMap<u64, u32>,
     /// Recency window of live keys, capped at [`RECENT_CALLS_CAP`] (FIFO).
     order: VecDeque<u64>,
+    /// Monotonic counter of novel (first-time) calls recorded so far — one
+    /// tick per new key. Repeats do not tick it. Used for progress-gated
+    /// decay: a repeat is "fresh" again only after enough novel work
+    /// happened in between (see [`PROGRESS_DECAY_NOVEL`]).
+    progress_seq: u32,
+    /// Per-key snapshot of `progress_seq` at the key's last record, so the
+    /// next repeat can measure how much novel work happened in between.
+    key_progress: HashMap<u64, u32>,
     /// Wait-tool calls in the CURRENT turn, keyed by tool name. Reset by
     /// [`RepeatCallGuard::reset_turn`] at every turn start; never enters the
     /// generic `counts` map above.
@@ -80,6 +101,8 @@ impl RepeatCallGuard {
         Self {
             counts: HashMap::new(),
             order: VecDeque::new(),
+            progress_seq: 0,
+            key_progress: HashMap::new(),
             wait_turn_runs: HashMap::new(),
         }
     }
@@ -95,21 +118,38 @@ impl RepeatCallGuard {
         }
         let key = canonical_key(tool_name, input);
         let count = {
-            let entry = self.counts.entry(key).or_insert(0);
-            *entry += 1;
-            if *entry == 1 {
-                self.order.push_back(key);
-            } else if let Some(pos) = self.order.iter().position(|&k| k == key) {
-                // Refresh recency so a still-active key is evicted last.
-                self.order.remove(pos);
-                self.order.push_back(key);
+            // Progress-gated decay: measure how much NOVEL work happened
+            // since this key's last record. Enough intervening novel calls
+            // mean the repeat is contextually fresh, not a loop — reset the
+            // running count to 1. Too little (alternating retries, immediate
+            // re-issues) keeps the count climbing.
+            let last_progress = self.key_progress.get(&key).copied().unwrap_or(0);
+            if self.progress_seq.saturating_sub(last_progress) >= PROGRESS_DECAY_NOVEL {
+                self.counts.insert(key, 0);
             }
+            let entry = self.counts.entry(key).or_insert(0);
+            let was_novel = *entry == 0;
+            *entry += 1;
+            if was_novel {
+                self.progress_seq = self.progress_seq.saturating_add(1);
+            }
+            // Snapshot AFTER this record's own novel tick, so the next
+            // repeat's delta counts only the novel calls recorded strictly
+            // after this one (an off-by-one here double-credits the decay).
+            self.key_progress.insert(key, self.progress_seq);
+            if let Some(pos) = self.order.iter().position(|&k| k == key) {
+                // Refresh recency so a still-active key is evicted last
+                // (also dedupes after a decay reset re-bumps a live key).
+                self.order.remove(pos);
+            }
+            self.order.push_back(key);
             *entry
         };
 
         // FIFO eviction bounds the recency window. Lazy: the evicted key's
         // count is intentionally kept so survivors never lose escalation
-        // state (contract: eviction must not reset live counts).
+        // state to eviction alone (progress-gated decay above is the only
+        // count reset short of `reset_session`).
         while self.order.len() > RECENT_CALLS_CAP {
             let _ = self.order.pop_front();
         }
@@ -117,12 +157,15 @@ impl RepeatCallGuard {
         if count >= STOP_THRESHOLD {
             RepeatAction::Stop(format!(
                 "[guard] 你已连续第 {count} 次用完全相同的参数调用 `{tool_name}`，该调用已被硬停。\
-                 继续重复不会产生新结果：请改变策略——换用其它工具、修改参数、或先阅读之前的工具输出再决定下一步。"
+                 继续重复不会产生新结果。{}\
+                 如果确实没有替代方案，请停止调用任何工具，直接给出说明缺口与已尝试内容的部分结果来结束回合——干净的失败报告远优于原地打转。",
+                variation_advice(tool_name)
             ))
         } else if count >= STRONG_HINT_THRESHOLD {
             RepeatAction::StrongHint(format!(
-                "[guard] ⚠ 你已第 {count} 次用完全相同的参数调用 `{tool_name}`——这几乎肯定是在原地打转。\
-                 请立刻停下来分析上一次的输出，或改用不同的方法。"
+                "[guard] ⚠ 你已第 {count} 次用完全相同的参数调用 `{tool_name}`——这几乎肯定是在原地打转。{}
+                 请立刻停下来分析上一次的输出，或改用不同的方法。",
+                variation_advice(tool_name)
             ))
         } else if count >= HINT_THRESHOLD {
             RepeatAction::Hint(format!(
@@ -208,6 +251,33 @@ fn canonical_key(tool_name: &str, input: &serde_json::Value) -> u64 {
 /// Whether `tool_name` is a wait tool on the dedicated per-turn path.
 fn is_wait_tool(tool_name: &str) -> bool {
     WAIT_TOOLS.contains(&tool_name)
+}
+
+/// Concrete, tool-specific variation strategies appended to StrongHint and
+/// Stop messages. Research-type agents stall on generic "change strategy"
+/// advice because they cannot think of an alternative — naming the exact
+/// moves for the tools they are looping on converts a dead-end refusal into
+/// an actionable redirect (observed: three subagent sessions killed by the
+/// guard while re-issuing identical `web_search`/`search_code` calls).
+fn variation_advice(tool_name: &str) -> &'static str {
+    match tool_name {
+        "web_search" => {
+            "可尝试的具体替代：换同义关键词、限定 site: 域名、拆分成更窄的子查询、或对已有结果中的 URL 改用 fetch_url 直取原文。"
+        }
+        "fetch_url" => {
+            "可尝试的具体替代：检查 URL 是否拼写正确/协议是否为 https、改用 web_search 先找到正确链接、或抓取该站的其它页面。"
+        }
+        "search_code" | "ast_grep_search" => {
+            "可尝试的具体替代：放宽或收紧正则、换大小写敏感开关、改搜标识符的其它片段、或用 query_symbols/read_file 直接定位。"
+        }
+        "query_symbols" => {
+            "可尝试的具体替代：换更短或更完整的符号名、用 search_code 全文搜索定义处、或 read_file 直接读目标模块。"
+        }
+        "read_file" | "list_directory" => {
+            "可尝试的具体替代：先 list_directory 确认路径存在、检查大小写与相对路径基准、或用 search_code 定位内容后再读。"
+        }
+        _ => "请改变策略——换用其它工具、修改参数、或先阅读之前的工具输出再决定下一步。",
+    }
 }
 
 #[cfg(test)]
@@ -355,6 +425,139 @@ mod tests {
             guard.record("ask_question", &input),
             RepeatAction::Hint(_)
         ));
+    }
+
+    #[test]
+    fn progress_decay_treats_post_progress_repeats_as_fresh() {
+        let mut guard = RepeatCallGuard::new();
+        let q = json!({"query": "glm reasoning_content"});
+        assert_eq!(guard.record("web_search", &q), RepeatAction::Proceed);
+
+        // Burn the key toward escalation WITHOUT intervening novel work.
+        for _ in 0..6 {
+            let _ = guard.record("web_search", &q);
+        }
+        // 7 identical calls so far; the 8th would Stop. Instead, do 4 NOVEL
+        // calls (distinct queries) — enough progress to decay the count.
+        for i in 0..4 {
+            let _ = guard.record("web_search", &json!({"query": format!("other {i}")}));
+        }
+        // The same query again is contextually fresh: count resets to 1.
+        assert_eq!(
+            guard.record("web_search", &q),
+            RepeatAction::Proceed,
+            "repeat after 4+ novel calls must be treated as fresh"
+        );
+    }
+
+    #[test]
+    fn decay_requires_enough_novel_work() {
+        let mut guard = RepeatCallGuard::new();
+        let q = json!({"path": "same"});
+        assert_eq!(guard.record("read_file", &q), RepeatAction::Proceed);
+        // Only 3 novel calls in between — below the decay threshold.
+        for i in 0..3 {
+            let _ = guard.record("read_file", &json!({"path": format!("n{i}")}));
+        }
+        assert_eq!(
+            guard.record("read_file", &q),
+            RepeatAction::Proceed,
+            "second call (count 2) still proceeds"
+        );
+        // 3 more novel calls, then the repeat lands on count 3 = Hint, not a
+        // reset — decay needs >= 4 novel calls between occurrences.
+        for i in 3..6 {
+            let _ = guard.record("read_file", &json!({"path": format!("n{i}")}));
+        }
+        assert!(
+            matches!(guard.record("read_file", &q), RepeatAction::Hint(_)),
+            "insufficient progress must keep the count climbing"
+        );
+    }
+
+    #[test]
+    fn alternating_repeats_without_progress_still_stop() {
+        // A/B alternation never accrues novel work between repeats — the
+        // classic degenerate loop must still escalate to Stop.
+        let mut guard = RepeatCallGuard::new();
+        let a = json!({"query": "a"});
+        let b = json!({"query": "b"});
+        let mut a_stopped = false;
+        let mut b_stopped = false;
+        for _ in 0..12 {
+            if let RepeatAction::Stop(_) = guard.record("web_search", &a) {
+                a_stopped = true;
+            }
+            if let RepeatAction::Stop(_) = guard.record("web_search", &b) {
+                b_stopped = true;
+            }
+        }
+        assert!(a_stopped && b_stopped, "alternation must still be stopped");
+    }
+
+    #[test]
+    fn stop_message_carries_surrender_path_and_tool_advice() {
+        let mut guard = RepeatCallGuard::new();
+        let q = json!({"query": "stuck"});
+        for _ in 0..7 {
+            let _ = guard.record("web_search", &q);
+        }
+        match guard.record("web_search", &q) {
+            RepeatAction::Stop(msg) => {
+                assert!(
+                    msg.contains("site:"),
+                    "web_search stop must name concrete alternatives: {msg}"
+                );
+                assert!(
+                    msg.contains("结束回合"),
+                    "stop must offer the surrender path (end turn with partial result): {msg}"
+                );
+            }
+            other => panic!("8th identical call must Stop, got {other:?}"),
+        }
+
+        // Unknown tools keep a generic (but still actionable) message.
+        let mut guard = RepeatCallGuard::new();
+        let x = json!({});
+        for _ in 0..7 {
+            let _ = guard.record("some_custom_tool", &x);
+        }
+        match guard.record("some_custom_tool", &x) {
+            RepeatAction::Stop(msg) => {
+                assert!(
+                    msg.contains("结束回合"),
+                    "generic stop must still offer the surrender path: {msg}"
+                );
+                assert!(
+                    !msg.contains("site:"),
+                    "generic stop must not carry web_search-specific advice: {msg}"
+                );
+            }
+            other => panic!("8th identical call must Stop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decay_does_not_duplicate_the_recency_window() {
+        // Regression: a decayed key is already in the `order` window; the
+        // re-record must refresh its position, not push a second copy (a
+        // duplicate entry would corrupt FIFO eviction accounting).
+        let mut guard = RepeatCallGuard::new();
+        let q = json!({"query": "x"});
+        let _ = guard.record("web_search", &q);
+        for i in 0..4 {
+            let _ = guard.record("web_search", &json!({"query": format!("n{i}")}));
+        }
+        assert_eq!(guard.record("web_search", &q), RepeatAction::Proceed);
+        assert_eq!(
+            guard
+                .order
+                .iter()
+                .filter(|&&k| k == canonical_key("web_search", &q))
+                .count(),
+            1,
+            "decayed key must appear exactly once in the recency window"
+        );
     }
 
     #[test]

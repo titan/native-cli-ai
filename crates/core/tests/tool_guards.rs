@@ -239,20 +239,26 @@ fn recent_calls_evict_oldest_fifo_without_resetting_survivors() {
         "evicted entry must be forgotten, not kept with a stale count"
     );
 
-    // A survivor keeps its running count across the eviction: f1 was called
-    // once during the fill; the 2nd call is Proceed and the 3rd escalates,
-    // proving the other insertions/evictions did not reset its counter.
+    // A survivor's historical count persists ONLY while no progress happens:
+    // eviction alone never resets it, but enough intervening NOVEL calls do
+    // (progress-gated decay — the fill above produced 33 novel calls, so
+    // every fill-era key is contextually fresh again).
     assert_eq!(
         guard.record("read_file", &json!({"path": "/tmp/f1"})),
         RepeatAction::Proceed,
-        "survivor 2nd call must still be below threshold"
+        "survivor after mass novel work is decayed to fresh"
+    );
+    assert_eq!(
+        guard.record("read_file", &json!({"path": "/tmp/f1"})),
+        RepeatAction::Proceed,
+        "immediate repeat (no novel work between) climbs to count 2"
     );
     assert!(
         matches!(
             guard.record("read_file", &json!({"path": "/tmp/f1"})),
             RepeatAction::Hint(_)
         ),
-        "survivor 3rd call must escalate: its count must persist across evictions"
+        "third repeat without any intervening novel call must escalate — counts persist when there is no progress"
     );
 }
 
