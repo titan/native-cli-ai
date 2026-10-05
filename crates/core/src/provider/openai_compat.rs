@@ -877,12 +877,24 @@ impl Provider for OpenAiCompatProvider {
         &self,
         snapshot: &KeepaliveSnapshot,
     ) -> Result<PingUsage, ProviderError> {
+        // Normalize the prefix exactly like the next real request will: the
+        // snapshot is cloned from `agent.messages` at the tool-pause point,
+        // BEFORE the next turn's `prepare_messages_for_request` runs, so it
+        // can still carry output-only fields (e.g. `reasoning_content`) that
+        // strip-providers (DeepSeek, ZhipuAI GLM thinking) reject with a 400
+        // when echoed back. Stripping here both prevents that 400 and makes
+        // the warmed prefix byte-identical to the next request's prefix,
+        // maximizing the cache hit.
+        let mut messages = snapshot.messages.clone();
+        self.prepare_messages_for_request(&mut messages, &snapshot.workspace_root)
+            .await?;
+
         // Build the request with max_tokens=1 to minimise output cost.
         // The input prefix is what we're paying for — it refreshes the cache.
         // Deliberately NOT clamped: the capability clamp would raise this to
         // the 128K floor, billing a full completion just to refresh the cache.
         let mut body = openai_request_body(
-            &snapshot.messages,
+            &messages,
             &snapshot.tools,
             &snapshot.model,
             1, // max_tokens = 1

@@ -31,7 +31,11 @@ const OPENROUTER_PROFILE: CompatProfile = CompatProfile {
 const ZHIPUAI_PROFILE: CompatProfile = CompatProfile {
     name: "ZhipuAI",
     endpoint_suffix: "chat/completions",
-    reasoning: ReasoningWirePolicy::Keep,
+    // GLM thinking models stream `reasoning_content`, but the API treats it
+    // as output-only: echoing it back inside assistant history is rejected
+    // with a 400, killing multi-turn tool loops (subagents) mid-flight.
+    // Strip before re-upload, mirroring the DeepSeek contract.
+    reasoning: ReasoningWirePolicy::Strip,
     send_stream_options: true,
     use_max_completion_tokens: false,
 };

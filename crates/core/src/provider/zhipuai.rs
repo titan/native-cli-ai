@@ -18,7 +18,7 @@ mod tests {
     const ZHIPUAI_PROFILE: CompatProfile = CompatProfile {
         name: "zhipuai",
         endpoint_suffix: "chat/completions",
-        reasoning: ReasoningWirePolicy::Keep,
+        reasoning: ReasoningWirePolicy::Strip,
         send_stream_options: true,
         use_max_completion_tokens: false,
     };
@@ -75,6 +75,95 @@ mod tests {
                 ..
             }
         ));
+        assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
+    }
+
+    #[tokio::test]
+    async fn zhipuai_prepare_strips_reasoning_content() {
+        // GLM thinking models (glm-5.x; 5.3 cannot disable thinking) stream
+        // `reasoning_content`, but the API rejects the field when it appears
+        // inside assistant history on a subsequent request — a plain 400 that
+        // kills multi-turn tool loops (subagent runs) from the second turn
+        // onward. The profile must strip it before re-upload.
+        let mut config = NcaConfig::default();
+        config.provider.zhipuai.api_key = Some("zhipuai-test-key".into());
+        let provider = OpenAiCompatProvider::from_config(
+            &config.provider.zhipuai,
+            config.model.max_tokens,
+            ZHIPUAI_PROFILE,
+            reqwest::header::HeaderMap::new(),
+        )
+        .expect("provider");
+
+        let mut messages = vec![
+            Message::user("hello"),
+            Message::assistant("response").with_reasoning("thinking...".into()),
+            Message::tool("call_1", "result"),
+        ];
+
+        provider
+            .prepare_messages_for_request(&mut messages, std::path::Path::new("."))
+            .await
+            .expect("prepare");
+
+        // reasoning_content must be stripped for ZhipuAI
+        assert!(messages[1].reasoning_content.is_none());
+        // Other fields unchanged
+        assert_eq!(messages[1].content.to_summary_text(), "response");
+        // User/tool messages unaffected
+        assert!(messages[0].reasoning_content.is_none());
+        assert!(messages[2].reasoning_content.is_none());
+    }
+
+    #[tokio::test]
+    async fn zhipuai_request_body_carries_no_reasoning_content() {
+        // Wire-level guard: even when history contains an assistant message
+        // with reasoning_content recorded, the serialized request body must
+        // not carry the field (this is the exact payload GLM 400s on).
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"index\":0,\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .to_string();
+        let base_url = spawn_sse_server_with_body(body, 200, |request, request_body| {
+            assert_eq!(request.url(), "/chat/completions");
+            let parsed: serde_json::Value =
+                serde_json::from_str(request_body).expect("request body is JSON");
+            let text = request_body;
+            assert!(
+                !text.contains("reasoning_content"),
+                "request body must not echo reasoning_content: {text}"
+            );
+            assert!(parsed["messages"][1]["role"] == "assistant", "body: {text}");
+        });
+
+        let mut config = NcaConfig::default();
+        config.provider.zhipuai.api_key = Some("zhipuai-test-key".into());
+        config.provider.zhipuai.base_url = base_url;
+
+        let provider =
+            build_provider_for(&config, ProviderKind::ZhipuAI).expect("build zhipuai provider");
+        // Mirror the driver contract: prepare_messages_for_request runs on the
+        // history BEFORE chat() (agent_driver.rs calls it ahead of every
+        // request). The wire-level guarantee is "prepared history never
+        // carries reasoning_content", not "chat() re-normalizes internally".
+        let mut history = vec![
+            Message::user("hello"),
+            Message::assistant("prior turn").with_reasoning("secret chain".into()),
+            Message::tool("call_1", "result"),
+            Message::user("continue"),
+        ];
+        provider
+            .prepare_messages_for_request(&mut history, std::path::Path::new("."))
+            .await
+            .expect("prepare");
+        let stream = provider
+            .chat(&history, &[], "", std::path::Path::new("."))
+            .await
+            .expect("chat stream");
+
+        let chunks = collect_chunks(stream).await;
         assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
     }
 
@@ -390,6 +479,10 @@ mod tests {
             // Keepalive hardcodes max_tokens = 1 to minimise output cost.
             assert_eq!(parsed["max_tokens"], 1, "body: {request_body}");
             assert_eq!(parsed["model"], "glm-5.3", "body: {request_body}");
+            assert!(
+                !request_body.contains("reasoning_content"),
+                "keepalive must strip reasoning_content (GLM 400s the echoed field): {request_body}"
+            );
         });
 
         let mut config = NcaConfig::default();
@@ -400,7 +493,15 @@ mod tests {
         let provider =
             build_provider_for(&config, ProviderKind::ZhipuAI).expect("build zhipuai provider");
         let snapshot = KeepaliveSnapshot {
-            messages: vec![Message::user("hello")],
+            // The driver clones this at the tool pause — BEFORE the next
+            // turn's prepare — so a fresh assistant reasoning_content is
+            // present here. keepalive_ping must strip it itself (GLM 400s
+            // the echoed field exactly like the main chat path).
+            messages: vec![
+                Message::user("hello"),
+                Message::assistant("thinking turn")
+                    .with_reasoning("must not reach the wire".into()),
+            ],
             tools: vec![],
             model: "glm-5.3".into(),
             workspace_root: PathBuf::from("."),
