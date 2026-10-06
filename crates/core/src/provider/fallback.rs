@@ -56,7 +56,7 @@ use nca_common::tool::ToolDefinition;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use super::openai_compat::truncate_bytes_safe;
+use super::openai_compat::{truncate_bytes_safe, truncate_tail_bytes_safe};
 use super::{Provider, ProviderError, StreamChunk};
 use crate::cache_keepalive::{KeepaliveSnapshot, PingUsage};
 
@@ -653,7 +653,7 @@ impl FailureCause {
             FailureCause::Error(err) => format!(
                 "{}: {}",
                 reason_label(err),
-                truncate_bytes_safe(&err.to_string(), 160)
+                truncate_tail_bytes_safe(&err.to_string(), 160)
             ),
             FailureCause::EmptyCompletion => "empty completion".to_string(),
         }

@@ -449,6 +449,23 @@ pub(crate) fn truncate_bytes_safe(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// Keep the LAST `max_bytes` bytes of `s`, prefixing a leading `…` when
+/// anything was cut. Failure chains classify at the tail
+/// (`… → client error (Connect) → operation timed out`); the head is the
+/// request URL. A head cut (like [`truncate_bytes_safe`]) lands mid-URL and
+/// hides exactly the part that names the cause. Lands on UTF-8 char
+/// boundaries by backing FORWARD off a multi-byte start.
+pub(crate) fn truncate_tail_bytes_safe(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut start = s.len() - max_bytes;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &s[start..])
+}
+
 fn tool_content_string(content: &MessageContent) -> String {
     match content {
         MessageContent::Text(t) => t.clone(),
@@ -1036,6 +1053,47 @@ mod tests {
     fn truncate_bytes_safe_returns_input_under_limit() {
         assert_eq!(truncate_bytes_safe("hello", 200), "hello");
         assert_eq!(truncate_bytes_safe("", 500), "");
+    }
+
+    #[test]
+    fn truncate_tail_keeps_classifying_chain_tail() {
+        // The real toast failure: a 160-byte head cut lands mid-URL and drops
+        // the `→ error class` tail that names the cause.
+        let chain = "API request failed: error sending request for url \
+(https://open.bigmodel.cn/api/coding/paas/v4/chat/completions) → client error (Connect) → operation timed out";
+        let truncated = truncate_tail_bytes_safe(chain, 160);
+        assert!(truncated.starts_with('…'));
+        assert!(
+            truncated.ends_with("→ client error (Connect) → operation timed out"),
+            "the classifying tail must survive: {truncated}"
+        );
+        assert!(
+            truncated.len() <= 163,
+            "≤ max_bytes + ellipsis: {}",
+            truncated.len()
+        );
+    }
+
+    #[test]
+    fn truncate_tail_returns_short_input_untouched() {
+        assert_eq!(truncate_tail_bytes_safe("hello", 200), "hello");
+        assert_eq!(truncate_tail_bytes_safe("", 500), "");
+    }
+
+    #[test]
+    fn truncate_tail_never_panics_on_multibyte() {
+        // The cut lands inside a 3-byte CJK glyph; the start must back
+        // FORWARD to a boundary (never slice mid-codepoint).
+        let s = format!("{}爱{}", "a".repeat(160), "b".repeat(50));
+        let truncated = truncate_tail_bytes_safe(&s, 160);
+        assert!(truncated.starts_with('…'));
+        assert!(truncated.ends_with(&"b".repeat(50)));
+        assert!(
+            truncated.len() <= 163,
+            "≤ max_bytes + ellipsis: {}",
+            truncated.len()
+        );
+        assert!(s.ends_with(&truncated[3..]));
     }
 
     // ---- ZhipuAI 1213-class guardrails: prompt payload must deserialize ----
