@@ -680,6 +680,18 @@ pub(crate) fn cleanup_processed_attachments(
     }
 }
 
+/// Render a tool result into the model-visible text for a `tool` role
+/// message.
+///
+/// Successful results render the raw `output`. Failed results prefer a
+/// non-empty `error`, but when `error` is absent or blank they fall back to
+/// the non-empty `output` — some tools attach the real diagnostics to
+/// `output` on failure (e.g. the runtime bash tool stores a non-zero exit's
+/// stdout there, pinned by
+/// `crates/runtime/tests/bash_tool_diagnostics.rs`), and discarding it left
+/// the model with nothing but `"tool failed"`, inviting blind identical
+/// retries. The literal `"tool failed"` is only the both-empty last resort.
+/// The rendered text still passes through [`truncate_tool_output`].
 pub(crate) fn format_tool_result(result: &nca_common::tool::ToolResult) -> String {
     let raw = if result.success {
         result.output.clone()
@@ -687,6 +699,8 @@ pub(crate) fn format_tool_result(result: &nca_common::tool::ToolResult) -> Strin
         result
             .error
             .clone()
+            .filter(|e| !e.trim().is_empty())
+            .or_else(|| (!result.output.trim().is_empty()).then(|| result.output.clone()))
             .unwrap_or_else(|| "tool failed".to_string())
     };
     truncate_tool_output(&raw)
@@ -695,6 +709,69 @@ pub(crate) fn format_tool_result(result: &nca_common::tool::ToolResult) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a `ToolResult` directly — no tools or I/O needed.
+    fn tool_result(
+        success: bool,
+        output: &str,
+        error: Option<&str>,
+    ) -> nca_common::tool::ToolResult {
+        nca_common::tool::ToolResult {
+            call_id: "c1".into(),
+            success,
+            output: output.into(),
+            error: error.map(str::to_string),
+            timed_out: false,
+        }
+    }
+
+    #[test]
+    fn failed_result_prefers_non_empty_error() {
+        let rendered = format_tool_result(&tool_result(false, "some output", Some("boom")));
+        assert_eq!(rendered, "boom");
+    }
+
+    #[test]
+    fn failed_result_falls_back_to_output_when_error_missing() {
+        // The bash-tool failure shape: non-zero exit with stdout stored in
+        // `output` and `error: None`. The diagnostics must reach the model.
+        let rendered = format_tool_result(&tool_result(false, "boom\n", None));
+        assert_eq!(rendered, "boom\n");
+    }
+
+    #[test]
+    fn failed_result_blank_error_is_ignored() {
+        let rendered = format_tool_result(&tool_result(false, "real diagnostics", Some("   ")));
+        assert_eq!(rendered, "real diagnostics");
+    }
+
+    #[test]
+    fn failed_result_with_both_empty_renders_literal() {
+        let rendered = format_tool_result(&tool_result(false, "", None));
+        assert_eq!(rendered, "tool failed");
+        let blanked = format_tool_result(&tool_result(false, "  \n\t", Some("")));
+        assert_eq!(blanked, "tool failed");
+    }
+
+    #[test]
+    fn successful_result_renders_raw_output_unchanged() {
+        let rendered = format_tool_result(&tool_result(true, "all good", Some("ignored")));
+        assert_eq!(rendered, "all good");
+    }
+
+    #[test]
+    fn long_output_fallback_is_truncated() {
+        let big = "x".repeat(MAX_TOOL_OUTPUT_BYTES + 4096);
+        let rendered = format_tool_result(&tool_result(false, &big, None));
+        assert!(
+            rendered.contains("[... truncated "),
+            "overlong fallback output must pass through the truncation guard"
+        );
+        assert!(
+            rendered.len() < MAX_TOOL_OUTPUT_BYTES + 4096,
+            "rendered text must be smaller than the raw input"
+        );
+    }
 
     #[test]
     fn turn_user_message_shapes() {

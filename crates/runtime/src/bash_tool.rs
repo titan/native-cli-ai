@@ -103,13 +103,14 @@ impl ToolExecutor for RuntimeBashTool {
         {
             Ok(out) => {
                 let success = out.exit_code == 0;
-                // Diagnostics for the failed-no-output case go in `error`, NOT
-                // `output`: `format_tool_result` (agent.rs) reads only `error`
-                // for failed results (falling back to the literal "tool
-                // failed"), so `output`-borne diagnostics would never reach
-                // the model. The UI path (ToolCallCompleted / stream.rs)
-                // already renders error-bearing failures gracefully, so the
-                // text is NOT duplicated into both fields.
+                // Diagnostics for the failed-no-output case go in `error`:
+                // `format_tool_result` (agent.rs) renders failed results from
+                // `error` first, falling back to non-empty `output` (a failed
+                // command's stdout is exactly that fallback). Putting the
+                // no-output diagnostics in `error` keeps them distinct from
+                // real stdout, and `output` stays the raw stream for the UI
+                // path (ToolCallCompleted / stream.rs), so the text is NOT
+                // duplicated into both fields.
                 let error = if !success && out.stdout.is_empty() {
                     Some(synthesize_failure_diagnostics(
                         out.exit_code,
