@@ -94,9 +94,28 @@ pub(crate) struct TurnDriver<'a> {
     /// Whether processed attachments have already been cleaned (first
     /// completed stream of the turn).
     attachments_cleaned: bool,
-    /// Consecutive failures of the same tool — stops infinite retry loops.
+    /// Consecutive failing steps on the IDENTICAL-retry track — the batch
+    /// fingerprint (tool name + canonical inputs) exactly matches the
+    /// previous failing step's, i.e. the model is verbatim-retrying. Stops
+    /// infinite retry loops fast (threshold
+    /// [`MAX_CONSECUTIVE_TOOL_FAILURES`]), aligned with the repeat guard's
+    /// hard-stop semantics for true loops.
     consecutive_tool_failures: u32,
     last_failed_tool: String,
+    /// Consecutive failing steps on the VARYING track — the batch
+    /// fingerprint keeps changing, i.e. the model is iterating (bash-only
+    /// debug workflows: sed → build → test, every step pure `execute_bash`,
+    /// legitimately string together 3+ failing steps while fixing). Trips
+    /// at [`MAX_VARYING_CONSECUTIVE_TOOL_FAILURES`] with a one-time warning
+    /// at [`VARYING_FAILURE_WARN_THRESHOLD`].
+    consecutive_varying_failures: u32,
+    /// Fingerprint of the most recent failing step's executor batch
+    /// (0 = no failing step yet this streak; never consulted as a sentinel
+    /// because streak-start is detected via the zeroed counters).
+    last_failed_batch_fingerprint: u64,
+    /// Whether the varying-track warning already fired for the current
+    /// streak (one warning per streak; reset by any non-failed batch).
+    varying_warned: bool,
     /// Diagnostic details from the most recent failure (populated by the
     /// `all_failed_same_tool` branch; only read when the max is reached).
     last_failed_output: String,
@@ -114,6 +133,16 @@ pub(crate) struct TurnDriver<'a> {
 
 const MAX_EMPTY_RETRIES: u32 = 2;
 const MAX_CONSECUTIVE_TOOL_FAILURES: u32 = 3;
+/// Consecutive VARYING-shape failing steps (batch fingerprint keeps
+/// changing — iteration, not verbatim retry) before the turn is force-ended.
+/// Higher than the identical threshold: killing a legitimate fix → test →
+/// fail iteration at 3 aborted normal workflows (the incident shape). True
+/// verbatim loops stay on the fast threshold-3 track (and the repeat guard's
+/// 3/5/8 ladder underneath).
+const MAX_VARYING_CONSECUTIVE_TOOL_FAILURES: u32 = 5;
+/// The varying track emits ONE user-visible warning at this count — a
+/// correction opportunity that does not consume the turn.
+const VARYING_FAILURE_WARN_THRESHOLD: u32 = 3;
 /// Consecutive steps that each contain at least one guard refusal before the
 /// turn is force-ended. The guard only Stops a call on its 8th+ identical
 /// issue, so one refusal-bearing step already implies seven identical priors;
@@ -137,6 +166,9 @@ impl<'a> TurnDriver<'a> {
             attachments_cleaned: attachments.is_empty(),
             consecutive_tool_failures: 0,
             last_failed_tool: String::new(),
+            consecutive_varying_failures: 0,
+            last_failed_batch_fingerprint: 0,
+            varying_warned: false,
             last_failed_output: String::new(),
             last_failed_error: None,
             consecutive_guard_stop_steps: 0,
@@ -690,6 +722,15 @@ impl<'a> TurnDriver<'a> {
         // 20+ guard hard-stops with the breaker silent.) Any successful call
         // or a mixed-tool batch resets the streak — a legitimate fix → test →
         // fail iteration always intersperses edits or reads that succeed.
+        //
+        // Dual-track retry-form discrimination: the step's executor batch is
+        // fingerprinted (tool name + canonical inputs); a fingerprint
+        // identical to the previous failing step's is a verbatim retry
+        // (identical track, threshold 3 — true loops must stop fast), while a
+        // changed fingerprint is iteration (varying track, threshold 5, one
+        // warning at 3). Bash-only debug workflows legitimately string
+        // together failing build/test steps with changing arguments — the
+        // incident's false kill.
         let step_single_tool = executors
             .first()
             .is_some_and(|first| executors.iter().all(|c| c.name == first.name));
@@ -699,26 +740,68 @@ impl<'a> TurnDriver<'a> {
         if all_failed_same_tool {
             let tool_name = &executors[0].name;
             let last_result = &pipeline.results[0];
-            if *tool_name == self.last_failed_tool {
-                self.consecutive_tool_failures += 1;
-            } else {
-                self.last_failed_tool = tool_name.clone();
+            let fingerprint = batch_fingerprint(&executors);
+            let streak_start =
+                self.consecutive_tool_failures == 0 && self.consecutive_varying_failures == 0;
+            if streak_start {
+                // The streak's form is only revealed by its successor, so the
+                // first failing step seeds BOTH tracks: a streak that stays
+                // varying trips at 5 (warning at 3), one that repeats
+                // verbatim trips at 3 — preserving the old breaker's timing
+                // for true loops.
                 self.consecutive_tool_failures = 1;
+                self.consecutive_varying_failures = 1;
+            } else if fingerprint == self.last_failed_batch_fingerprint {
+                // Identical retry shape: the model re-issued the same batch.
+                self.consecutive_tool_failures += 1;
+                self.consecutive_varying_failures = 0;
+            } else {
+                // Changed shape: iteration form.
+                self.consecutive_varying_failures += 1;
+                self.consecutive_tool_failures = 0;
             }
+            self.last_failed_tool = tool_name.clone();
+            self.last_failed_batch_fingerprint = fingerprint;
             // Capture failure details for diagnostics and the final error message.
             self.last_failed_output = last_result.output.clone();
             self.last_failed_error = last_result.error.clone();
             tracing::warn!(
                 tool = %tool_name,
-                attempt = self.consecutive_tool_failures,
-                max_attempts = MAX_CONSECUTIVE_TOOL_FAILURES,
+                identical_attempt = self.consecutive_tool_failures,
+                varying_attempt = self.consecutive_varying_failures,
+                max_identical = MAX_CONSECUTIVE_TOOL_FAILURES,
+                max_varying = MAX_VARYING_CONSECUTIVE_TOOL_FAILURES,
                 output = %crate::agent::truncate_str(&last_result.output, 500),
                 error = ?last_result.error,
                 "consecutive tool failure detected"
             );
+            // One-time warning on the varying track: user-visible and logged,
+            // deliberately WITHOUT the loop-breaker classification marker so
+            // child-session terminal folding never misreads a warned-but-
+            // continuing turn as failed. Same channel (`AgentEvent::Error`)
+            // as the breaker's own message — transcript-visible.
+            if !self.varying_warned
+                && self.consecutive_varying_failures == VARYING_FAILURE_WARN_THRESHOLD
+            {
+                self.varying_warned = true;
+                let warn_msg = format!(
+                    "[nca:loop-breaker-warning] Tool `{tool_name}` has failed \
+                     {VARYING_FAILURE_WARN_THRESHOLD} times consecutively with varying parameters \
+                     — this looks like iteration rather than an infinite loop, so the turn \
+                     continues. The breaker will end the turn at \
+                     {MAX_VARYING_CONSECUTIVE_TOOL_FAILURES} consecutive varying failures \
+                     ({MAX_CONSECUTIVE_TOOL_FAILURES} for identical retries). If you are stuck, \
+                     change strategy, inspect the last failure's diagnostics, or end the turn \
+                     with a partial result explaining the gap."
+                );
+                agent.emit(AgentEvent::Error { message: warn_msg }).await;
+            }
         } else {
             self.consecutive_tool_failures = 0;
             self.last_failed_tool.clear();
+            self.consecutive_varying_failures = 0;
+            self.last_failed_batch_fingerprint = 0;
+            self.varying_warned = false;
         }
 
         // Assemble the result set for the KEPT window only: real executor
@@ -846,7 +929,18 @@ impl<'a> TurnDriver<'a> {
             }
         }
 
-        if self.consecutive_tool_failures >= MAX_CONSECUTIVE_TOOL_FAILURES {
+        if self.consecutive_tool_failures >= MAX_CONSECUTIVE_TOOL_FAILURES
+            || self.consecutive_varying_failures >= MAX_VARYING_CONSECUTIVE_TOOL_FAILURES
+        {
+            // N is the FIRING track's count: 3 for verbatim retries, 5 for
+            // varying-shape iteration. Message format unchanged — the runtime
+            // child-session classification (`starts_with` marker check) and
+            // breaker_classification.rs depend on it.
+            let firing_count = if self.consecutive_tool_failures >= MAX_CONSECUTIVE_TOOL_FAILURES {
+                self.consecutive_tool_failures
+            } else {
+                self.consecutive_varying_failures
+            };
             let detail = self
                 .last_failed_error
                 .as_deref()
@@ -854,7 +948,7 @@ impl<'a> TurnDriver<'a> {
                 .unwrap_or_else(|| crate::agent::truncate_str(&self.last_failed_output, 300));
             let msg = format!(
                 "{LOOP_BREAKER_MARKER} Tool `{}` failed {} times consecutively — stopping to avoid infinite loop.\n\nLast failure detail:\n{}",
-                self.last_failed_tool, self.consecutive_tool_failures, detail
+                self.last_failed_tool, firing_count, detail
             );
             agent
                 .emit(AgentEvent::Error {
@@ -871,6 +965,27 @@ impl<'a> TurnDriver<'a> {
             had_tool_calls: true,
         })
     }
+}
+
+/// Fingerprint a step's executor batch: hash of each executor's
+/// (tool name + canonical JSON input), aggregated over the whole batch so
+/// batch-shape changes (a call added/removed) count as "varying" too.
+/// Same technique as `tool_guards::canonical_key` (serde_json Maps are
+/// BTreeMap-ordered here, so `to_string` is a stable canonical form) but
+/// implemented locally — the breaker is per-turn and batch-level, the
+/// repeat guard is session-scoped with decay; coupling them would tangle
+/// two orthogonal mechanisms.
+fn batch_fingerprint(executors: &[ToolCall]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for call in executors {
+        call.name.hash(&mut hasher);
+        hasher.write_u8(0xFF); // delimiter: name cannot collide with serialized JSON
+        if let Ok(canonical) = serde_json::to_string(&call.input) {
+            canonical.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
 }
 
 #[cfg(test)]
@@ -1238,8 +1353,214 @@ mod tests {
         );
     }
 
-    // ── Batch guardrails: cap + intra-batch dedup (incident 2026-10-02) ──
+    // ── Dual-track breaker: varying vs identical retry forms ─────────────
 
+    /// A tool that fails only when `fail` is true — lets one scripted run
+    /// interleave failing and succeeding steps to pin reset semantics.
+    struct FlakyTool;
+    #[async_trait::async_trait]
+    impl crate::tools::ToolExecutor for FlakyTool {
+        fn definition(&self) -> nca_common::tool::ToolDefinition {
+            nca_common::tool::ToolDefinition {
+                timeout_ms: None,
+                name: "flaky".into(),
+                description: "fails when fail=true".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"fail": {"type": "boolean"}, "v": {"type": "integer"}}
+                }),
+            }
+        }
+        async fn execute(&self, call: &ToolCall) -> nca_common::tool::ToolResult {
+            let fail = call
+                .input
+                .get("fail")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if fail {
+                nca_common::tool::ToolResult {
+                    timed_out: false,
+                    call_id: call.id.clone(),
+                    success: false,
+                    output: "nope".into(),
+                    error: Some("flaky failure".into()),
+                }
+            } else {
+                nca_common::tool::ToolResult {
+                    timed_out: false,
+                    call_id: call.id.clone(),
+                    success: true,
+                    output: "recovered".into(),
+                    error: None,
+                }
+            }
+        }
+    }
+
+    /// Varying-shape failures must NOT trip at 3 — the incident's false
+    /// kill. Three steps with distinct inputs each produce exactly one
+    /// `[nca:loop-breaker-warning]` Error event (no marker) and the turn
+    /// continues to a normal final answer.
+    #[tokio::test]
+    async fn varying_failures_warn_at_three_but_do_not_trip() {
+        let fail_step = |i: i32| {
+            vec![
+                use_call(
+                    &format!("v{i}",),
+                    "flaky",
+                    serde_json::json!({"fail": true, "v": i}),
+                ),
+                StreamChunk::Finish {
+                    reason: "tool_calls".into(),
+                },
+            ]
+        };
+        let final_round = vec![
+            StreamChunk::TextDelta("still iterating".into()),
+            StreamChunk::Finish {
+                reason: "stop".into(),
+            },
+        ];
+        let (provider, calls) =
+            RoundsProvider::new(vec![fail_step(1), fail_step(2), fail_step(3), final_round]);
+        let (mut agent, event_rx) = guardrail_agent(Arc::new(provider), Box::new(FlakyTool));
+        let mut event_rx = event_rx;
+
+        let text = agent
+            .run_turn("go", Path::new("."), &[])
+            .await
+            .expect("varying failures must not trip the breaker at 3");
+        assert_eq!(text, "still iterating");
+        assert_eq!(calls.load(Ordering::SeqCst), 4, "all four steps ran");
+
+        let mut warnings = 0;
+        while let Ok(event) = event_rx.try_recv() {
+            if let AgentEvent::Error { message } = event {
+                assert!(
+                    !message.starts_with(crate::agent::LOOP_BREAKER_MARKER),
+                    "no hard-break event may fire: {message}"
+                );
+                if message.starts_with("[nca:loop-breaker-warning]") {
+                    warnings += 1;
+                    assert!(
+                        message.contains("varying"),
+                        "warning must explain the varying form: {message}"
+                    );
+                    assert!(
+                        message.contains("`flaky`"),
+                        "warning must name the tool: {message}"
+                    );
+                }
+            }
+        }
+        assert_eq!(warnings, 1, "exactly one warning at count 3");
+    }
+
+    /// A successful call at step 4 resets the varying streak: the warning
+    /// must not re-fire on the NEXT streak's count 2 (warned flag cleared),
+    /// and the streak that follows starts from zero. Steps: fail(1), fail(2),
+    /// fail(3) → warning; success → reset; fail(4), fail(5) → count 2, no
+    /// second warning; final answer.
+    #[tokio::test]
+    async fn successful_step_resets_varying_streak_and_warned_flag() {
+        let fail_step = |i: i32| {
+            vec![
+                use_call(
+                    &format!("v{i}"),
+                    "flaky",
+                    serde_json::json!({"fail": true, "v": i}),
+                ),
+                StreamChunk::Finish {
+                    reason: "tool_calls".into(),
+                },
+            ]
+        };
+        let ok_step = vec![
+            use_call("ok", "flaky", serde_json::json!({"fail": false, "v": 99})),
+            StreamChunk::Finish {
+                reason: "tool_calls".into(),
+            },
+        ];
+        let final_round = vec![
+            StreamChunk::TextDelta("recovered".into()),
+            StreamChunk::Finish {
+                reason: "stop".into(),
+            },
+        ];
+        let (provider, _calls) = RoundsProvider::new(vec![
+            fail_step(1),
+            fail_step(2),
+            fail_step(3),
+            ok_step,
+            fail_step(4),
+            fail_step(5),
+            final_round,
+        ]);
+        let (mut agent, event_rx) = guardrail_agent(Arc::new(provider), Box::new(FlakyTool));
+        let mut event_rx = event_rx;
+
+        let text = agent
+            .run_turn("go", Path::new("."), &[])
+            .await
+            .expect("post-reset streak of 2 must not trip");
+        assert_eq!(text, "recovered");
+
+        let mut warnings = 0;
+        while let Ok(event) = event_rx.try_recv() {
+            if let AgentEvent::Error { message } = event
+                && message.starts_with("[nca:loop-breaker-warning]")
+            {
+                warnings += 1;
+            }
+        }
+        assert_eq!(
+            warnings, 1,
+            "warning fires once for the first streak; the reset clears the warned flag so the second streak warns again only at its own count 3"
+        );
+    }
+
+    /// Five consecutive varying-shape failures trip the breaker at 5 — the
+    /// raised threshold still contains a truly stuck iteration, and the
+    /// breaker text carries the marker with N = the firing track's count.
+    #[tokio::test]
+    async fn five_varying_failures_trip_the_breaker_at_five() {
+        let fail_step = |i: i32| {
+            vec![
+                use_call(
+                    &format!("v{i}"),
+                    "flaky",
+                    serde_json::json!({"fail": true, "v": i}),
+                ),
+                StreamChunk::Finish {
+                    reason: "tool_calls".into(),
+                },
+            ]
+        };
+        let (provider, calls) = RoundsProvider::new(vec![
+            fail_step(1),
+            fail_step(2),
+            fail_step(3),
+            fail_step(4),
+            fail_step(5),
+        ]);
+        let mut agent = breaker_agent(Arc::new(provider), Box::new(FlakyTool));
+
+        let text = agent
+            .run_turn("go", Path::new("."), &[])
+            .await
+            .expect("varying breaker ends the turn with final text");
+        assert!(
+            text.starts_with(crate::agent::LOOP_BREAKER_MARKER),
+            "hard break must carry the classification marker: {text}"
+        );
+        assert!(
+            text.contains("failed 5 times consecutively"),
+            "N is the firing (varying) track's count: {text}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 5, "fires on the 5th step");
+    }
+
+    // ── Batch guardrails: cap + intra-batch dedup (incident 2026-10-02) ──
     /// Tool that records every execution's `n` argument and echoes it in the
     /// output — lets tests count executions and compare fan-out content.
     struct CountingTool {

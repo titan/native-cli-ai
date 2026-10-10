@@ -1,3 +1,4 @@
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Mutex;
@@ -250,6 +251,12 @@ impl PtyManager {
         let deadline = Instant::now() + Duration::from_secs(timeout_secs);
         let mut timed_out = false;
         let mut exit_code: Option<i32> = None;
+        // Signal that killed the child, when death was by signal. On Unix
+        // `ExitStatus::code()` and `ExitStatus::signal()` are mutually
+        // exclusive (exactly one is `Some`), so both must be captured or the
+        // true cause of death (OOM-kill, group-cleanup race, external kill)
+        // is silently discarded as a bare `-1`.
+        let mut signal: Option<i32> = None;
         let mut reader_done = false;
         loop {
             if reader_done {
@@ -257,6 +264,7 @@ impl PtyManager {
                     status = child.wait() => {
                         if let Ok(s) = status {
                             exit_code = s.code();
+                            signal = s.signal();
                         }
                         break;
                     }
@@ -274,6 +282,7 @@ impl PtyManager {
                     status = child.wait() => {
                         if let Ok(s) = status {
                             exit_code = s.code();
+                            signal = s.signal();
                         }
                         break;
                     }
@@ -320,6 +329,7 @@ impl PtyManager {
         Ok(PtyOutput {
             stdout,
             exit_code: exit_code.unwrap_or(-1),
+            signal,
         })
     }
 
@@ -335,7 +345,16 @@ impl PtyManager {
 #[derive(Debug)]
 pub struct PtyOutput {
     pub stdout: String,
+    /// Process exit code; `-1` sentinel when the process died by signal
+    /// (see [`Self::signal`]).
     pub exit_code: i32,
+    /// Signal that terminated the process (`Some(9)` for a SIGKILL, e.g.
+    /// OOM-kill or an external kill), `None` for a normal exit. On Unix
+    /// this is complementary to `exit_code`: exactly one of
+    /// `ExitStatus::code()` / `ExitStatus::signal()` is `Some`, so
+    /// `signal == Some(n)` implies `exit_code == -1` and `signal == None`
+    /// implies `exit_code` is the real exit status.
+    pub signal: Option<i32>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -508,6 +527,19 @@ mod tests {
             .await
             .expect("spawn should succeed");
         assert_eq!(fail.exit_code, 7);
+        assert_eq!(fail.signal, None, "exit 7 dies by exit, not signal");
+
+        // (3b) Signal death must be reported: `kill -9 $$` in the child shell
+        //      terminates it via SIGKILL — `code()` is None (the `-1`
+        //      fallback fires) and `signal()` must carry the true cause.
+        //      This is the OOM-kill / external-kill / group-cleanup-race
+        //      shape the incident report showed as a bare `-1`.
+        let killed = m
+            .exec_streaming("kill -9 $$", 30, &progress("fg-signal-death"))
+            .await
+            .expect("spawn should succeed");
+        assert_eq!(killed.exit_code, -1, "signal death has no exit code");
+        assert_eq!(killed.signal, Some(9), "SIGKILL must be reported");
 
         // (4) Concurrent tool calls on a single runtime (the production shape:
         //     the tool pipeline runs tools concurrently via join_all). Each
