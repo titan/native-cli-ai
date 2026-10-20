@@ -2426,12 +2426,42 @@ pub struct HarnessConfig {
     pub skill_directories: Vec<PathBuf>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpConfig {
     #[serde(default)]
     pub expose_in_safe_mode: bool,
     #[serde(default)]
     pub servers: Vec<McpServerConfig>,
+    /// Budget for each MCP server startup handshake (`serve()` +
+    /// `list_all_tools()`), milliseconds. A cold `bunx -y pkg@latest` fetch
+    /// can block indefinitely; exceeding the budget kills the server child
+    /// and degrades to "skipped" instead of hanging startup. `0` disables
+    /// the timeout (legacy behavior).
+    #[serde(default = "default_mcp_startup_timeout_ms")]
+    pub startup_timeout_ms: u64,
+    /// Budget for each MCP tool call (`serve()` + `call_tool`), milliseconds.
+    /// `0` disables the timeout.
+    #[serde(default = "default_mcp_call_timeout_ms")]
+    pub call_timeout_ms: u64,
+}
+
+fn default_mcp_startup_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_mcp_call_timeout_ms() -> u64 {
+    120_000
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            expose_in_safe_mode: false,
+            servers: Vec::new(),
+            startup_timeout_ms: default_mcp_startup_timeout_ms(),
+            call_timeout_ms: default_mcp_call_timeout_ms(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2663,6 +2693,12 @@ impl McpConfig {
         }
         if let Some(servers) = partial.servers {
             self.servers = servers;
+        }
+        if let Some(startup_timeout_ms) = partial.startup_timeout_ms {
+            self.startup_timeout_ms = startup_timeout_ms;
+        }
+        if let Some(call_timeout_ms) = partial.call_timeout_ms {
+            self.call_timeout_ms = call_timeout_ms;
         }
     }
 }
@@ -3032,6 +3068,8 @@ struct PartialHarnessConfig {
 struct PartialMcpConfig {
     expose_in_safe_mode: Option<bool>,
     servers: Option<Vec<McpServerConfig>>,
+    startup_timeout_ms: Option<u64>,
+    call_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -3184,6 +3222,32 @@ fn expand_tilde(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_timeout_defaults_and_backward_compatibility() {
+        // Defaults: 30s startup / 120s call.
+        let config = McpConfig::default();
+        assert_eq!(config.startup_timeout_ms, 30_000);
+        assert_eq!(config.call_timeout_ms, 120_000);
+
+        // Old TOML (no timeout keys) parses with defaults.
+        let old: PartialNcaConfig =
+            toml::from_str("[mcp]\nexpose_in_safe_mode = true\n").expect("parse old");
+        let mut config = NcaConfig::default();
+        config.merge(old);
+        assert!(config.mcp.expose_in_safe_mode);
+        assert_eq!(config.mcp.startup_timeout_ms, 30_000);
+        assert_eq!(config.mcp.call_timeout_ms, 120_000);
+
+        // New keys override per-field; 0 is an explicit disable.
+        let tuned: PartialNcaConfig =
+            toml::from_str("[mcp]\nstartup_timeout_ms = 5000\ncall_timeout_ms = 0\n")
+                .expect("parse tuned");
+        let mut config = NcaConfig::default();
+        config.merge(tuned);
+        assert_eq!(config.mcp.startup_timeout_ms, 5_000);
+        assert_eq!(config.mcp.call_timeout_ms, 0);
+    }
 
     #[test]
     fn fallback_defaults_to_disabled_empty_chain() {

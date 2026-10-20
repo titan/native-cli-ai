@@ -45,6 +45,7 @@ use nca_core::skills::{SkillCatalog, SkillFilterHandle, effective_skills_for_pro
 use nca_core::tools::AskQuestionTool;
 use nca_core::tools::InvokeSkillTool;
 use nca_core::tools::ToolRegistry;
+use nca_core::tools::mcp::McpServerLoadReport;
 use nca_core::tools::mcp::load_mcp_tools;
 use nca_core::tools::spawn_subagent::{SpawnRequest, SpawnSubagentTool};
 use nca_core::tools::subagent_control::{
@@ -182,6 +183,11 @@ pub struct Supervisor {
     /// no filtering (default harness persona or a profile without skill
     /// directives).
     skill_filter: SkillFilterHandle,
+    /// Per-server MCP load outcome from this session's `create()` (empty
+    /// when no servers are configured or none were attempted). Consumed
+    /// once by [`Supervisor::take_mcp_report`] and surfaced to the user by
+    /// the CLI wiring (TUI `push_system` / non-TTY stderr summary).
+    mcp_report: Vec<McpServerLoadReport>,
 }
 /// Terminal `result_summary` stamped on ghost children by the resume sweep:
 /// the run was cut off by a parent-process restart, not by its own logic.
@@ -724,14 +730,14 @@ impl Supervisor {
         } else {
             ToolRegistry::with_default_full_tools(fs.clone(), config.web.clone())
         };
+        let mut mcp_report: Vec<McpServerLoadReport> = Vec::new();
         if !config.mcp.servers.is_empty() && (!cfg.safe_mode || config.mcp.expose_in_safe_mode) {
-            match load_mcp_tools(&workspace_root, &config.mcp.servers).await {
-                Ok(mcp_tools) => {
-                    for tool in mcp_tools {
-                        tools.register(tool);
-                    }
-                }
-                Err(error) => tracing::warn!("failed to load MCP tools: {}", error),
+            // Per-server aggregation: one failing/timed-out server is skipped
+            // with a warn + report entry; it never blocks session creation.
+            let (mcp_tools, report) = load_mcp_tools(&workspace_root, &config.mcp).await;
+            mcp_report = report;
+            for tool in mcp_tools {
+                tools.register(tool);
             }
         }
 
@@ -1058,6 +1064,7 @@ impl Supervisor {
             fallback,
             live_config,
             skill_filter,
+            mcp_report,
         };
         sup.save().await.map_err(ProviderError::Other)?;
         sup.update_last_session()
@@ -1356,6 +1363,14 @@ impl Supervisor {
     /// fresh sessions and clean resumes; consecutive calls return nothing.
     pub fn take_restart_ghosts(&mut self) -> Vec<RestartGhost> {
         std::mem::take(&mut self.restart_ghosts)
+    }
+
+    /// Take the per-server MCP load report collected by [`Self::create`]
+    /// (one entry per enabled server: loaded tool count or skip reason).
+    /// Consumed once by the CLI wiring (TUI `push_system` lines / non-TTY
+    /// stderr summary); consecutive calls return nothing.
+    pub fn take_mcp_report(&mut self) -> Vec<McpServerLoadReport> {
+        std::mem::take(&mut self.mcp_report)
     }
 
     /// Whether a turn is currently running on this supervisor. Read side of

@@ -10,8 +10,44 @@ use ratatui::backend::CrosstermBackend;
 use super::feedback::TuiFeedbackMsg;
 use super::model::{NcaModel, SideEffectChannels};
 use super::msg::Msg;
-use crate::tui::app::{ApprovalAnswer, TerminalGuard, setup_terminal};
+use crate::tui::app::{ApprovalAnswer, TerminalGuard, restore_terminal, setup_terminal};
 use nca_common::event::{InteractiveQuestionPayload, QuestionSelection};
+
+/// Install SIGTERM/SIGHUP handlers that restore the terminal before exit.
+///
+/// A hard `kill` of the TUI process previously leaked the alternate screen
+/// and mouse-tracking sequences (`?1000/?1002/?1006`): the shell is back in
+/// cooked+echo mode and echoes raw SGR mouse reports (`^[[<34;98;32…`) on
+/// every move until `reset`. `setup_terminal` has already run by the time
+/// this is called, so restoring here is symmetric. One task per signal —
+/// deliberately simple; SIGKILL remains un-interceptable (known residual).
+/// Runs on the async runtime from the blocking TUI thread: requires an
+/// active tokio runtime handle, callers on a bare thread must not use this.
+fn install_terminal_signal_handlers() {
+    for (kind, exit_code) in [
+        (
+            tokio::signal::unix::SignalKind::terminate(),
+            130, // SIGINT-conventional 128+2-style interrupt exit
+        ),
+        (tokio::signal::unix::SignalKind::hangup(), 129), // 128+SIGHUP(1)
+    ] {
+        let mut handle = match tokio::signal::unix::signal(kind) {
+            Ok(handle) => handle,
+            Err(err) => {
+                tracing::warn!(
+                    ?kind,
+                    "failed to install terminal-restore signal handler: {err}"
+                );
+                continue;
+            }
+        };
+        tokio::spawn(async move {
+            handle.recv().await;
+            restore_terminal();
+            std::process::exit(exit_code);
+        });
+    }
+}
 
 /// Parameters for initializing the NcaModel event loop.
 pub(crate) struct NcaModelParams {
@@ -51,6 +87,10 @@ pub(crate) fn run_nca_model(
     // previous explicit `restore_terminal()` after the loop was bypassed by
     // `tick()?`, leaving the terminal in raw mode + bracketed paste on error.
     let _restore_guard = TerminalGuard;
+    // SIGTERM/SIGHUP: the RAII guard cannot cover external kills — restore
+    // the terminal from a signal handler before exiting (mouse-tracking
+    // leak). Best-effort: registration failure is logged, never fatal.
+    install_terminal_signal_handlers();
 
     // Create NcaModel
     let mut nca_model = NcaModel::new(

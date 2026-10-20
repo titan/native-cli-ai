@@ -182,6 +182,25 @@ impl Repl {
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let mut editor = self.build_editor()?;
 
+        // MCP load report (per-server outcomes from session create): one
+        // stderr line each — non-TTY mode has no transcript to push into.
+        for report in self.runtime.take_mcp_report() {
+            match (&report.tool_count, &report.error) {
+                (Some(count), _) => eprintln!(
+                    "[mcp] loaded {} ({} tool{})",
+                    report.name,
+                    count,
+                    if *count == 1 { "" } else { "s" }
+                ),
+                (None, Some(error)) => {
+                    eprintln!("[mcp] FAILED {}: {} (skipped)", report.name, error)
+                }
+                (None, None) => {
+                    eprintln!("[mcp] FAILED {}: unknown reason (skipped)", report.name)
+                }
+            }
+        }
+
         let _spawn_task = {
             let spawn_rx = self.runtime.take_spawn_rx();
             let event_tx = self.runtime.event_tx();
@@ -1849,6 +1868,26 @@ impl Repl {
         let log_path = self.runtime.event_log_path();
         // Replay historical events into the Elm feedback channel (consumed by NcaModel at startup).
         replay_events_to_feedback(&log_path, &feedback_tx).await;
+
+        // MCP load report (per-server outcomes from session create): surface
+        // one transcript line each so a skipped/timed-out server is visible
+        // instead of silently missing from the tool list.
+        for report in self.runtime.take_mcp_report() {
+            match (&report.tool_count, &report.error) {
+                (Some(count), _) => tui_feedback.push_system(format!(
+                    "[mcp] loaded {} ({} tool{})",
+                    report.name,
+                    count,
+                    if *count == 1 { "" } else { "s" }
+                )),
+                (None, Some(error)) => tui_feedback
+                    .push_system(format!("[mcp] FAILED {}: {} (skipped)", report.name, error)),
+                (None, None) => tui_feedback.push_system(format!(
+                    "[mcp] FAILED {}: unknown reason (skipped)",
+                    report.name
+                )),
+            }
+        }
 
         // Populate the git branch name immediately so it appears on first render.
         let workspace = self.runtime.workspace_root();

@@ -178,6 +178,12 @@ impl SessionRuntime {
         self.supervisor.take_restart_ghosts()
     }
 
+    /// Per-server MCP load report from session create (loaded tool counts
+    /// or skip reasons). Consumed once by the CLI wiring.
+    pub fn take_mcp_report(&mut self) -> Vec<nca_core::tools::mcp::McpServerLoadReport> {
+        self.supervisor.take_mcp_report()
+    }
+
     /// Shared plugin registry handle (G3: `subagentDispatch` hooks fire
     /// against the parent-rooted plugin instances).
     pub fn plugin_registry(&self) -> Option<Arc<nca_core::plugin::PluginRegistry>> {
@@ -538,6 +544,39 @@ pub(crate) fn format_job_line(
     }
 }
 
+/// Pre-load MCP progress line (PRD R2): `Some(line)` when any ENABLED
+/// server is configured, `None` otherwise.
+///
+/// Pure helper so the guard is unit-testable; [`announce_mcp_load`] prints it.
+fn mcp_load_announcement(config: &NcaConfig) -> Option<String> {
+    let enabled: Vec<&str> = config
+        .mcp
+        .servers
+        .iter()
+        .filter(|server| server.enabled)
+        .map(|server| server.name.as_str())
+        .collect();
+    (!enabled.is_empty()).then(|| {
+        format!(
+            "[mcp] loading {} server(s): {}\u{2026}",
+            enabled.len(),
+            enabled.join(", ")
+        )
+    })
+}
+
+/// Announce MCP loading BEFORE the supervisor's create/resume handshake
+/// runs. The TUI has not entered the alt screen yet, so this stderr line is
+/// exactly what the user sees during a slow cold-cache `bunx -y pkg@latest`
+/// fetch (non-TTY modes see it on stderr too). Main-session paths only —
+/// never the subagent spawn path (children run headless). No-op when no
+/// enabled servers exist.
+fn announce_mcp_load(config: &NcaConfig) {
+    if let Some(line) = mcp_load_announcement(config) {
+        eprintln!("{line}");
+    }
+}
+
 pub async fn build_session_runtime(
     config: NcaConfig,
     workspace_root: &Path,
@@ -548,6 +587,10 @@ pub async fn build_session_runtime(
     orchestration_context: Option<OrchestrationContext>,
 ) -> Result<SessionRuntime, ProviderError> {
     let approval_handler = ipc_approval_handler;
+
+    // Before `create` is awaited (PRD R2): MCP servers can take tens of
+    // seconds on a cold cache — show progress instead of a silent hang.
+    announce_mcp_load(&config);
 
     let mut supervisor = Supervisor::create(SupervisorConfig {
         config,
@@ -581,6 +624,10 @@ pub async fn build_resumed_session_runtime(
     session_id: &str,
     approval_handler: Option<Arc<dyn ApprovalHandler>>,
 ) -> Result<SessionRuntime, ProviderError> {
+    // Same pre-load announcement as the create path: `Supervisor::resume`
+    // re-runs the create pipeline (MCP handshake included), so a resumed
+    // session gets the same during-load visibility.
+    announce_mcp_load(&config);
     let mut supervisor = Supervisor::resume(
         config,
         workspace_root,
@@ -600,6 +647,65 @@ pub async fn build_resumed_session_runtime(
         safe_mode,
         interactive_approvals,
     })
+}
+
+#[cfg(test)]
+mod mcp_announcement_tests {
+    use super::*;
+
+    /// M1 guard: the pre-load line names every ENABLED server and stays
+    /// silent when none exist (all-disabled configs must not print noise).
+    #[test]
+    fn mcp_load_announcement_lists_enabled_servers_only() {
+        let mut config = NcaConfig::default();
+        assert_eq!(
+            mcp_load_announcement(&config),
+            None,
+            "no servers configured"
+        );
+
+        config.mcp.servers = vec![nca_common::config::McpServerConfig {
+            name: "rea".into(),
+            enabled: false,
+            command: String::new(),
+            args: vec![],
+            env: Default::default(),
+            cwd: None,
+        }];
+        assert_eq!(
+            mcp_load_announcement(&config),
+            None,
+            "disabled servers must not trigger the announcement"
+        );
+
+        config.mcp.servers = vec![
+            nca_common::config::McpServerConfig {
+                name: "off".into(),
+                enabled: false,
+                command: String::new(),
+                args: vec![],
+                env: Default::default(),
+                cwd: None,
+            },
+            nca_common::config::McpServerConfig {
+                name: "rea".into(),
+                enabled: true,
+                command: String::new(),
+                args: vec![],
+                env: Default::default(),
+                cwd: None,
+            },
+        ];
+        let line = mcp_load_announcement(&config).expect("enabled server announces");
+        assert!(
+            line.contains("1 server(s): rea"),
+            "only enabled names appear, got: {line}"
+        );
+        assert!(
+            !line.contains("off"),
+            "disabled name must be absent: {line}"
+        );
+    }
 }
 
 #[cfg(test)]

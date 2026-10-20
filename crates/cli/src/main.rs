@@ -934,6 +934,22 @@ async fn run_one_shot(
     )
     .await
     .map_err(anyhow::Error::msg)?;
+    // MCP load report (per-server outcomes from session create): stderr
+    // summary lines — one-shot mode has no transcript to push into.
+    for report in runtime.take_mcp_report() {
+        match (&report.tool_count, &report.error) {
+            (Some(count), _) => eprintln!(
+                "[mcp] loaded {} ({} tool{})",
+                report.name,
+                count,
+                if *count == 1 { "" } else { "s" }
+            ),
+            (None, Some(error)) => {
+                eprintln!("[mcp] FAILED {}: {} (skipped)", report.name, error)
+            }
+            (None, None) => eprintln!("[mcp] FAILED {}: unknown reason (skipped)", report.name),
+        }
+    }
     if let Some(rx) = runtime.take_event_rx() {
         let ipc_handle = runtime.take_ipc_handle();
         let approval_pending = runtime.take_ipc_approval_pending();
@@ -1717,6 +1733,18 @@ fn show_doctor(config: &NcaConfig, workspace_root: &Path, json: bool) -> anyhow:
             .iter()
             .filter(|server| server.enabled)
             .count(),
+        mcp_servers: config
+            .mcp
+            .servers
+            .iter()
+            .map(|server| McpServerDoctorLine {
+                name: server.name.clone(),
+                command: format!("{} {}", server.command, server.args.join(" "))
+                    .trim()
+                    .to_string(),
+                enabled: server.enabled,
+            })
+            .collect(),
         skill_count: skills,
         memory_path: if config.memory.file_path.is_absolute() {
             config.memory.file_path.clone()
@@ -1747,6 +1775,17 @@ fn show_doctor(config: &NcaConfig, workspace_root: &Path, json: bool) -> anyhow:
         }
         println!("Skills discovered: {}", output.skill_count);
         println!("MCP servers enabled: {}", output.mcp_server_count);
+        if !output.mcp_servers.is_empty() {
+            println!("MCP servers:");
+            for server in &output.mcp_servers {
+                println!(
+                    "  {}{}: {}",
+                    server.name,
+                    if server.enabled { "" } else { " [disabled]" },
+                    server.command
+                );
+            }
+        }
         println!("Memory path: {}", output.memory_path.display());
         println!("DeepSeek is the default provider for this workspace.");
     }
@@ -1921,8 +1960,16 @@ struct DoctorOutput {
     default_model: String,
     providers: Vec<ProviderDoctorStatus>,
     mcp_server_count: usize,
+    mcp_servers: Vec<McpServerDoctorLine>,
     skill_count: usize,
     memory_path: PathBuf,
+}
+
+#[derive(serde::Serialize)]
+struct McpServerDoctorLine {
+    name: String,
+    command: String,
+    enabled: bool,
 }
 
 #[derive(serde::Serialize)]

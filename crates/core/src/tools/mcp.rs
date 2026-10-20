@@ -1,25 +1,85 @@
 use crate::tools::ToolExecutor;
-use nca_common::config::McpServerConfig;
+use nca_common::config::{McpConfig, McpServerConfig};
 use nca_common::tool::{ToolCall, ToolDefinition, ToolResult};
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, ClientInfo, Implementation};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
-pub async fn load_mcp_tools(
-    workspace_root: &Path,
-    servers: &[McpServerConfig],
-) -> Result<Vec<Box<dyn ToolExecutor>>, String> {
-    let mut tools: Vec<Box<dyn ToolExecutor>> = Vec::new();
-    for server in servers.iter().filter(|server| server.enabled) {
-        let server_tools = discover_server_tools(workspace_root, server).await?;
-        for tool in server_tools {
-            tools.push(Box::new(tool));
+/// Hard cap on the retained stderr tail, bytes. Overflow drops the HEAD and
+/// keeps the TAIL (most recent diagnostics win — startup banners are noise,
+/// the final panic/error line is the signal).
+const STDERR_TAIL_LIMIT: usize = 64 * 1024;
+
+/// Portion of the drained stderr embedded in error text, bytes (kept small
+/// so a chatty server cannot flood tool-call error messages).
+const STDERR_TAIL_IN_ERROR: usize = 4 * 1024;
+
+/// Outcome of loading one MCP server during startup.
+///
+/// Aggregated per server so a single failing server degrades to "skipped"
+/// instead of failing the whole [`load_mcp_tools`] call.
+#[derive(Debug, Clone)]
+pub struct McpServerLoadReport {
+    /// Configured server name.
+    pub name: String,
+    /// Number of tools registered on success.
+    pub tool_count: Option<usize>,
+    /// Error text on failure (already includes the stderr tail when one was
+    /// captured).
+    pub error: Option<String>,
+}
+
+impl McpServerLoadReport {
+    fn ok(name: &str, tool_count: usize) -> Self {
+        Self {
+            name: name.to_string(),
+            tool_count: Some(tool_count),
+            error: None,
         }
     }
-    Ok(tools)
+
+    fn failed(name: &str, error: String) -> Self {
+        Self {
+            name: name.to_string(),
+            tool_count: None,
+            error: Some(error),
+        }
+    }
+}
+
+/// Load MCP tools from every enabled server in `config`.
+///
+/// Per-server Result aggregation: a server that fails to start, times out
+/// (see `startup_timeout_ms`), or errors during tool discovery is skipped
+/// with a failed [`McpServerLoadReport`] — the remaining servers still
+/// register. Never returns `Err` for server-level failures.
+pub async fn load_mcp_tools(
+    workspace_root: &Path,
+    config: &McpConfig,
+) -> (Vec<Box<dyn ToolExecutor>>, Vec<McpServerLoadReport>) {
+    let mut tools: Vec<Box<dyn ToolExecutor>> = Vec::new();
+    let mut reports = Vec::new();
+    for server in config.servers.iter().filter(|server| server.enabled) {
+        match discover_server_tools(workspace_root, server, config).await {
+            Ok(server_tools) => {
+                reports.push(McpServerLoadReport::ok(&server.name, server_tools.len()));
+                for tool in server_tools {
+                    tools.push(Box::new(tool));
+                }
+            }
+            Err(error) => {
+                tracing::warn!(server = %server.name, "{error}");
+                reports.push(McpServerLoadReport::failed(&server.name, error));
+            }
+        }
+    }
+    (tools, reports)
 }
 
 #[derive(Clone)]
@@ -29,6 +89,8 @@ pub struct McpTool {
     tool_name: String,
     description: Option<String>,
     parameters: Value,
+    /// Call timeout snapshot (`[mcp] call_timeout_ms`); `0` disables.
+    call_timeout_ms: u64,
 }
 
 impl McpTool {
@@ -56,7 +118,8 @@ impl ToolExecutor for McpTool {
         let tool_name = self.tool_name.clone();
         let input = call.input.clone();
         let call_id = call.id.clone();
-        match execute_mcp_call(&workspace_root, &server, &tool_name, input).await {
+        let call_timeout_ms = self.call_timeout_ms;
+        match execute_mcp_call(&workspace_root, &server, &tool_name, input, call_timeout_ms).await {
             Ok(output) => ToolResult {
                 timed_out: false,
                 call_id,
@@ -75,8 +138,15 @@ impl ToolExecutor for McpTool {
     }
 }
 
-/// Spawn a child process for an MCP server, returning (stdout, stdin, child).
-/// The child is kept alive for cleanup; caller must kill it when done.
+/// Bounded stderr tail buffer shared with the background drain task.
+type StderrTail = Arc<Mutex<Vec<u8>>>;
+
+/// Spawn a child process for an MCP server.
+///
+/// stderr is `Stdio::piped()` — never inherited: an MCP server's stray
+/// writes must not corrupt the TUI. A background task drains the pipe into
+/// `StderrTail` (bounded, drop-head-keep-tail) so the pipe never fills and
+/// deadlocks the child, and the tail is available for error reporting.
 fn spawn_mcp_server(
     server: &McpServerConfig,
     workspace_root: &Path,
@@ -85,6 +155,7 @@ fn spawn_mcp_server(
         tokio::process::ChildStdout,
         tokio::process::ChildStdin,
         tokio::process::Child,
+        StderrTail,
     ),
     String,
 > {
@@ -93,7 +164,7 @@ fn spawn_mcp_server(
         .envs(&server.env)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::piped());
 
     let working_dir = server
         .cwd
@@ -105,37 +176,167 @@ fn spawn_mcp_server(
         .spawn()
         .map_err(|err| format!("failed to start MCP server `{}`: {err}", server.name))?;
 
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| format!("missing stdin for MCP server `{}`", server.name))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| format!("missing stdout for MCP server `{}`", server.name))?;
+    // The take() failures below drop `child` — kill it first so a spawn
+    // that succeeded but came up without a stdio pipe never leaks a
+    // live process (caller gets Err and cannot clean up itself).
+    let stdin = match child.stdin.take() {
+        Some(stdin) => stdin,
+        None => {
+            let _ = child.start_kill();
+            return Err(format!("missing stdin for MCP server `{}`", server.name));
+        }
+    };
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = child.start_kill();
+            return Err(format!("missing stdout for MCP server `{}`", server.name));
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let _ = child.start_kill();
+            return Err(format!("missing stderr for MCP server `{}`", server.name));
+        }
+    };
+    let tail: StderrTail = Arc::new(Mutex::new(Vec::new()));
+    let drain_tail = Arc::clone(&tail);
+    tokio::spawn(async move {
+        let mut reader = stderr;
+        let mut chunk = [0u8; 4096];
+        loop {
+            match reader.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if let Ok(mut buf) = drain_tail.lock() {
+                        buf.extend_from_slice(&chunk[..n]);
+                        if buf.len() > STDERR_TAIL_LIMIT {
+                            let excess = buf.len() - STDERR_TAIL_LIMIT;
+                            buf.drain(..excess);
+                        }
+                    }
+                }
+            }
+        }
+    });
 
-    Ok((stdout, stdin, child))
+    Ok((stdout, stdin, child, tail))
+}
+
+/// Format the captured stderr tail for inclusion in an error message.
+/// Empty tails contribute nothing; tails are truncated to
+/// [`STDERR_TAIL_IN_ERROR`] bytes.
+fn stderr_context(tail: &StderrTail) -> String {
+    let snapshot = tail.lock().map(|buf| buf.clone()).unwrap_or_default();
+    if snapshot.is_empty() {
+        return String::new();
+    }
+    let start = snapshot.len().saturating_sub(STDERR_TAIL_IN_ERROR);
+    let slice = &snapshot[start..];
+    let text = String::from_utf8_lossy(slice);
+    format!("; stderr tail: {text}")
+}
+
+/// Kill the MCP server child and collect its stderr tail for the error
+/// path, allowing the background drain a brief grace window first.
+///
+/// `stderr_context` alone races the drain task: a diagnostic emitted at the
+/// timeout instant may not have been read into the tail buffer yet when the
+/// error text is formatted. `start_kill` followed by a short sleep lets the
+/// drain task consume the pipe's final bytes (EOF after kill) before the
+/// snapshot is taken. Callers keep their `client.cancel()` awaits where they
+/// exist today — this helper owns only the kill + collect concern.
+async fn kill_and_collect_stderr(child: &mut tokio::process::Child, tail: &StderrTail) -> String {
+    let _ = child.start_kill();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    stderr_context(tail)
+}
+
+/// `ms` as an optional `tokio::time::timeout` budget. `0` disables the
+/// timeout entirely (legacy behavior).
+fn timeout_budget(ms: u64) -> Option<Duration> {
+    (ms > 0).then(|| Duration::from_millis(ms))
 }
 
 async fn discover_server_tools(
     workspace_root: &Path,
     server: &McpServerConfig,
+    config: &McpConfig,
 ) -> Result<Vec<McpTool>, String> {
-    let (stdout, stdin, mut child) = spawn_mcp_server(server, workspace_root)?;
+    let startup_timeout_ms = config.startup_timeout_ms;
+    let (stdout, stdin, mut child, tail) = spawn_mcp_server(server, workspace_root)?;
 
     let client_info = ClientInfo::new(
         rmcp::model::ClientCapabilities::default(),
         Implementation::new("nca", env!("CARGO_PKG_VERSION")),
     );
-    let client = client_info
-        .serve((stdout, stdin))
-        .await
-        .map_err(|err| format!("MCP server `{}` init failed: {err}", server.name))?;
+    let serve = client_info.serve((stdout, stdin));
+    let client = match timeout_budget(startup_timeout_ms) {
+        Some(budget) => match tokio::time::timeout(budget, serve).await {
+            Ok(Ok(client)) => client,
+            Ok(Err(err)) => {
+                let stderr = kill_and_collect_stderr(&mut child, &tail).await;
+                return Err(format!(
+                    "MCP server `{}` init failed: {err}{stderr}",
+                    server.name
+                ));
+            }
+            Err(_) => {
+                let stderr = kill_and_collect_stderr(&mut child, &tail).await;
+                return Err(format!(
+                    "MCP server `{}` init timed out after {startup_timeout_ms}ms (server killed; \
+                     raise [mcp] startup_timeout_ms if this server is slow to start){stderr}",
+                    server.name
+                ));
+            }
+        },
+        None => match serve.await {
+            Ok(client) => client,
+            Err(err) => {
+                let stderr = kill_and_collect_stderr(&mut child, &tail).await;
+                return Err(format!(
+                    "MCP server `{}` init failed: {err}{stderr}",
+                    server.name
+                ));
+            }
+        },
+    };
 
-    let tools = client
-        .list_all_tools()
-        .await
-        .map_err(|err| format!("MCP server `{}` list_tools failed: {err}", server.name))?;
+    let list = client.list_all_tools();
+    let tools = match timeout_budget(startup_timeout_ms) {
+        Some(budget) => match tokio::time::timeout(budget, list).await {
+            Ok(Ok(tools)) => tools,
+            Ok(Err(err)) => {
+                let stderr = kill_and_collect_stderr(&mut child, &tail).await;
+                let _ = client.cancel().await;
+                return Err(format!(
+                    "MCP server `{}` list_tools failed: {err}{stderr}",
+                    server.name
+                ));
+            }
+            Err(_) => {
+                let stderr = kill_and_collect_stderr(&mut child, &tail).await;
+                let _ = client.cancel().await;
+                return Err(format!(
+                    "MCP server `{}` list_tools timed out after {startup_timeout_ms}ms (server \
+                     killed){stderr}",
+                    server.name
+                ));
+            }
+        },
+        None => match list.await {
+            Ok(tools) => tools,
+            Err(err) => {
+                let stderr = kill_and_collect_stderr(&mut child, &tail).await;
+                let _ = client.cancel().await;
+                return Err(format!(
+                    "MCP server `{}` list_tools failed: {err}{stderr}",
+                    server.name
+                ));
+            }
+        },
+    };
 
     let result: Vec<McpTool> = tools
         .into_iter()
@@ -153,6 +354,7 @@ async fn discover_server_tools(
                 tool_name: tool.name.to_string(),
                 description: tool.description.map(|d| d.to_string()),
                 parameters,
+                call_timeout_ms: config.call_timeout_ms,
             }
         })
         .collect();
@@ -168,24 +370,82 @@ async fn execute_mcp_call(
     server: &McpServerConfig,
     tool_name: &str,
     input: Value,
+    call_timeout_ms: u64,
 ) -> Result<String, String> {
-    let (stdout, stdin, mut child) = spawn_mcp_server(server, workspace_root)?;
+    let (stdout, stdin, mut child, tail) = spawn_mcp_server(server, workspace_root)?;
 
     let client_info = ClientInfo::new(
         rmcp::model::ClientCapabilities::default(),
         Implementation::new("nca", env!("CARGO_PKG_VERSION")),
     );
-    let client = client_info
-        .serve((stdout, stdin))
-        .await
-        .map_err(|err| format!("MCP server `{}` init failed: {err}", server.name))?;
+    let serve = client_info.serve((stdout, stdin));
+    let client = match timeout_budget(call_timeout_ms) {
+        Some(budget) => match tokio::time::timeout(budget, serve).await {
+            Ok(Ok(client)) => client,
+            Ok(Err(err)) => {
+                let stderr = kill_and_collect_stderr(&mut child, &tail).await;
+                return Err(format!(
+                    "MCP server `{}` init failed: {err}{stderr}",
+                    server.name
+                ));
+            }
+            Err(_) => {
+                let stderr = kill_and_collect_stderr(&mut child, &tail).await;
+                return Err(format!(
+                    "MCP server `{}` init timed out after {call_timeout_ms}ms (server \
+                     killed){stderr}",
+                    server.name
+                ));
+            }
+        },
+        None => match serve.await {
+            Ok(client) => client,
+            Err(err) => {
+                let stderr = kill_and_collect_stderr(&mut child, &tail).await;
+                return Err(format!(
+                    "MCP server `{}` init failed: {err}{stderr}",
+                    server.name
+                ));
+            }
+        },
+    };
 
     let arguments = input.as_object().cloned().unwrap_or_default();
 
-    let result = client
-        .call_tool(CallToolRequestParams::new(tool_name.to_owned()).with_arguments(arguments))
-        .await
-        .map_err(|err| format!("MCP tool `{}` call failed: {err}", tool_name))?;
+    let call = client
+        .call_tool(CallToolRequestParams::new(tool_name.to_owned()).with_arguments(arguments));
+    let result = match timeout_budget(call_timeout_ms) {
+        Some(budget) => match tokio::time::timeout(budget, call).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(err)) => {
+                let stderr = kill_and_collect_stderr(&mut child, &tail).await;
+                let _ = client.cancel().await;
+                return Err(format!(
+                    "MCP tool `{}` call failed: {err}{stderr}",
+                    tool_name
+                ));
+            }
+            Err(_) => {
+                let stderr = kill_and_collect_stderr(&mut child, &tail).await;
+                let _ = client.cancel().await;
+                return Err(format!(
+                    "MCP tool `{}` call timed out after {call_timeout_ms}ms (server killed){stderr}",
+                    tool_name
+                ));
+            }
+        },
+        None => match call.await {
+            Ok(result) => result,
+            Err(err) => {
+                let stderr = kill_and_collect_stderr(&mut child, &tail).await;
+                let _ = client.cancel().await;
+                return Err(format!(
+                    "MCP tool `{}` call failed: {err}{stderr}",
+                    tool_name
+                ));
+            }
+        },
+    };
 
     let _ = child.start_kill();
     let _ = client.cancel().await;
@@ -196,4 +456,117 @@ async fn execute_mcp_call(
         .filter_map(|c| c.as_text().map(|t| t.text.clone()))
         .collect();
     serde_json::to_string(&output).map_err(|err| err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hanging_server(name: &str, extra_args: &[&str]) -> McpServerConfig {
+        let mut args = vec!["-c".to_string()];
+        args.extend(extra_args.iter().map(|s| s.to_string()));
+        McpServerConfig {
+            name: name.to_string(),
+            command: "sh".to_string(),
+            args,
+            enabled: true,
+            env: Default::default(),
+            cwd: None,
+        }
+    }
+
+    /// A hanging server must fail within the timeout budget (not hang the
+    /// startup path), the error must carry the timeout hint, and the child
+    /// must be killed (no orphan).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn discover_times_out_on_hanging_server() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = hanging_server("hang", &["sleep 30"]);
+        let mut config = McpConfig::default();
+        config.startup_timeout_ms = 500;
+
+        let started = std::time::Instant::now();
+        let err = match discover_server_tools(dir.path(), &server, &config).await {
+            Ok(_) => panic!("hanging server must fail"),
+            Err(err) => err,
+        };
+        let elapsed = started.elapsed();
+
+        assert!(
+            err.contains("timed out"),
+            "error must carry the timeout hint, got: {err}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "must return well before the 30s sleep elapses, took {elapsed:?}"
+        );
+    }
+
+    /// stderr written before the hang must surface in the error text — the
+    /// bunx-style failure mode where the useful diagnostic lands on stderr.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn discover_includes_stderr_tail_in_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = hanging_server(
+            "noisy-hang",
+            &["echo 'NCA_TEST_STDERR_MARKER' >&2; sleep 30"],
+        );
+        let mut config = McpConfig::default();
+        config.startup_timeout_ms = 500;
+
+        let err = match discover_server_tools(dir.path(), &server, &config).await {
+            Ok(_) => panic!("hanging server must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("NCA_TEST_STDERR_MARKER"),
+            "stderr marker must be embedded in the error, got: {err}"
+        );
+    }
+
+    /// Per-server aggregation: one failing server must not fail the whole
+    /// load — a failing report is recorded and zero tools returned.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn load_mcp_tools_aggregates_failures_per_server() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = McpConfig::default();
+        config.startup_timeout_ms = 300;
+        config.servers = vec![hanging_server("rea", &["sleep 30"])];
+
+        let started = std::time::Instant::now();
+        let (tools, reports) = load_mcp_tools(dir.path(), &config).await;
+        let elapsed = started.elapsed();
+
+        assert!(tools.is_empty(), "no tools from a hanging server");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].name, "rea");
+        assert!(
+            reports[0]
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("timed out"),
+            "report must carry the timeout error, got: {:?}",
+            reports[0].error
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "load must return within the budget, took {elapsed:?}"
+        );
+    }
+
+    /// Disabled servers are skipped entirely — no report, no spawn.
+    #[tokio::test]
+    async fn load_mcp_tools_skips_disabled_servers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut server = hanging_server("off", &["sleep 30"]);
+        server.enabled = false;
+        let mut config = McpConfig::default();
+        config.startup_timeout_ms = 50;
+        config.servers = vec![server];
+
+        let (tools, reports) = load_mcp_tools(dir.path(), &config).await;
+        assert!(tools.is_empty());
+        assert!(reports.is_empty(), "disabled server must not be reported");
+    }
 }
