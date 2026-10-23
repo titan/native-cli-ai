@@ -73,7 +73,114 @@ pub fn repair_json_string(raw: &str) -> Option<Value> {
     {
         return Some(v);
     }
+    // Attempt 6: close structurally-open containers when every string
+    // literal is TERMINATED (e.g. `{"path":"src/main.rs"` cut before `}`).
+    //
+    // Deliberately narrow: a cut INSIDE a string literal means the value
+    // itself is incomplete. Completing the quote there would hand `write_file`
+    // / `edit_file` / `execute_bash` truncated content and silently corrupt
+    // data — such inputs must stay unparseable so the provider layer emits
+    // its `_error` payload and the model retries the call.
+    if no_trailing.len() <= 64 * 1024
+        && let Some(closed) = close_open_containers(&no_trailing)
+        && let Ok(v) = serde_json::from_str(&closed)
+    {
+        return Some(v);
+    }
     None
+}
+
+/// Close containers left open by a stream cut, returning `None` when the cut
+/// landed inside a string literal (incomplete value — never completed).
+///
+/// Also drops a dangling `,` / `:` key fragment before the closers so the
+/// result is valid JSON rather than a member without a value.
+fn close_open_containers(s: &str) -> Option<String> {
+    let trimmed = s.trim_end();
+    let mut in_string = false;
+    let mut escape = false;
+    let mut open_stack: Vec<char> = Vec::new();
+
+    for ch in trimmed.chars() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if in_string {
+            match ch {
+                '\\' => escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' | '[' => open_stack.push(ch),
+            '}' | ']' => {
+                open_stack.pop();
+            }
+            _ => {}
+        }
+    }
+
+    // A dangling string literal means an incomplete value: refuse.
+    if in_string || open_stack.is_empty() {
+        return None;
+    }
+
+    // A bare trailing TOKEN (digit/letter/`-`/`.`) means the last scalar was
+    // itself cut: `{"max_lines":1000` truncated from `10000` would otherwise
+    // complete to `100` and silently change the tool's meaning. Only
+    // structural tails (`}`, `]`, `"`, `,`, `:`) are safe to close. Same
+    // "dangerous side stays unfixed" rule as the mid-string case above.
+    if let Some(tail) = trimmed.chars().next_back()
+        && !matches!(tail, '}' | ']' | '"' | ',' | ':' | '{' | '[')
+    {
+        return None;
+    }
+
+    let mut result = trimmed.to_string();
+    for opener in open_stack.iter().rev() {
+        // A member cut right after `"key":` has no value — drop the fragment.
+        while let Some(tail) = result.chars().next_back() {
+            match tail {
+                ' ' | '\t' | '\n' | '\r' | ',' => {
+                    result.pop();
+                }
+                ':' => {
+                    result.pop();
+                    // A member key is `"name"` — drop the closing quote, the
+                    // name, the opening quote, then the preceding separator.
+                    while result.ends_with(|c: char| c.is_whitespace()) {
+                        result.pop();
+                    }
+                    if result.ends_with('"') {
+                        result.pop();
+                        while let Some(t) = result.chars().next_back() {
+                            result.pop();
+                            if t == '"' {
+                                break;
+                            }
+                        }
+                    }
+                    while result.ends_with(|c: char| c.is_whitespace()) {
+                        result.pop();
+                    }
+                    if result.ends_with(',') {
+                        result.pop();
+                    }
+                }
+                _ => break,
+            }
+        }
+        result.push(match opener {
+            '{' => '}',
+            '[' => ']',
+            _ => return None,
+        });
+    }
+    Some(result)
 }
 
 /// Remove trailing commas before closing braces/brackets.
@@ -713,6 +820,40 @@ mod tests {
         assert_eq!(
             result,
             Some(json!({"path": "f.txt", "content": "a\u{0000}b"}))
+        );
+    }
+    // ---- D3: structural completion is safe, mid-string completion is not ----
+
+    #[test]
+    fn truncated_after_complete_string_value_closes_object() {
+        // Value complete, only the closer was cut: safe to complete.
+        let raw = r#"{"path":"src/main.rs""#;
+        assert_eq!(
+            repair_json_string(raw),
+            Some(json!({"path": "src/main.rs"}))
+        );
+    }
+
+    #[test]
+    fn truncated_inside_string_value_is_never_completed() {
+        // The content value is incomplete — completing it would hand
+        // write_file truncated data. Must stay unparseable.
+        let raw = r#"{"path":"src/main.rs","content":"fn main() { println!("#;
+        assert_eq!(
+            repair_json_string(raw),
+            None,
+            "mid-string cuts must fail loudly, never yield partial content"
+        );
+    }
+
+    #[test]
+    fn truncated_after_dangling_key_drops_the_key() {
+        // Cut right after `"content":` — no value; drop the fragment.
+        let raw = r#"{"path":"f.txt","content":"#;
+        let repaired = close_open_containers(raw).expect("structural completion");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&repaired).ok(),
+            Some(json!({"path": "f.txt"}))
         );
     }
 }
