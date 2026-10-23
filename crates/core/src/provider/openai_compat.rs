@@ -334,12 +334,18 @@ where
     rx
 }
 
-pub fn map_provider_error(status: reqwest::StatusCode, body_text: String) -> ProviderError {
+pub fn map_provider_error(
+    status: reqwest::StatusCode,
+    retry_after_ms: Option<u64>,
+    body_text: String,
+) -> ProviderError {
     match status.as_u16() {
         401 | 403 => ProviderError::AuthError(body_text),
         404 => ProviderError::ModelNotFound(body_text),
+        // Server-provided `Retry-After` wins; missing/unparseable header
+        // falls back to the historical fixed 1 s backoff.
         429 => ProviderError::RateLimited {
-            retry_after_ms: 1000,
+            retry_after_ms: retry_after_ms.unwrap_or(1000),
         },
         // Everything else keeps the numeric status so failover/retry
         // policies can classify by status class (5xx vs 400) without
@@ -896,6 +902,9 @@ impl Provider for OpenAiCompatProvider {
 
         let status = response.status();
         if !status.is_success() {
+            // Header captured BEFORE the body is consumed: `response.text()`
+            // takes the response, so `Retry-After` must be read first.
+            let retry_after_ms = super::parse_retry_after(response.headers());
             let body_text = response.text().await.unwrap_or_default();
             tracing::error!(
                 provider = self.name,
@@ -906,7 +915,7 @@ impl Provider for OpenAiCompatProvider {
                 request_tools = tools.len(),
                 "provider_http_error"
             );
-            return Err(map_provider_error(status, body_text));
+            return Err(map_provider_error(status, retry_after_ms, body_text));
         }
 
         Ok(spawn_openai_stream(response, self.name))
@@ -958,8 +967,9 @@ impl Provider for OpenAiCompatProvider {
 
         let status = response.status();
         if !status.is_success() {
+            let retry_after_ms = super::parse_retry_after(response.headers());
             let body_text = response.text().await.unwrap_or_default();
-            return Err(map_provider_error(status, body_text));
+            return Err(map_provider_error(status, retry_after_ms, body_text));
         }
 
         // Drain the stream, discard all output, extract usage only.
@@ -991,6 +1001,61 @@ impl Provider for OpenAiCompatProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::test_support::spawn_sse_server_with_headers;
+    use nca_common::config::OpenRouterConfig;
+
+    // D2: the OpenAI-compat `chat()` path must read `Retry-After` BEFORE the
+    // body is consumed (`response.text()` takes ownership) and surface the
+    // server value in the mapped error.
+    #[tokio::test]
+    async fn openai_compat_429_retry_after_reaches_error() {
+        let base_url = spawn_sse_server_with_headers(
+            String::from("{\"error\":{\"message\":\"rate limited\"}}"),
+            429,
+            vec![("Retry-After", String::from("7"))],
+            |request| {
+                assert_eq!(request.url(), "/v1/chat/completions");
+            },
+        );
+        let compat = OpenRouterConfig {
+            api_key: Some("test-key".into()),
+            base_url,
+            ..Default::default()
+        };
+        let profile = CompatProfile {
+            name: "test-compat",
+            endpoint_suffix: "v1/chat/completions",
+            reasoning: ReasoningWirePolicy::Keep,
+            thinking_model_marker: None,
+            send_stream_options: true,
+            use_max_completion_tokens: false,
+        };
+        let provider = OpenAiCompatProvider::from_config(
+            &compat,
+            128,
+            profile,
+            reqwest::header::HeaderMap::new(),
+        )
+        .expect("provider");
+        let err = provider
+            .chat(
+                &[nca_common::message::Message::user("hi")],
+                &[],
+                "",
+                std::path::Path::new("."),
+            )
+            .await
+            .expect_err("429 must map to an error");
+        assert!(
+            matches!(
+                err,
+                ProviderError::RateLimited {
+                    retry_after_ms: 7_000
+                }
+            ),
+            "server Retry-After=7s must become 7_000 ms: {err:?}"
+        );
+    }
 
     #[tokio::test]
     async fn run_openai_sse_parses_frames_from_in_memory_bytes() {

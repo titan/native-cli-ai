@@ -147,6 +147,13 @@ where
         // `tool-call-{n}` id when a compat endpoint omits the block id
         // (mirror of openai_compat's `tool-call-{index}`).
         let mut tool_seq: u64 = 0;
+        // Terminal stop reason, normalized to the OpenAI vocabulary the driver
+        // classifies on (`length` / `tool_calls` / `stop`). Anthropic emits
+        // `stop_reason` on `message_delta`, never as a stream-level finish —
+        // without this mapping the driver could not tell a truncated answer
+        // ("max_tokens") from a clean end, so output-limit continuation and
+        // the empty-content fail-fast never fired for this protocol family.
+        let mut stop_reason: Option<String> = None;
         let mut input_tokens: u64 = 0;
         let mut cache_creation_tokens: u64 = 0;
         let mut cache_read_tokens: u64 = 0;
@@ -321,6 +328,12 @@ where
                         .await;
                     }
                     "message_delta" => {
+                        // `{"type":"message_delta","delta":{"stop_reason":...}}`
+                        if let Some(reason) = event["delta"]["stop_reason"].as_str()
+                            && !reason.is_empty()
+                        {
+                            stop_reason = Some(normalize_anthropic_stop_reason(reason).to_string());
+                        }
                         let output_tokens = event["usage"]["output_tokens"].as_u64().unwrap_or(0);
                         if input_tokens > 0 || output_tokens > 0 {
                             let _ = tx
@@ -352,18 +365,43 @@ where
             &mut tool_seq,
         )
         .await;
+        if let Some(reason) = stop_reason.take() {
+            let _ = tx.send(StreamChunk::Finish { reason }).await;
+        }
         let _ = tx.send(StreamChunk::Done).await;
     });
 
     rx
 }
 
-pub fn map_provider_error(status: reqwest::StatusCode, body_text: String) -> ProviderError {
+/// Map an Anthropic `stop_reason` onto the OpenAI `finish_reason` vocabulary
+/// the agent driver classifies on.
+///
+/// `max_tokens` is the truncation signal (`finish_reason = "length"`), which
+/// drives output-limit continuation and the empty-content fail-fast;
+/// `tool_use` must stay distinguishable from a clean stop so the driver's
+/// tool-call path is unchanged.
+fn normalize_anthropic_stop_reason(reason: &str) -> &'static str {
+    match reason {
+        "max_tokens" => "length",
+        "tool_use" => "tool_calls",
+        // "end_turn" / "stop_sequence" / "refusal" / anything new: a clean end.
+        _ => "stop",
+    }
+}
+
+pub fn map_provider_error(
+    status: reqwest::StatusCode,
+    retry_after_ms: Option<u64>,
+    body_text: String,
+) -> ProviderError {
     match status.as_u16() {
         401 | 403 => ProviderError::AuthError(body_text),
         404 => ProviderError::ModelNotFound(body_text),
+        // Server-provided `Retry-After` wins; missing/unparseable header
+        // falls back to the historical fixed 1 s backoff.
         429 => ProviderError::RateLimited {
-            retry_after_ms: 1000,
+            retry_after_ms: retry_after_ms.unwrap_or(1000),
         },
         // Everything else keeps the numeric status so failover/retry
         // policies can classify by status class (5xx vs 400) without
@@ -728,5 +766,17 @@ mod tests {
         assert_eq!(content[1]["source"]["type"], "base64");
         assert_eq!(content[1]["source"]["media_type"], "image/png");
         assert!(content[1]["source"]["data"].as_str().unwrap().len() > 8);
+    }
+    #[test]
+    fn normalize_stop_reason_maps_max_tokens_to_length() {
+        // The truncation signal the driver classifies on must survive the
+        // protocol translation, or output-limit continuation never fires.
+        assert_eq!(normalize_anthropic_stop_reason("max_tokens"), "length");
+        assert_eq!(normalize_anthropic_stop_reason("tool_use"), "tool_calls");
+        assert_eq!(normalize_anthropic_stop_reason("end_turn"), "stop");
+        assert_eq!(normalize_anthropic_stop_reason("stop_sequence"), "stop");
+        assert_eq!(normalize_anthropic_stop_reason("refusal"), "stop");
+        // Unknown future reasons degrade to a clean stop, never to `length`.
+        assert_eq!(normalize_anthropic_stop_reason("something_new"), "stop");
     }
 }

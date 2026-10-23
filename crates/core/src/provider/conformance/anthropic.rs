@@ -16,9 +16,11 @@
 //!
 //! ## Exclusions / spec-conformance notes
 //!
-//! * `stop_reason` / [`StreamChunk::Finish`] is deliberately ignored on the
-//!   anthropic path (known exclusion, out of scope). Pinned as the *absence* of
-//!   any `Finish` chunk in `fixture_anthropic_simple_text_done`.
+//! * `stop_reason` IS mapped onto [`StreamChunk::Finish`] before `Done`, with
+//!   the same OpenAI vocabulary the driver classifies on (`max_tokens` →
+//!   `length`, `tool_use` → `tool_calls`, everything else → `stop`). Output
+//!   token-limit continuation and the empty-content fail-fast depend on it, so
+//!   the fixtures now pin its presence (superseding the old "known exclusion").
 //! * Multi-line `data:` payloads ARE re-joined per the SSE spec (values joined
 //!   with `\n`, dispatched as one event on the blank line; an event still
 //!   incomplete at EOF is discarded). A join landing inside an open JSON
@@ -100,8 +102,9 @@ async fn drive_anthropic(bytes: &str, split: Split) -> Vec<StreamChunk> {
 
 #[tokio::test]
 async fn manifest_fixtures_all_terminate_with_done() {
-    // Every manifest entry must be non-empty and drive to a terminal `Done`
-    // (and never emit a `Finish` — the anthropic path has no finish channel).
+    // Every manifest entry must be non-empty and drive to a terminal `Done`.
+    // A `Finish` (when present) must precede it: `stop_reason` is folded onto
+    // the stream right before the close, never after.
     for (name, bytes) in ANTHROPIC_FIXTURES {
         assert!(!bytes.is_empty(), "fixture `{name}` is empty");
         let chunks = drive_anthropic(bytes, Split::Whole).await;
@@ -109,23 +112,32 @@ async fn manifest_fixtures_all_terminate_with_done() {
             matches!(chunks.last(), Some(StreamChunk::Done)),
             "fixture `{name}` did not terminate with Done: {chunks:?}"
         );
+        let finish_positions: Vec<usize> = chunks
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| matches!(c, StreamChunk::Finish { .. }))
+            .map(|(i, _)| i)
+            .collect();
         assert!(
-            !chunks
-                .iter()
-                .any(|c| matches!(c, StreamChunk::Finish { .. })),
-            "fixture `{name}` emitted a Finish chunk (anthropic path must not)"
+            finish_positions.len() <= 1,
+            "fixture `{name}` emitted {} Finish chunks: {chunks:?}",
+            finish_positions.len()
         );
+        if let Some(pos) = finish_positions.first() {
+            assert_eq!(
+                *pos,
+                chunks.len() - 2,
+                "fixture `{name}`: Finish must immediately precede Done: {chunks:?}"
+            );
+        }
     }
 }
 
 #[tokio::test]
 async fn fixture_anthropic_simple_text_done() {
     // message_start HOLDS input/cache tokens; message_delta combines them with
-    // `usage.output_tokens` into a single Usage chunk.
-    //
-    // KNOWN EXCLUSION: `stop_reason` is ignored, so NO `Expect::Finish` appears
-    // — this test pins its deliberate absence (the `stop_reason`/Finish
-    // semantic gap is out of scope).
+    // `usage.output_tokens` into a single Usage chunk and carries the terminal
+    // `stop_reason` → Finish.
     let expected = [
         Expect::text("Hello"),
         Expect::text(" world"),
@@ -135,6 +147,7 @@ async fn fixture_anthropic_simple_text_done() {
             cache_creation: 0,
             cache_read: 0,
         },
+        Expect::Finish("stop".to_string()),
         Expect::Done,
     ];
     for split in [
@@ -169,6 +182,7 @@ async fn fixture_anthropic_tool_use_accumulate() {
             cache_creation: 0,
             cache_read: 0,
         },
+        Expect::Finish("tool_calls".to_string()),
         Expect::Done,
     ];
     for split in [
@@ -200,6 +214,7 @@ async fn fixture_anthropic_mixed_text_tool_text() {
             cache_creation: 0,
             cache_read: 0,
         },
+        Expect::Finish("stop".to_string()),
         Expect::Done,
     ];
     for split in [
@@ -226,6 +241,7 @@ async fn fixture_anthropic_ping_interleaved() {
             cache_creation: 0,
             cache_read: 0,
         },
+        Expect::Finish("stop".to_string()),
         Expect::Done,
     ];
     for split in [
@@ -251,6 +267,7 @@ async fn fixture_anthropic_thinking_delta() {
             cache_creation: 0,
             cache_read: 0,
         },
+        Expect::Finish("stop".to_string()),
         Expect::Done,
     ];
     for split in [
@@ -276,6 +293,7 @@ async fn fixture_anthropic_usage_cache_tokens() {
             cache_creation: 20,
             cache_read: 50,
         },
+        Expect::Finish("stop".to_string()),
         Expect::Done,
     ];
     for split in [
@@ -301,6 +319,7 @@ async fn fixture_anthropic_crlf_endings() {
             cache_creation: 0,
             cache_read: 0,
         },
+        Expect::Finish("stop".to_string()),
         Expect::Done,
     ];
     for split in [
@@ -326,6 +345,7 @@ async fn fixture_anthropic_done_sentinel() {
             cache_creation: 0,
             cache_read: 0,
         },
+        Expect::Finish("stop".to_string()),
         Expect::Done,
     ];
     for split in [
@@ -428,6 +448,7 @@ async fn fixture_anthropic_error_event_ignored() {
             cache_creation: 0,
             cache_read: 0,
         },
+        Expect::Finish("stop".to_string()),
         Expect::Done,
     ];
     for split in [

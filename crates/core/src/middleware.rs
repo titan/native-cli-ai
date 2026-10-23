@@ -331,9 +331,14 @@ impl AgentMiddleware for CompactionMiddleware {
 /// **unmodified** request (`Next` is `Clone`). Non-retryable errors and
 /// exhausted attempts pass the `Err` through unchanged.
 ///
-/// Note: both compat parsers hard-code `retry_after_ms: 1000` today (no
-/// `Retry-After` header is parsed), so the production sleep is a fixed 1 s
-/// and the cap is forward-looking protection.
+/// `retry_after_ms` is parsed from the response's `Retry-After` header
+/// (delta-seconds or HTTP-date) by the compat error mappers; a missing or
+/// unparseable header falls back to a fixed 1 s. The cap bounds
+/// server-provided values so a hostile/garbage header cannot stall the turn.
+/// Lower bound for a rate-limit backoff. `Retry-After: 0` and expired
+/// HTTP-dates parse to 0 ms; sleeping 0 would hammer the endpoint.
+pub(crate) const RETRY_DELAY_FLOOR_MS: u64 = 1_000;
+
 pub struct RetryMiddleware {
     /// Retries after the first attempt.
     max_attempts: u32,
@@ -366,7 +371,14 @@ impl AgentMiddleware for RetryMiddleware {
                 Err(ProviderError::RateLimited { retry_after_ms })
                     if attempt < self.max_attempts =>
                 {
-                    let delay = retry_after_ms.min(self.delay_cap_ms);
+                    // A `Retry-After: 0` (or a past HTTP-date, which clamps
+                    // to 0) must not become a busy retry burst against a
+                    // rate-limited endpoint: keep the historical 1 s floor.
+                    // Floor first, then the configured cap — a cap below the
+                    // floor still wins (it is an explicit operator limit).
+                    let delay = retry_after_ms
+                        .max(RETRY_DELAY_FLOOR_MS)
+                        .min(self.delay_cap_ms);
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                     attempt += 1;
                 }
@@ -1272,7 +1284,7 @@ mod tests {
     }
 
     // R4 — retry-after respected but capped: server says 10 min, cap 50 ms →
-    // elapsed ≪ 600 s (test-only scenario; parsers hard-code 1000 ms today).
+    // elapsed ≪ 600 s (a gateway may legitimately send a long Retry-After).
     #[tokio::test]
     async fn r4_retry_after_capped_by_delay_cap() {
         let provider = Arc::new(RateLimitThenOkProvider {
@@ -1398,5 +1410,32 @@ mod tests {
             SessionUsage::estimated_cost_usd(usage),
             tracker.estimated_cost_usd()
         );
+    }
+    #[tokio::test]
+    async fn r5_zero_retry_after_still_backs_off() {
+        // `Retry-After: 0` (and expired HTTP-dates, which clamp to 0) must
+        // not turn into a busy retry burst against a throttled endpoint.
+        let provider = Arc::new(RateLimitThenOkProvider {
+            calls: Mutex::new(Vec::new()),
+            fail_calls: 1,
+            retry_after_ms: 0,
+        });
+        let dyn_provider: Arc<dyn Provider> = provider.clone();
+        let mut chain = MiddlewareChain::new();
+        // Cap well above the floor so the floor is what we measure.
+        chain.push(Arc::new(RetryMiddleware::new(1, 5_000)));
+
+        let (request, _event_rx) = mw_req(vec![Message::user("go")], SessionUsage::default());
+        let start = std::time::Instant::now();
+        chain
+            .call(&dyn_provider, request)
+            .await
+            .expect("retry must succeed");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(RETRY_DELAY_FLOOR_MS),
+            "a zero Retry-After must still sleep the floor, got {elapsed:?}"
+        );
+        assert_eq!(provider.calls.lock().unwrap().len(), 2);
     }
 }

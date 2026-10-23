@@ -13,6 +13,44 @@ where
     })
 }
 
+/// Like [`spawn_sse_server`], but the response carries extra headers —
+/// for pinning header-derived behavior (e.g. a 429 with `Retry-After`).
+pub fn spawn_sse_server_with_headers<F>(
+    body: String,
+    status: u16,
+    headers: Vec<(&'static str, String)>,
+    assert_request: F,
+) -> String
+where
+    F: FnOnce(&Request) + Send + 'static,
+{
+    let server = Server::http("127.0.0.1:0").expect("start mock server");
+    let base_url = match server.server_addr() {
+        tiny_http::ListenAddr::IP(addr) => format!("http://{addr}"),
+        other => panic!("unsupported listen addr: {other:?}"),
+    };
+
+    thread::spawn(move || {
+        let request = server.recv().expect("receive request");
+        assert_request(&request);
+        let mut response = Response::from_string(body)
+            .with_status_code(StatusCode(status))
+            .with_header(
+                Header::from_bytes("Content-Type", "text/event-stream")
+                    .expect("content type header"),
+            );
+        for (name, value) in headers {
+            response = response.with_header(
+                Header::from_bytes(name.as_bytes(), value.as_bytes())
+                    .unwrap_or_else(|err| panic!("invalid test header {name}: {err:?}")),
+            );
+        }
+        request.respond(response).expect("send response");
+    });
+
+    base_url
+}
+
 /// Like [`spawn_sse_server`], but the assertion closure also receives the
 /// decoded request body — for pinning wire-contract fields (e.g. a provider's
 /// `thinking` override or floored `max_tokens`) on the exact JSON sent.

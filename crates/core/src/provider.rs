@@ -25,6 +25,62 @@ use async_trait::async_trait;
 use nca_common::message::Message;
 use nca_common::tool::{ToolCall, ToolDefinition};
 
+/// Parse an HTTP `Retry-After` response header into milliseconds.
+///
+/// Per RFC 7231 §7.1.3 the header carries either delta-seconds or an
+/// HTTP-date (the time at which the client may retry). Returns `None` when
+/// the header is absent or unparseable — callers fall back to a fixed
+/// delay. A date already in the past clamps to `0` (retry immediately).
+pub fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let raw = headers
+        .get("Retry-After")?
+        .to_str()
+        .ok()?
+        .trim()
+        .to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    // Form 1: delta-seconds (integer). Some gateways emit a decimal value;
+    // the fractional part is sub-second noise for a retry hint and is
+    // truncated rather than failing the parse.
+    if let Ok(seconds) = raw.parse::<u64>() {
+        return Some(seconds.saturating_mul(1000));
+    }
+    if let Some((int_part, frac)) = raw.split_once('.')
+        && !int_part.is_empty()
+        && int_part.bytes().all(|b| b.is_ascii_digit())
+        && !frac.is_empty()
+        && frac.bytes().all(|b| b.is_ascii_digit())
+        && let Ok(seconds) = int_part.parse::<u64>()
+    {
+        return Some(seconds.saturating_mul(1000));
+    }
+    // Form 2: HTTP-date — retry at the named instant. RFC 7231 §7.1.1.1
+    // lists three formats: IMF-fixdate (rfc2822-shaped), RFC 850, and
+    // asctime. chrono has a dedicated parser for the first; the other two
+    // are strptime formats (rfc850's 2-digit year maps to %y). All are
+    // interpreted as UTC — HTTP-date mandates GMT.
+    if let Ok(target) = chrono::DateTime::parse_from_rfc2822(&raw) {
+        return Some(elapsed_ms_until(&target.with_timezone(&chrono::Utc)));
+    }
+    for format in ["%A, %d-%b-%y %H:%M:%S GMT", "%a %b %e %H:%M:%S %Y"] {
+        if let Ok(target) = chrono::NaiveDateTime::parse_from_str(&raw, format) {
+            return Some(elapsed_ms_until(&target.and_utc()));
+        }
+    }
+    None
+}
+
+/// Milliseconds from now until `target`, clamped at zero (a date already in
+/// the past means the server allows an immediate retry).
+fn elapsed_ms_until(target: &chrono::DateTime<chrono::Utc>) -> u64 {
+    target
+        .signed_duration_since(chrono::Utc::now())
+        .num_milliseconds()
+        .max(0) as u64
+}
+
 /// Format an error's full source chain as "msg → source → …" for diagnostics.
 ///
 /// The top-level `Display` of reqwest/hyper errors is often too vague (e.g.
@@ -277,9 +333,12 @@ mod tests {
     #[test]
     fn is_context_overflow_false_for_unrelated_errors() {
         assert!(!ProviderError::AuthError("invalid api key".into()).is_context_overflow());
+        // Sentinel-independent since D2: the RateLimited backoff hint may be
+        // any server-provided value (parse_retry_after), so the assertion
+        // must hold for an arbitrary ms — e.g. one a gateway would send.
         assert!(
             !ProviderError::RateLimited {
-                retry_after_ms: 1000
+                retry_after_ms: 65_000
             }
             .is_context_overflow()
         );
@@ -300,5 +359,82 @@ mod tests {
         // through unchanged, which is exactly the pre-P3 behavior.
         let chinese_body = "错误：输入内容超过了模型的最大上下文窗口，请缩短输入";
         assert!(!ProviderError::RequestFailed(chinese_body.into()).is_context_overflow());
+    }
+
+    fn header_map(pairs: &[(&str, &str)]) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                reqwest::header::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        headers
+    }
+
+    #[test]
+    fn parse_retry_after_integer_seconds_scale_to_ms() {
+        assert_eq!(
+            parse_retry_after(&header_map(&[("Retry-After", "120")])),
+            Some(120_000)
+        );
+        assert_eq!(
+            parse_retry_after(&header_map(&[("Retry-After", "0")])),
+            Some(0)
+        );
+        // Some gateways send a decimal delta; the fraction is truncated.
+        assert_eq!(
+            parse_retry_after(&header_map(&[("Retry-After", "1.5")])),
+            Some(1_000)
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_http_date_yields_delta() {
+        // Future date (~1 h out) → delta ≈ 3_600_000 ms with clock slop.
+        let target = chrono::Utc::now() + chrono::Duration::hours(1);
+        for formatted in [
+            target.to_rfc2822(),
+            target.format("%a %b %e %H:%M:%S %Y").to_string(),
+        ] {
+            let parsed = parse_retry_after(&header_map(&[("Retry-After", &formatted)]))
+                .unwrap_or_else(|| panic!("must parse: {formatted}"));
+            let slop = (parsed as i64 - 3_600_000).abs();
+            assert!(slop < 5_000, "delta too far from 1 h: {parsed} ms");
+        }
+    }
+
+    #[test]
+    fn parse_retry_after_http_date_rfc850() {
+        // RFC 850 format ("%A, %d-%b-%y %H:%M:%S GMT", 2-digit year).
+        let target = chrono::Utc::now() + chrono::Duration::minutes(2);
+        let rfc850 = target.format("%A, %d-%b-%y %H:%M:%S GMT").to_string();
+        let parsed = parse_retry_after(&header_map(&[("Retry-After", &rfc850)]))
+            .expect("rfc850 date must parse");
+        let slop = (parsed as i64 - 120_000).abs();
+        assert!(slop < 5_000, "delta too far from 2 min: {parsed} ms");
+    }
+
+    #[test]
+    fn parse_retry_after_past_date_clamps_to_zero() {
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc2822();
+        assert_eq!(
+            parse_retry_after(&header_map(&[("Retry-After", &past)])),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_missing_or_garbage_is_none() {
+        assert_eq!(parse_retry_after(&header_map(&[])), None);
+        assert_eq!(parse_retry_after(&header_map(&[("Retry-After", "")])), None);
+        assert_eq!(
+            parse_retry_after(&header_map(&[("Retry-After", "soon")])),
+            None
+        );
+        assert_eq!(
+            parse_retry_after(&header_map(&[("Content-Type", "text/plain")])),
+            None
+        );
     }
 }

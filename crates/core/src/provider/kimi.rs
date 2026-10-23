@@ -116,8 +116,9 @@ impl Provider for KimiProvider {
 
         let status = response.status();
         if !status.is_success() {
+            let retry_after_ms = super::parse_retry_after(response.headers());
             let body_text = response.text().await.unwrap_or_default();
-            return Err(map_provider_error(status, body_text));
+            return Err(map_provider_error(status, retry_after_ms, body_text));
         }
 
         Ok(spawn_anthropic_stream(response, "kimi"))
@@ -127,10 +128,96 @@ impl Provider for KimiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::test_support::{collect_chunks, spawn_sse_server};
+    use crate::provider::test_support::{
+        collect_chunks, spawn_sse_server, spawn_sse_server_with_headers,
+    };
     use nca_common::message::Message;
     use nca_common::tool::ToolDefinition;
     use serde_json::json;
+
+    fn kimi_config(base_url: String) -> NcaConfig {
+        let mut config = NcaConfig::default();
+        config.provider.kimi.api_key = Some("kimi-test-key".into());
+        config.provider.kimi.base_url = base_url;
+        config
+    }
+
+    // D2: a 429 with `Retry-After: <delta-seconds>` must surface the
+    // server-provided backoff in the mapped error.
+    #[tokio::test]
+    async fn kimi_429_retry_after_integer_seconds_reaches_error() {
+        let base_url = spawn_sse_server_with_headers(
+            String::from("{\"type\":\"error\"}\n"),
+            429,
+            vec![("Retry-After", String::from("30"))],
+            |request| {
+                assert_eq!(request.url(), "/v1/messages");
+            },
+        );
+        let provider = KimiProvider::from_config(&kimi_config(base_url)).expect("provider");
+        let err = provider
+            .chat(&[Message::user("hi")], &[], "", std::path::Path::new("."))
+            .await
+            .expect_err("429 must map to an error");
+        assert!(
+            matches!(
+                err,
+                ProviderError::RateLimited {
+                    retry_after_ms: 30_000
+                }
+            ),
+            "server Retry-After=30s must become 30_000 ms: {err:?}"
+        );
+    }
+
+    // D2: a 429 with an HTTP-date `Retry-After` (one of the three RFC 7231
+    // formats) must yield the date-minus-now delta in ms.
+    #[tokio::test]
+    async fn kimi_429_retry_after_http_date_reaches_error() {
+        let target = chrono::Utc::now() + chrono::Duration::seconds(90);
+        let base_url = spawn_sse_server_with_headers(
+            String::new(),
+            429,
+            vec![("Retry-After", target.to_rfc2822())],
+            |_| {},
+        );
+        let provider = KimiProvider::from_config(&kimi_config(base_url)).expect("provider");
+        let err = provider
+            .chat(&[Message::user("hi")], &[], "", std::path::Path::new("."))
+            .await
+            .expect_err("429 must map to an error");
+        match err {
+            ProviderError::RateLimited { retry_after_ms } => {
+                // ~90_000 ms with clock/traversal slop.
+                let slop = (retry_after_ms as i64 - 90_000).abs();
+                assert!(
+                    slop < 10_000,
+                    "delta too far from 90 s: {retry_after_ms} ms"
+                );
+            }
+            other => panic!("expected RateLimited, got: {other:?}"),
+        }
+    }
+
+    // D2: no `Retry-After` header → the historical 1 s fallback backoff.
+    #[tokio::test]
+    async fn kimi_429_without_retry_after_falls_back_to_1s() {
+        let base_url = spawn_sse_server_with_headers(String::new(), 429, vec![], |_| {});
+        let provider = KimiProvider::from_config(&kimi_config(base_url)).expect("provider");
+        let err = provider
+            .chat(&[Message::user("hi")], &[], "", std::path::Path::new("."))
+            .await
+            .expect_err("429 must map to an error");
+        assert!(
+            matches!(
+                err,
+                ProviderError::RateLimited {
+                    retry_after_ms: 1000
+                }
+            ),
+            "missing header must fall back to 1000 ms: {err:?}"
+        );
+    }
 
     #[tokio::test]
     async fn kimi_provider_streams_text_and_usage() {

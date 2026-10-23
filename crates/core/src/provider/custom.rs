@@ -134,8 +134,9 @@ impl Provider for CustomProvider {
 
                 let status = response.status();
                 if !status.is_success() {
+                    let retry_after_ms = super::parse_retry_after(response.headers());
                     let body_text = response.text().await.unwrap_or_default();
-                    return Err(map_openai_error(status, body_text));
+                    return Err(map_openai_error(status, retry_after_ms, body_text));
                 }
 
                 Ok(spawn_openai_stream(response, "custom"))
@@ -160,8 +161,9 @@ impl Provider for CustomProvider {
 
                 let status = response.status();
                 if !status.is_success() {
+                    let retry_after_ms = super::parse_retry_after(response.headers());
                     let body_text = response.text().await.unwrap_or_default();
-                    return Err(map_anthropic_error(status, body_text));
+                    return Err(map_anthropic_error(status, retry_after_ms, body_text));
                 }
 
                 Ok(spawn_anthropic_stream(response, "custom"))

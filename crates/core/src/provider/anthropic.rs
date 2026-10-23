@@ -109,8 +109,9 @@ impl Provider for AnthropicProvider {
 
         let status = response.status();
         if !status.is_success() {
+            let retry_after_ms = super::parse_retry_after(response.headers());
             let body_text = response.text().await.unwrap_or_default();
-            return Err(map_provider_error(status, body_text));
+            return Err(map_provider_error(status, retry_after_ms, body_text));
         }
 
         Ok(spawn_anthropic_stream(response, "anthropic"))
@@ -144,8 +145,9 @@ impl Provider for AnthropicProvider {
 
         let status = response.status();
         if !status.is_success() {
+            let retry_after_ms = super::parse_retry_after(response.headers());
             let body_text = response.text().await.unwrap_or_default();
-            return Err(map_provider_error(status, body_text));
+            return Err(map_provider_error(status, retry_after_ms, body_text));
         }
 
         // Drain the stream, discard all output, extract usage only.
