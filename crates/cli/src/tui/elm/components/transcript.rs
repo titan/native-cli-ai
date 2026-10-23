@@ -16,7 +16,9 @@ use nca_common::event::{AgentEvent, InteractiveQuestionPayload, QuestionSelectio
 use nca_common::tool::ToolResult;
 
 use crate::tui::state::{ApprovalRequest, DisplayBlock};
-use crate::tui::text_utils::{format_tool_input_for_display, short_session_prefix, truncate};
+use crate::tui::text_utils::{
+    fmt_tokens_k, format_tool_input_for_display, short_session_prefix, truncate,
+};
 
 // ── Theme (from shared module, re-exported via searchable_list) ───
 use super::searchable_list::theme;
@@ -768,6 +770,25 @@ impl TranscriptState {
                     self.child_activity_blocks
                         .insert(child_session_id.clone(), idx);
                 }
+            }
+            AgentEvent::ChildSessionCost {
+                child_session_id,
+                input_tokens,
+                output_tokens,
+                ..
+            } => {
+                // D5: one cost line right after the terminal status line —
+                // same in-place idiom as the activity/completed handlers so
+                // the incremental cache stays valid. Pushed (not in-place)
+                // because the terminal line already occupies the rolling
+                // block; the cost line reads as a footer below it.
+                let short = short_session_prefix(child_session_id);
+                self.blocks.push(DisplayBlock::System(format!(
+                    "↳ {short}… · cost: {} in / {} out",
+                    fmt_tokens_k(*input_tokens),
+                    fmt_tokens_k(*output_tokens)
+                )));
+                self.blocks_pushed();
             }
             AgentEvent::ChildSessionCompleted {
                 child_session_id,

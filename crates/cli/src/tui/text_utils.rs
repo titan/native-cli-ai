@@ -23,6 +23,18 @@ pub(crate) fn short_session_prefix(id: &str) -> &str {
     if id.len() > 8 { &id[..8] } else { id }
 }
 
+/// Compact token-count rendering for child-cost lines: `12.3k` / `999` /
+/// `1.2M` (D5 transcript footer). TUI twin of `stream.rs::fmt_k`.
+pub(crate) fn fmt_tokens_k(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
 /// Remove SGR-1006 mouse-tracking residue (`[<btn;col;rowM` / `...m`) that
 /// leaks into the input buffer as plain chars after an escape-sequence
 /// desync (the terminal's mouse-report bytes overflow the tty input queue,

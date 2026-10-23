@@ -34,7 +34,18 @@ pub struct ParentForward {
     /// Liveness heartbeat (T1-3). `None` only in tests that exercise
     /// forwarding without a registry; production child runs always stamp.
     pub heartbeat: Option<ActivityHeartbeat>,
+    /// D6 activity projection feed: called with `(phase, detail)` for every
+    /// event that maps to a parent-visible activity line, so the parent's
+    /// registry can append it to the child's recent-activity ring. Fed from
+    /// the same mapping the forward uses — including elided droppables (the
+    /// ring is the model-facing record, not the UI channel). `None` when
+    /// the run has no registry (tests).
+    pub activity_log: Option<ActivityLogCallback>,
 }
+
+/// Callback that appends one `(phase, detail)` line to a child's
+/// recent-activity ring (D6). Named to keep `ParentForward` readable.
+pub type ActivityLogCallback = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 /// Delivery class for a parent-forwarded child event
 /// (event-consumer-liveness, Chunk 1). Decides how the fanout forwards it
@@ -272,6 +283,18 @@ pub fn spawn_event_fanout(
                         && let Some((fwd, class)) =
                             map_child_event_for_parent_broadcast(&forward.child_id, &envelope.event)
                     {
+                        // D6: feed the registry's activity ring from the same
+                        // mapping — BEFORE the elision branch, so a ring entry
+                        // exists even when the parent channel was full (the
+                        // ring is the durable projection; elision only sheds
+                        // the live-UI copy).
+                        if let Some(ref log) = forward.activity_log
+                            && let AgentEvent::ChildSessionActivity {
+                                phase, detail, ..
+                            } = &fwd
+                        {
+                            log(phase, detail);
+                        }
                         match class {
                             ForwardClass::Droppable => match forward.tx.try_send(fwd) {
                                 Ok(()) => {}
@@ -743,6 +766,7 @@ mod tests {
             heartbeat: Some(Arc::new(move || {
                 counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             })),
+            activity_log: None,
         };
         let mut task = spawn_event_fanout(
             event_rx,
@@ -807,6 +831,7 @@ mod tests {
                 child_id: "child-1".to_string(),
                 tx: ptx,
                 heartbeat: None,
+                activity_log: None,
             }),
             None,
             Duration::ZERO,
@@ -871,6 +896,7 @@ mod tests {
                 child_id: "child-2".to_string(),
                 tx: ptx,
                 heartbeat: None,
+                activity_log: None,
             }),
             None,
             Duration::ZERO,

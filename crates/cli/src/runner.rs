@@ -736,6 +736,10 @@ mod job_line_tests {
             specialist: None,
             last_activity: tokio::time::Instant::now(),
             interaction_pending: false,
+            recent_activity: std::collections::VecDeque::new(),
+            accumulated_input_tokens: 0,
+            accumulated_output_tokens: 0,
+            accumulated_cache_read_tokens: 0,
         }
     }
 

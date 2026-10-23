@@ -78,6 +78,18 @@ pub enum StreamMode {
     Ndjson,
 }
 
+/// Compact token-count rendering for child-cost lines: `12.3k` / `999` /
+/// `1.2M`. Kept here (stream renderer local) until a second caller needs it.
+fn fmt_k(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
 /// Real-time streaming stats
 struct StreamStats {
     input_tokens: Arc<AtomicU64>,
@@ -563,6 +575,26 @@ fn render_event(event: &AgentEvent, stats: &StreamStats) {
                 short,
                 phase.color(theme::TEXT_DIM),
                 detail.color(theme::TEXT_DIM)
+            );
+        }
+        AgentEvent::ChildSessionCost {
+            child_session_id,
+            input_tokens,
+            output_tokens,
+            ..
+        } => {
+            print!("{}", theme::CLEAR_LINE);
+            let short = if child_session_id.len() > 8 {
+                &child_session_id[..8]
+            } else {
+                child_session_id.as_str()
+            };
+            println!(
+                "  {} {}… · cost: {} in / {} out",
+                "↳".color(theme::TOOL_BG),
+                short,
+                fmt_k(*input_tokens).color(theme::TEXT_DIM),
+                fmt_k(*output_tokens).color(theme::TEXT_DIM),
             );
         }
         AgentEvent::ChildSessionCompleted {
