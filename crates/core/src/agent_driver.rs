@@ -48,6 +48,10 @@ enum StepOutcome {
     Continue { had_tool_calls: bool },
     /// Empty response retry: another step is owed without tool calls.
     Retry,
+    /// The response was cut by the output-token limit with partial content:
+    /// the segment was recorded and a continuation prompt queued, so another
+    /// step is owed (always true — the turn must not end here).
+    ContinueAfterLength,
 }
 
 impl AgentLoop {
@@ -129,6 +133,16 @@ pub(crate) struct TurnDriver<'a> {
     /// with the refusals spelled out — for a sub-agent that output surfaces
     /// to the parent via the spawn reply / task_result.
     consecutive_guard_stop_steps: u32,
+    /// Output-token-limit continuations used in this turn. Each
+    /// `finish_reason = "length"` response with partial content is recorded
+    /// and re-prompted to resume from the cut point; past
+    /// [`MAX_LENGTH_CONTINUATIONS`] the turn ends with the partial text plus a
+    /// loud error instead of looping.
+    length_continuations: u32,
+    /// Text accumulated across length-continuation segments, joined with
+    /// `\n\n` at the end (segment boundaries stay visible: same lesson as
+    /// opencode's text-block-boundary fix).
+    length_continuation_text: String,
 }
 
 const MAX_EMPTY_RETRIES: u32 = 2;
@@ -149,6 +163,13 @@ const VARYING_FAILURE_WARN_THRESHOLD: u32 = 3;
 /// three in a row is unambiguous loop pathology, not legitimate iteration
 /// (fix → test loops vary their calls and never reach a Stop).
 const MAX_CONSECUTIVE_GUARD_STOP_STEPS: u32 = 3;
+/// Continuations allowed after an output-token-limit cut before the turn ends
+/// with the partial text. Three covers a long answer split into four requests
+/// while still bounding a model that keeps re-hitting the cap.
+const MAX_LENGTH_CONTINUATIONS: u32 = 3;
+/// Appended as a user message to resume a truncated answer. The `[continue]`
+/// marker is asserted by tests and makes the injection recognizable in replay.
+const LENGTH_CONTINUATION_PROMPT: &str = "[continue] Continue your previous answer from exactly where it was cut off — it hit the output token limit. Do not repeat earlier text, do not restart the answer, and do not add a preamble: resume from the cut point and finish.";
 
 impl<'a> TurnDriver<'a> {
     pub(crate) fn new(
@@ -172,6 +193,8 @@ impl<'a> TurnDriver<'a> {
             last_failed_output: String::new(),
             last_failed_error: None,
             consecutive_guard_stop_steps: 0,
+            length_continuations: 0,
+            length_continuation_text: String::new(),
         }
     }
 
@@ -245,6 +268,16 @@ impl<'a> TurnDriver<'a> {
                 }
                 Ok(StepOutcome::Retry) => {
                     self.emit_step_completed(duration_ms, false).await;
+                    owed = true;
+                }
+                Ok(StepOutcome::ContinueAfterLength) => {
+                    // No tool ran on this step — it was a pure text
+                    // continuation. Reporting `true` would mark it
+                    // "tool-calls" in the stream renderer.
+                    self.emit_step_completed(duration_ms, false).await;
+                    // Always owed: the cut response was incomplete, so the
+                    // turn cannot end on this step (unlike `Continue`, whose
+                    // `owed` depends on whether tools ran).
                     owed = true;
                 }
                 Err(e) => {
@@ -578,6 +611,12 @@ impl<'a> TurnDriver<'a> {
                     .await;
                 return Err(ProviderError::Other(format!("{diag} after retries",)));
             }
+            // Output-token-limit continuation: the model produced content but
+            // was cut off. Record the segment, then re-prompt to resume from
+            // the cut point instead of silently treating a truncated answer
+            // as final (the pre-existing behavior). Empty-content `length`
+            // never reaches here — that fail-fast path is above.
+            let hit_length_limit = finish_reason.as_deref() == Some("length");
             let mut msg = Message::assistant(assistant_text.clone());
             if !reasoning_text.is_empty() {
                 msg = msg.with_reasoning(std::mem::take(&mut reasoning_text));
@@ -591,8 +630,67 @@ impl<'a> TurnDriver<'a> {
                     steering: false,
                 })
                 .await;
+
+            if hit_length_limit {
+                if self.length_continuations < MAX_LENGTH_CONTINUATIONS {
+                    self.length_continuations += 1;
+                    if !self.length_continuation_text.is_empty() {
+                        self.length_continuation_text.push_str("\n\n");
+                    }
+                    self.length_continuation_text
+                        .push_str(assistant_text.trim_end());
+                    let prompt = Message::user(LENGTH_CONTINUATION_PROMPT);
+                    agent.record(&prompt).await;
+                    agent.messages.push(prompt);
+                    agent
+                        .emit(AgentEvent::MessageReceived {
+                            role: "user".into(),
+                            content: LENGTH_CONTINUATION_PROMPT.into(),
+                            steering: false,
+                        })
+                        .await;
+                    return Ok(StepOutcome::ContinueAfterLength);
+                }
+                // Budget exhausted: surface the truncation loudly and hand
+                // back everything produced so far — never loop, never drop.
+                // Keep the SAME segment boundary the continuation path uses,
+                // so the glued text reads identically either way.
+                if !self.length_continuation_text.is_empty() {
+                    self.length_continuation_text.push_str("\n\n");
+                }
+                self.length_continuation_text
+                    .push_str(assistant_text.trim_end());
+                let total = self.length_continuation_text.chars().count();
+                let msg = format!(
+                    "Response truncated by the output token limit \
+                     (finish_reason=length) after {MAX_LENGTH_CONTINUATIONS} continuation(s); \
+                     returning the {total} chars produced so far. Raise [model] max_tokens \
+                     to finish in one response."
+                );
+                agent
+                    .emit(AgentEvent::Error {
+                        message: msg.clone(),
+                    })
+                    .await;
+                return Ok(StepOutcome::FinalText {
+                    text: std::mem::take(&mut self.length_continuation_text),
+                    had_tool_calls: false,
+                });
+            }
+
+            // A normal stop ends the turn. If earlier segments were recorded
+            // for a truncated answer, glue them back on so the caller sees
+            // the complete text.
+            let text = if self.length_continuation_text.is_empty() {
+                assistant_text
+            } else {
+                self.length_continuation_text.push_str("\n\n");
+                self.length_continuation_text
+                    .push_str(assistant_text.trim_end());
+                std::mem::take(&mut self.length_continuation_text)
+            };
             return Ok(StepOutcome::FinalText {
-                text: assistant_text,
+                text,
                 had_tool_calls: false,
             });
         }
@@ -2247,6 +2345,130 @@ mod tests {
         assert!(
             bytes / N >= 100,
             "sanity: each serialized tool_use block costs ≥100 bytes"
+        );
+    }
+    // ── D4: output-token-limit continuation ──────────────────────────────
+
+    /// Agent with no tools registered — the continuation tests only need the
+    /// provider rounds and the message history.
+    #[allow(dead_code)]
+    fn continuation_agent(provider: Arc<dyn Provider>) -> AgentLoop {
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(1024);
+        AgentLoop::new(
+            provider,
+            ToolRegistry::new(),
+            ApprovalPolicy::new(PermissionConfig {
+                mode: PermissionMode::BypassPermissions,
+                ..Default::default()
+            }),
+            "test-model".into(),
+            event_tx,
+            20,
+            32,
+            0,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn length_cut_with_content_continues_and_glues_segments() {
+        use nca_common::message::Role;
+        let (provider, calls) = RoundsProvider::new(vec![
+            vec![
+                StreamChunk::TextDelta("first half".into()),
+                StreamChunk::Finish {
+                    reason: "length".into(),
+                },
+            ],
+            vec![
+                StreamChunk::TextDelta("second half".into()),
+                StreamChunk::Finish {
+                    reason: "stop".into(),
+                },
+            ],
+        ]);
+        let mut agent = continuation_agent(Arc::new(provider));
+
+        let text = agent
+            .run_turn("go", Path::new("."), &[])
+            .await
+            .expect("turn must complete");
+
+        assert_eq!(
+            text, "first half\n\nsecond half",
+            "segments must be glued with a visible boundary"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "exactly one continuation request"
+        );
+        // The continuation prompt is in the history the model sees.
+        assert!(
+            agent
+                .messages
+                .iter()
+                .any(|m| m.role == Role::User
+                    && m.content
+                        .to_summary_text()
+                        .contains("[continue]")),
+            "the continuation prompt must be recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_length_cuts_stop_at_the_budget_and_keep_partial_text() {
+        // Four length-cuts in a row: MAX_LENGTH_CONTINUATIONS = 3, so the
+        // fourth step ends the turn with an error carrying the partial text.
+        let cut = |label: &str| {
+            vec![
+                StreamChunk::TextDelta(label.into()),
+                StreamChunk::Finish {
+                    reason: "length".into(),
+                },
+            ]
+        };
+        let mut rounds = Vec::new();
+        for i in 0..4 {
+            rounds.push(cut(&format!("part{i}")));
+        }
+        // Extra round that must NOT be requested.
+        rounds.push(vec![
+            StreamChunk::TextDelta("never reached".into()),
+            StreamChunk::Finish {
+                reason: "stop".into(),
+            },
+        ]);
+        let (provider, calls) = RoundsProvider::new(rounds);
+        let mut agent = continuation_agent(Arc::new(provider));
+
+        let text = agent
+            .run_turn("go", Path::new("."), &[])
+            .await
+            .expect("budget exhaustion still completes the turn with partial text");
+
+        assert!(
+            text.contains("part0") && text.contains("part3"),
+            "all produced segments must survive: {text}"
+        );
+        // Segment boundaries must stay visible on the budget-exhausted path
+        // too (the continuation path already separates them).
+        assert!(
+            !text.contains("part2part3"),
+            "segments must be separated by a blank line, got: {text:?}"
+        );
+        assert!(
+            text.contains("part2\n\npart3"),
+            "the final segment must be glued with the same boundary: {text:?}"
+        );
+        assert!(
+            !text.contains("never reached"),
+            "the turn must stop at the continuation budget"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "initial step + 3 continuations, then stop"
         );
     }
 }
