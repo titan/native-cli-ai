@@ -39,7 +39,7 @@ use nca_core::middleware::default_chain;
 use nca_core::plugin::PluginRegistry;
 use nca_core::provider::Provider;
 use nca_core::provider::ProviderError;
-use nca_core::provider::factory::build_provider_with_tracker;
+use nca_core::provider::factory::{build_provider_for, build_provider_with_tracker};
 use nca_core::provider::fallback::FallbackProvider;
 use nca_core::skills::{SkillCatalog, SkillFilterHandle, effective_skills_for_profile};
 use nca_core::tools::AskQuestionTool;
@@ -188,6 +188,19 @@ pub struct Supervisor {
     /// once by [`Supervisor::take_mcp_report`] and surfaced to the user by
     /// the CLI wiring (TUI `push_system` / non-TTY stderr summary).
     mcp_report: Vec<McpServerLoadReport>,
+    /// Dedicated provider for side-calls (auto-summarize, session titles),
+    /// built from `[memory.context] summary_provider`/`summary_model` when
+    /// configured. `None` = unconfigured (side-calls use the main provider)
+    /// or the pinned build failed (warned + fell back to the main provider —
+    /// a bad summary route must never block the main flow). Refreshed at
+    /// the same points as `fallback` (`create`, `apply_agent_profile`,
+    /// `apply_nca_config`). Built with the pinned-clone pattern — never by
+    /// mutating `self.config` in place.
+    summary_provider: Option<Arc<dyn Provider>>,
+    /// Model name routed to [`Self::summary_provider`] (`summary_model`,
+    /// or the provider's configured default when unset). Kept beside the
+    /// provider so the two always agree after a rebuild.
+    summary_model_name: Option<String>,
 }
 /// Terminal `result_summary` stamped on ghost children by the resume sweep:
 /// the run was cut off by a parent-process restart, not by its own logic.
@@ -569,6 +582,56 @@ fn resolve_provider(
     match injected {
         Some(provider) => Ok((provider, None)),
         None => build_provider_with_tracker(config, event_tx),
+    }
+}
+
+/// Build the session-title side-call prompt (D1 tightened contract: ≤6
+/// words, no trailing punctuation, same language as the user's message,
+/// bare title only — no quotes, no explanation). Extracted so the shape
+/// is pinnable in tests.
+fn session_title_prompt(first_prompt: &str) -> String {
+    format!(
+        "Based on the user's first message below, generate a short session title. \
+         Requirements: at most 6 words, no trailing punctuation, written in the \
+         SAME language as the user's message. Output ONLY the title itself, \
+         nothing else — no quotes, no explanation, no full sentence.\
+         \n\nUser's first message:\n{first_prompt}"
+    )
+}
+
+/// Build the side-call (summary/title) provider from
+/// `[memory.context] summary_provider`/`summary_model`.
+///
+/// Mirrors the pinned-clone pattern of `resolve_fallback_entries`
+/// (factory.rs): clone the config, pin the target provider's model via
+/// `set_model_for`, then `build_provider_for` against the pinned clone —
+/// `self.config` is never mutated. Returns the provider plus the resolved
+/// model name (the pin, or the provider's configured default). `None` when
+/// `summary_provider` is unconfigured — side-calls then stay on the main
+/// provider with the session model (the pre-existing behavior).
+fn build_summary_provider(config: &NcaConfig) -> Option<(Arc<dyn Provider>, String)> {
+    let kind = config.memory.context.summary_provider?;
+    let mut pinned = config.clone();
+    let model = config
+        .memory
+        .context
+        .summary_model
+        .clone()
+        .unwrap_or_else(|| config.provider.model_for(kind).to_string());
+    pinned.provider.set_model_for(kind, model.clone());
+    match build_provider_for(&pinned, kind) {
+        Ok(provider) => Some((provider, model)),
+        // A broken summary route degrades to the main provider — warned,
+        // never fatal (side-calls must not block the main flow).
+        Err(e) => {
+            tracing::warn!(
+                provider = kind.display_name(),
+                model = %model,
+                error = %e,
+                "summary provider build failed; side-calls fall back to the main provider"
+            );
+            None
+        }
     }
 }
 
@@ -1007,6 +1070,10 @@ impl Supervisor {
         let context_manager =
             Self::make_context_manager(&config, &config.model.default_model).await;
 
+        // Side-call (summary/title) routing from [memory.context]; None =
+        // unconfigured or build-failed (warned inside, falls back to main).
+        let summary_route = build_summary_provider(&config);
+
         // Turn-commit durability wiring (P2 Phase B): the fanout signals each
         // committed TurnCompleted on the watch; run_turn waits for it.
         let (commit_tx, commit_rx) = watch::channel::<u64>(0);
@@ -1065,6 +1132,8 @@ impl Supervisor {
             live_config,
             skill_filter,
             mcp_report,
+            summary_provider: summary_route.as_ref().map(|(p, _)| Arc::clone(p)),
+            summary_model_name: summary_route.map(|(_, m)| m),
         };
         sup.save().await.map_err(ProviderError::Other)?;
         sup.update_last_session()
@@ -1817,9 +1886,16 @@ impl Supervisor {
         // Generate summary prompt
         let summary_prompt = self.context_manager.summary_prompt(&messages_to_summarize);
 
+        // Cache-prefix reuse: instead of flattening the conversation into a
+        // single prompt string, send a clone of the REAL messages plus a
+        // summary-instruction user message appended. A shared prefix with
+        // the main conversation lets DeepSeek-style disk caches hit on the
+        // prefix (cache_read priced at 1/50 of normal input).
+        let summary = self.summarize_conversation_with_ai(&summary_prompt).await;
+
         // Try to use the AI to summarize. If the provider supports a quick call,
         // we can use it. Otherwise, fall back to extractive summarization.
-        match self.summarize_with_ai(&summary_prompt).await {
+        match summary {
             Ok(summary) => {
                 // Apply the summary
                 let replaced = self
@@ -1868,19 +1944,148 @@ impl Supervisor {
     }
 
     /// Use AI to generate a summary of the conversation.
+    ///
+    /// Routes to the dedicated side-call provider
+    /// (`[memory.context] summary_provider`/`summary_model`) when configured,
+    /// otherwise the session's main provider + model.
     async fn summarize_with_ai(&self, prompt: &str) -> Result<String, String> {
         use nca_common::message::Message;
 
         let messages = vec![Message::user(prompt)];
+        let (provider, model): (&Arc<dyn Provider>, &str) = match (
+            self.summary_provider.as_ref(),
+            self.summary_model_name.as_deref(),
+        ) {
+            (Some(p), Some(m)) => (p, m),
+            // Half-configured route (build failure fallback keeps the pair
+            // consistent, but belt-and-braces): degrade to the main provider.
+            _ => (&self.agent.provider, &self.model),
+        };
 
-        let mut stream = self
-            .agent
-            .provider
-            .chat(&messages, &[], &self.model, self.workspace_root.as_path())
+        let mut stream = provider
+            .chat(&messages, &[], model, self.workspace_root.as_path())
             .await
             .map_err(|e| e.to_string())?;
 
         // Collect the response
+        let mut summary = String::new();
+        while let Some(chunk) = stream.recv().await {
+            match chunk {
+                nca_core::provider::StreamChunk::TextDelta(delta) => {
+                    summary.push_str(&delta);
+                }
+                nca_core::provider::StreamChunk::Done => break,
+                nca_core::provider::StreamChunk::Error(err) => {
+                    return Err(err.to_string());
+                }
+                _ => {}
+            }
+        }
+
+        Ok(summary.trim().to_string())
+    }
+
+    /// Token headroom reserved when clipping the cloned history for a
+    /// conversation-summary side-call: output budget + safety margin, so
+    /// the summary request itself can never overflow the window it just
+    /// tried to relieve (opencode RESERVE_MIN lesson).
+    const SUMMARY_RESERVE_TOKENS: usize = 16_384;
+
+    /// Conversation-summarize side-call: the REAL messages (clone) plus an
+    /// appended summary-instruction user message, normalized through the
+    /// summary provider's `prepare_messages_for_request`. The cloned history
+    /// is clipped oldest-first (non-system messages only) until it fits
+    /// `window − max_tokens − SUMMARY_RESERVE_TOKENS`, mirroring the main
+    /// loop's overflow-prune ladder. Falls back to [`Self::summarize_with_ai`]
+    /// (flat single-prompt shape) when there is nothing to clone.
+    async fn summarize_conversation_with_ai(&self, instruction: &str) -> Result<String, String> {
+        use nca_common::message::Message;
+
+        // Work on the messages marked for summarization — the same slice the
+        // flat prompt used — not the whole live history.
+        // `prepare_for_summary` truncates over-long messages to text AND
+        // strips image parts — without it an unprocessed attachment or a
+        // transcript-sized tool result reaches a text-only summary model and
+        // the request 400s (falling back to the extractive summary).
+        let source = self.context_manager.prepare_for_summary(
+            &self
+                .context_manager
+                .get_messages_to_summarize(&self.agent.messages),
+        );
+        if source.is_empty() {
+            return self.summarize_with_ai(instruction).await;
+        }
+
+        let (provider, model): (&Arc<dyn Provider>, &str) = match (
+            self.summary_provider.as_ref(),
+            self.summary_model_name.as_deref(),
+        ) {
+            (Some(p), Some(m)) => (p, m),
+            _ => (&self.agent.provider, &self.model),
+        };
+
+        // Clip oldest-first while over budget. System messages are always
+        // kept (they lead the request); the budget accounts for the appended
+        // instruction message and the reserve.
+        let window = self.context_manager.config().context_window_target.max(1);
+        let max_tokens = self.config.model.max_tokens as usize;
+        let budget = window
+            .saturating_sub(max_tokens)
+            .saturating_sub(Self::SUMMARY_RESERVE_TOKENS)
+            .max(1);
+        let instruction_tokens = crate::context_manager::ContextManager::estimate_tokens_for_slice(
+            &[Message::user(instruction)],
+        );
+        let mut clip_budget = budget.saturating_sub(instruction_tokens).max(1);
+
+        let mut messages: Vec<Message> = Vec::with_capacity(source.len() + 1);
+        // System messages first (always kept, never clipped).
+        let system_count = source.iter().take_while(|m| m.role == Role::System).count();
+        for message in &source[..system_count] {
+            clip_budget = clip_budget.saturating_sub(
+                crate::context_manager::ContextManager::estimate_tokens(message),
+            );
+            messages.push(message.clone());
+        }
+        // Newest-first retention: walk backwards collecting while budget
+        // allows, then reverse — this keeps the most recent context when the
+        // middle must be dropped.
+        let mut retained: Vec<Message> = Vec::new();
+        for message in source[system_count..].iter().rev() {
+            let cost = crate::context_manager::ContextManager::estimate_tokens(message);
+            if cost > clip_budget && !retained.is_empty() {
+                break;
+            }
+            clip_budget = clip_budget.saturating_sub(cost);
+            retained.push(message.clone());
+        }
+        retained.reverse();
+        // The clip point is arbitrary: it can land inside a tool-call batch.
+        // Drop leading orphan tool results (their assistant call was clipped
+        // away) and synthesize results for assistant calls whose results
+        // were clipped — otherwise a strict provider rejects the whole
+        // summary request with "tool_calls must be followed by tool
+        // messages" and compaction fails exactly when it is needed most.
+        while retained.first().is_some_and(|m| m.role == Role::Tool) {
+            retained.remove(0);
+        }
+        messages.extend(retained);
+        nca_core::agent::sanitize_tool_call_pairs(&mut messages);
+
+        messages.push(Message::user(instruction));
+
+        // Provider-specific normalization (e.g. MiniMax VLM rewrite) on the
+        // summary provider's own contract.
+        provider
+            .prepare_messages_for_request(&mut messages, self.workspace_root.as_path())
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let mut stream = provider
+            .chat(&messages, &[], model, self.workspace_root.as_path())
+            .await
+            .map_err(|e| e.to_string())?;
+
         let mut summary = String::new();
         while let Some(chunk) = stream.recv().await {
             match chunk {
@@ -2010,12 +2215,7 @@ impl Supervisor {
         if self.session_title.is_some() {
             return;
         }
-        let prompt = format!(
-            "Based on the user's first message below, generate a very short title \
-             (at most 20 words, in the same language as the user's message) that \
-             summarizes the topic of this coding session. Output ONLY the title, \
-             nothing else.\n\nUser's first message:\n{first_prompt}"
-        );
+        let prompt = session_title_prompt(first_prompt);
         match self.summarize_with_ai(&prompt).await {
             Ok(title) => {
                 let cleaned = title
@@ -2154,6 +2354,14 @@ impl Supervisor {
         self.agent
             .set_keepalive_profile(cache_keepalive::resolve_profile(effective.provider.default));
         self.agent.approval.set_mode(effective.permissions.mode);
+
+        // Side-call routing follows the config rebuild (same refresh point
+        // as `fallback`): a profile/config switch can change provider keys,
+        // so the summary provider must be re-resolved against the new
+        // config — never against a stale build.
+        let summary_route = build_summary_provider(&effective);
+        self.summary_provider = summary_route.as_ref().map(|(p, _)| Arc::clone(p));
+        self.summary_model_name = summary_route.map(|(_, m)| m);
 
         // Store profile and rebuild system prompt. `active_agent_name` is
         // assigned HERE, on the success path only: a failed switch above
@@ -2505,6 +2713,11 @@ impl Supervisor {
         agent.replace_provider(provider);
         agent.set_keepalive_profile(cache_keepalive::resolve_profile(provider_kind));
         self.rebuild_context_manager_sync();
+        // Side-call routing follows the config rebuild (same refresh point
+        // as `fallback`).
+        let summary_route = build_summary_provider(&self.config);
+        self.summary_provider = summary_route.as_ref().map(|(p, _)| Arc::clone(p));
+        self.summary_model_name = summary_route.map(|(_, m)| m);
         // Config changed (possibly `harness.skill_directories` or profile
         // definitions): re-fold the active profile's gate against the new
         // discovery roots.
@@ -3058,6 +3271,7 @@ pub(crate) fn should_overflow_retry(err: &ProviderError, already_retried: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nca_common::config::ContextConfig;
     use nca_common::session::ChildSessionState;
 
     /// Offline default config for supervisor construction in tests (mirrors
@@ -3753,6 +3967,244 @@ mod tests {
         }
     }
 
+    // ── D1: side-call (summary/title) provider routing ────────────
+
+    /// Records `(model, prompt)` per chat call and answers with a fixed
+    /// text. Lets supervisor tests observe exactly which provider/model a
+    /// side-call was routed to without any network.
+    #[derive(Default)]
+    struct RecordingProvider {
+        calls: std::sync::Mutex<Vec<(String, String)>>,
+        answer: &'static str,
+    }
+
+    impl RecordingProvider {
+        fn new(answer: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                answer,
+            })
+        }
+
+        fn calls(&self) -> Vec<(String, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for RecordingProvider {
+        async fn chat(
+            &self,
+            messages: &[Message],
+            _tools: &[nca_common::tool::ToolDefinition],
+            model: &str,
+            _workspace_root: &Path,
+        ) -> Result<tokio::sync::mpsc::Receiver<nca_core::provider::StreamChunk>, ProviderError>
+        {
+            self.calls.lock().unwrap().push((
+                model.to_string(),
+                messages
+                    .last()
+                    .map(|m| m.content.event_preview())
+                    .unwrap_or_default(),
+            ));
+            let (tx, rx) = tokio::sync::mpsc::channel(8);
+            let answer = self.answer.to_string();
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(nca_core::provider::StreamChunk::TextDelta(answer))
+                    .await;
+                let _ = tx.send(nca_core::provider::StreamChunk::Done).await;
+            });
+            Ok(rx)
+        }
+    }
+
+    /// Supervisor wired with an injected main provider (the recording
+    /// provider) — `summarize_with_ai` paths can then be driven offline.
+    async fn supervisor_with_recording_provider(
+        root: &Path,
+        main: Arc<RecordingProvider>,
+        context: ContextConfig,
+    ) -> Supervisor {
+        let _guard = SUPERVISOR_CREATE_LOCK.lock().await;
+        let mut config = NcaConfig::default();
+        config.provider.deepseek.api_key = Some("test-key".into());
+        config.permissions.mode = nca_common::config::PermissionMode::BypassPermissions;
+        config.memory.context.auto_detect_context_window = false;
+        config.memory.context.query_provider_models_api = false;
+        config.memory.context.enable_auto_summarize = false;
+        config.memory.context = context;
+        // Re-apply the offline guards a custom `context` may have reset.
+        config.memory.context.auto_detect_context_window = false;
+        config.memory.context.query_provider_models_api = false;
+        config.memory.context.enable_auto_summarize = false;
+        Supervisor::create(SupervisorConfig {
+            config,
+            workspace_root: root.to_path_buf(),
+            safe_mode: true,
+            interactive_approvals: false,
+            session_id: Some("summary-routing".into()),
+            approval_handler: None,
+            orchestration_context: None,
+            agent_name: None,
+            provider: Some(main),
+        })
+        .await
+        .expect("supervisor")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unconfigured_summary_calls_stay_on_main_provider_and_model() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = RecordingProvider::new("plain summary");
+        let sup =
+            supervisor_with_recording_provider(dir.path(), main.clone(), ContextConfig::default())
+                .await;
+
+        // No summary_provider configured → main provider, session model.
+        assert!(sup.summary_provider.is_none());
+        assert!(sup.summary_model_name.is_none());
+        let out = sup
+            .summarize_with_ai("summarize this")
+            .await
+            .expect("summary");
+        assert_eq!(out, "plain summary");
+        let calls = main.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, sup.model, "model must be the session model");
+        assert!(calls[0].1.contains("summarize this"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn configured_summary_provider_routes_side_calls_to_pinned_model() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = RecordingProvider::new("main says no");
+        let ctx = ContextConfig {
+            summary_provider: Some(ProviderKind::DeepSeek),
+            summary_model: Some("deepseek-chat-sidecall".into()),
+            ..Default::default()
+        };
+        let sup = supervisor_with_recording_provider(dir.path(), main.clone(), ctx).await;
+
+        // Structurally: the pinned build succeeded and carries the exact pin.
+        assert!(sup.summary_provider.is_some(), "pinned build must succeed");
+        assert_eq!(
+            sup.summary_model_name.as_deref(),
+            Some("deepseek-chat-sidecall")
+        );
+        // The main (injected) provider is distinct from the summary provider.
+        let main_dyn: Arc<dyn Provider> = main.clone();
+        assert!(
+            sup.summary_provider
+                .as_ref()
+                .is_some_and(|p| !Arc::ptr_eq(p, &main_dyn)),
+            "side-call must not route to the main provider"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn apply_nca_config_refreshes_summary_routing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = RecordingProvider::new("ok");
+        let mut sup =
+            supervisor_with_recording_provider(dir.path(), main.clone(), ContextConfig::default())
+                .await;
+        assert!(sup.summary_provider.is_none());
+
+        // Configure a route via apply_nca_config — the same refresh point as
+        // `fallback`. Keyless OpenAI would fail-loudly; DeepSeek with a key
+        // builds.
+        let mut next = sup.config().clone();
+        next.memory.context.summary_provider = Some(ProviderKind::DeepSeek);
+        next.memory.context.summary_model = Some("deepseek-chat-refresh".into());
+        sup.apply_nca_config(next).expect("apply config");
+        assert!(sup.summary_provider.is_some());
+        assert_eq!(
+            sup.summary_model_name.as_deref(),
+            Some("deepseek-chat-refresh")
+        );
+
+        // Clearing the route tears it down again.
+        let mut cleared = sup.config().clone();
+        cleared.memory.context.summary_provider = None;
+        cleared.memory.context.summary_model = None;
+        sup.apply_nca_config(cleared).expect("apply config");
+        assert!(sup.summary_provider.is_none());
+        assert!(sup.summary_model_name.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn summary_conversation_side_call_sends_real_messages_with_instruction() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Message-observing main provider: unconfigured route → the
+        // conversation side-call also lands here, and we can pin its shape.
+        let main = RecordingProvider::new("conv summary");
+        let mut sup =
+            supervisor_with_recording_provider(dir.path(), main.clone(), ContextConfig::default())
+                .await;
+
+        // Seed a history with a couple of turns so get_messages_to_summarize
+        // has content. Drive via run_turn so the history is recorded through
+        // the normal pipeline (the provider answers immediately).
+        sup.run_turn("hello world question").await.expect("turn");
+        sup.run_turn("another message to converse about")
+            .await
+            .expect("turn 2");
+
+        let out = sup
+            .summarize_conversation_with_ai("SUMMARIZE-INSTRUCTION-MARKER")
+            .await
+            .expect("summary");
+        assert_eq!(out, "conv summary");
+
+        let calls = main.calls();
+        // run_turn consumed two calls; the side-call is the LAST one and must
+        // carry the instruction as its final message.
+        let (_, last_prompt) = calls.last().expect("side-call recorded").clone();
+        assert!(
+            last_prompt.contains("SUMMARIZE-INSTRUCTION-MARKER"),
+            "instruction must ride as the final user message: {last_prompt}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_summary_build_falls_back_to_main_provider() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = RecordingProvider::new("fallback ok");
+        // OpenAI builds fail loudly without an API key → build_summary_provider
+        // warns and yields None.
+        let ctx = ContextConfig {
+            summary_provider: Some(ProviderKind::OpenAi),
+            summary_model: Some("gpt-test".into()),
+            ..Default::default()
+        };
+        let sup = supervisor_with_recording_provider(dir.path(), main.clone(), ctx).await;
+
+        assert!(
+            sup.summary_provider.is_none(),
+            "failed build must degrade to None"
+        );
+        assert!(sup.summary_model_name.is_none());
+        let out = sup.summarize_with_ai("still works").await.expect("summary");
+        assert_eq!(out, "fallback ok");
+        assert_eq!(main.calls().len(), 1);
+        assert_eq!(main.calls()[0].0, sup.model);
+    }
+
+    #[test]
+    fn session_title_prompt_is_tightened() {
+        // Shape pin for the ≤6-word / no-trailing-punctuation / same-language
+        // title contract (D1). The prompt is built inside generate_session_title;
+        // this pins the requirements text so a regression cannot slip silently.
+        let prompt = session_title_prompt("fix the login bug");
+        assert!(prompt.contains("at most 6 words"));
+        assert!(prompt.contains("no trailing punctuation"));
+        assert!(prompt.contains("SAME language"));
+        assert!(prompt.contains("ONLY the title"));
+        assert!(prompt.contains("fix the login bug"));
+    }
+
     #[test]
     fn resolve_provider_uses_injected_verbatim_else_builds() {
         // (a) injected provider is returned verbatim — `build_provider` skipped
@@ -3944,5 +4396,48 @@ mod tests {
             sup.sandbox_status().confined,
             "Required override must yield a confined PTY"
         );
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn summary_side_call_keeps_tool_pairing_after_clipping() {
+        // Build a history whose clip point necessarily falls inside a
+        // tool-call batch: one assistant message with two calls, then the
+        // tool results, repeated — and a tiny context window so most of it
+        // is dropped.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = RecordingProvider::new("summary");
+        let ctx = ContextConfig {
+            context_window_target: 2_000, // force aggressive clipping
+            ..Default::default()
+        };
+        let mut sup = supervisor_with_recording_provider(dir.path(), main.clone(), ctx).await;
+
+        for round in 0..6 {
+            let call_a = nca_common::message::MessageToolCall {
+                id: format!("a{round}"),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path": "src/main.rs"}),
+            };
+            let call_b = nca_common::message::MessageToolCall {
+                id: format!("b{round}"),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path": "src/lib.rs"}),
+            };
+            sup.agent.messages.push(Message::assistant_with_tool_calls(
+                "checking",
+                vec![call_a, call_b],
+            ));
+            // Only ONE of the two results is present — the shape that makes a
+            // strict provider reject the request.
+            sup.agent
+                .messages
+                .push(Message::tool(format!("a{round}"), "contents of main.rs"));
+        }
+
+        let out = sup
+            .summarize_conversation_with_ai("summarize the conversation")
+            .await
+            .expect("summary must succeed despite the ragged history");
+        assert_eq!(out, "summary");
+        assert_eq!(main.calls().len(), 1, "one side-call");
     }
 }

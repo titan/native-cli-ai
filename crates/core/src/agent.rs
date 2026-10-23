@@ -440,7 +440,7 @@ fn event_kind_label(event: &AgentEvent) -> String {
 /// This repairs the history in-place by injecting a synthetic error tool
 /// message for every missing `tool_call_id`. The repair is persisted to
 /// `self.messages`, so resumed sessions stay valid.
-pub(crate) fn sanitize_tool_call_pairs(messages: &mut Vec<Message>) {
+pub fn sanitize_tool_call_pairs(messages: &mut Vec<Message>) {
     const SYNTHETIC_RESULT: &str = "[tool execution interrupted — a budget or \
         pipeline limit was reached before this call ran; synthetic result \
         inserted to keep the message history valid for the provider]";

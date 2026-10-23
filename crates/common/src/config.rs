@@ -2522,6 +2522,16 @@ pub struct ContextConfig {
     /// `on` sends a compact cloned view while persisting canonical history.
     #[serde(default)]
     pub smart_compaction_mode: SmartCompactionMode,
+    /// Route side-calls (auto-summarize, session titles) to a cheaper
+    /// provider instead of the session's main provider. `None` (default)
+    /// keeps the current behavior (main provider + session model).
+    /// Set under `[memory.context]`, e.g. `summary_provider = "zhipuai"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_provider: Option<ProviderKind>,
+    /// Model name for side-calls when `summary_provider` is set. `None`
+    /// inherits the target provider's configured default model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_model: Option<String>,
 }
 
 /// Provider-request smart compaction mode.
@@ -2558,6 +2568,8 @@ impl Default for ContextConfig {
             auto_summarize_threshold: default_summarize_threshold(),
             enable_auto_summarize: default_true(),
             smart_compaction_mode: SmartCompactionMode::Off,
+            summary_provider: None,
+            summary_model: None,
         }
     }
 }
@@ -2753,6 +2765,12 @@ impl ContextConfig {
         }
         if let Some(smart_compaction_mode) = partial.smart_compaction_mode {
             self.smart_compaction_mode = smart_compaction_mode;
+        }
+        if let Some(summary_provider) = partial.summary_provider {
+            self.summary_provider = Some(summary_provider);
+        }
+        if let Some(summary_model) = partial.summary_model {
+            self.summary_model = Some(summary_model);
         }
     }
 }
@@ -3089,6 +3107,8 @@ struct PartialContextConfig {
     auto_summarize_threshold: Option<u8>,
     enable_auto_summarize: Option<bool>,
     smart_compaction_mode: Option<SmartCompactionMode>,
+    summary_provider: Option<ProviderKind>,
+    summary_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -3259,6 +3279,69 @@ mod tests {
         assert_eq!(
             fallback.max_retries, 0,
             "budget defaults to switch-immediately"
+        );
+    }
+
+    #[test]
+    fn summary_provider_config_parses_and_merges() {
+        let raw = r#"
+            [memory.context]
+            summary_provider = "zhipuai"
+            summary_model = "glm-5.3-flash"
+        "#;
+        let partial: PartialNcaConfig = toml::from_str(raw).expect("parse");
+        let mut config = NcaConfig::default();
+        config.merge(partial);
+        assert_eq!(
+            config.memory.context.summary_provider,
+            Some(ProviderKind::ZhipuAI)
+        );
+        assert_eq!(
+            config.memory.context.summary_model.as_deref(),
+            Some("glm-5.3-flash")
+        );
+    }
+
+    #[test]
+    fn summary_config_defaults_to_none_and_partial_merge_is_per_field() {
+        let mut config = NcaConfig::default();
+        assert_eq!(config.memory.context.summary_provider, None);
+        assert_eq!(config.memory.context.summary_model, None);
+
+        // A bare provider pin does not invent a model.
+        let partial: PartialNcaConfig =
+            toml::from_str("[memory.context]\nsummary_provider = \"kimi\"\n").expect("parse");
+        config.merge(partial);
+        assert_eq!(
+            config.memory.context.summary_provider,
+            Some(ProviderKind::Kimi)
+        );
+        assert_eq!(config.memory.context.summary_model, None);
+
+        // A bare model pin does not invent a provider (the model string is
+        // then inert — the supervisor only routes when a provider is set).
+        let mut config = NcaConfig::default();
+        let partial: PartialNcaConfig =
+            toml::from_str("[memory.context]\nsummary_model = \"whatever\"\n").expect("parse");
+        config.merge(partial);
+        assert_eq!(config.memory.context.summary_provider, None);
+        assert_eq!(
+            config.memory.context.summary_model.as_deref(),
+            Some("whatever")
+        );
+    }
+
+    #[test]
+    fn summary_provider_fields_skip_serialize_when_none() {
+        let config = ContextConfig::default();
+        let json = serde_json::to_string(&config).expect("serialize");
+        assert!(
+            !json.contains("summary_provider"),
+            "must skip when None: {json}"
+        );
+        assert!(
+            !json.contains("summary_model"),
+            "must skip when None: {json}"
         );
     }
 

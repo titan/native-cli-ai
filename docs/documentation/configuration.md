@@ -169,6 +169,10 @@ query_provider_models_api = true       # Fetch model limits from provider API
 max_retained_messages = 50
 auto_summarize_threshold = 75          # Percentage of context window used before summarizing
 enable_auto_summarize = true
+# Route side-calls (context summaries, session titles) to a cheaper model.
+# Omit both to reuse the session's own provider/model.
+# summary_provider = "deepseek"
+# summary_model = "deepseek-chat"
 ```
 
 ### `[hooks]` — Lifecycle Hooks
