@@ -14,10 +14,23 @@ use nca_common::message::{ContentPart, MessageContent, Role};
 use nca_common::session::{ChildSessionState, SessionState};
 use nca_core::agent_driver::InboxItem;
 use nca_core::tools::subagent_control::{SubagentControlRequest, SubagentControlResponse};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
+
+/// Cap on retained recent-activity entries per child (D6 projection): the
+/// ring keeps the newest [`RECENT_ACTIVITY_CAP`] one-liners for
+/// `task_status` output.
+pub(crate) const RECENT_ACTIVITY_CAP: usize = 8;
+
+/// One recent-activity line for a tracked child (D6):
+/// `[phase] detail`, stamped at observation time.
+#[derive(Debug, Clone)]
+pub struct ActivityEntry {
+    pub text: String,
+    pub at: tokio::time::Instant,
+}
 
 /// One tracked child (subagent) task.
 #[derive(Debug, Clone)]
@@ -60,6 +73,25 @@ pub struct SubagentRegistryEntry {
     /// so nothing sets this in production yet; the latch guards the seam
     /// for any future interactive-child path.
     pub interaction_pending: bool,
+    /// Ring of the child's most recent activity one-liners (D6 projection,
+    /// newest last, capped at [`RECENT_ACTIVITY_CAP`]). Fed live by the
+    /// parent-forward activity callback and rebuilt at resume by folding
+    /// `ChildSessionActivity` envelopes. Runtime-only projection state.
+    pub recent_activity: VecDeque<ActivityEntry>,
+    /// The child's LIFETIME token usage as last reported via
+    /// `ChildSessionCost` (D5). Independent account — the parent's own cost
+    /// tracker never sees these numbers.
+    ///
+    /// Snapshot, not accumulator: a revived child resumes the same session
+    /// and `seed_cost_tracker_from_log` restores its tracker to the prior
+    /// generations' total, so each terminal report is already the lifetime
+    /// figure. Summing reports would double-count generation 1 (oracle
+    /// review, D5) — the newest report wins instead.
+    pub accumulated_input_tokens: u64,
+    /// Output half of [`Self::accumulated_input_tokens`].
+    pub accumulated_output_tokens: u64,
+    /// Cache-read half of [`Self::accumulated_input_tokens`].
+    pub accumulated_cache_read_tokens: u64,
 }
 
 /// In-memory projection of spawned child tasks, keyed by child session id
@@ -132,6 +164,10 @@ impl SubagentRegistry {
             specialist: None,
             last_activity: tokio::time::Instant::now(),
             interaction_pending: false,
+            recent_activity: VecDeque::new(),
+            accumulated_input_tokens: 0,
+            accumulated_output_tokens: 0,
+            accumulated_cache_read_tokens: 0,
         });
     }
 
@@ -221,6 +257,15 @@ impl SubagentRegistry {
     /// life, whether or not the event is parent-visible. No-op for unknown
     /// ids (e.g. a heartbeat racing the registry fold at resume).
     pub fn note_activity(&self, child_session_id: &str) {
+        self.note_activity_with(child_session_id, None);
+    }
+
+    /// [`Self::note_activity`], optionally appending a one-line activity
+    /// entry to the child's recent-activity ring (D6): `text` arrives
+    /// preformatted (`[phase] detail`) from the parent-forward callback.
+    /// The ring evicts oldest beyond [`RECENT_ACTIVITY_CAP`]. Blank text is
+    /// ignored (heartbeat still stamped). No-op for unknown ids.
+    pub fn note_activity_with(&self, child_session_id: &str, text: Option<String>) {
         let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         let Some(entry) = entries
             .iter_mut()
@@ -229,6 +274,15 @@ impl SubagentRegistry {
             return;
         };
         entry.last_activity = tokio::time::Instant::now();
+        if let Some(text) = text.filter(|t| !t.trim().is_empty()) {
+            entry.recent_activity.push_back(ActivityEntry {
+                text,
+                at: tokio::time::Instant::now(),
+            });
+            while entry.recent_activity.len() > RECENT_ACTIVITY_CAP {
+                entry.recent_activity.pop_front();
+            }
+        }
     }
 
     /// Mark a tracked child as blocked on a pending approval/question (a
@@ -347,6 +401,36 @@ impl SubagentRegistry {
         Some(entry.generation)
     }
 
+    /// Fold a child's terminal cost snapshot into its entry (D5).
+    ///
+    /// Called by the live spawn path right after the `ChildSessionCost`
+    /// event is emitted, so the runtime projection never depends on whether
+    /// a parent fanout happened to consume that event; [`Self::apply_envelope`]
+    /// folds the same event on the resume path. Unknown ids are ignored,
+    /// same as every other fold.
+    pub fn record_cost(
+        &self,
+        child_session_id: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+    ) {
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(entry) = entries
+            .iter_mut()
+            .find(|e| e.session_id == child_session_id)
+        else {
+            return;
+        };
+        // Snapshot semantics (see the field docs): a report already covers
+        // every generation, so the newest one replaces the previous value.
+        // `max` guards against a stale/out-of-order report shrinking it.
+        entry.accumulated_input_tokens = entry.accumulated_input_tokens.max(input_tokens);
+        entry.accumulated_output_tokens = entry.accumulated_output_tokens.max(output_tokens);
+        entry.accumulated_cache_read_tokens =
+            entry.accumulated_cache_read_tokens.max(cache_read_tokens);
+    }
+
     /// Apply one event-log envelope: `ChildSessionSpawned` records the
     /// spawn, `ChildSessionStatusChanged` updates tracked fields, and
     /// `ChildSessionCompleted` folds the terminal state (without
@@ -416,6 +500,45 @@ impl SubagentRegistry {
                     ChildSessionState::from_spawn_status(status),
                     None,
                 )
+            }
+            // D5: fold the child's terminal cost snapshot into its entry —
+            // cumulative across generations (a revived child's second run
+            // adds on top). Unknown ids ignored, same as every fold.
+            AgentEvent::ChildSessionCost {
+                child_session_id,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                ..
+            } => {
+                self.record_cost(
+                    child_session_id,
+                    *input_tokens,
+                    *output_tokens,
+                    *cache_read_tokens,
+                );
+            }
+            // D6: fold forwarded activity into the ring (resume rebuilds
+            // the same projection the live path feeds).
+            AgentEvent::ChildSessionActivity {
+                child_session_id,
+                phase,
+                detail,
+            } => {
+                let text = format!("[{phase}] {detail}");
+                let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(entry) = entries
+                    .iter_mut()
+                    .find(|e| e.session_id == *child_session_id)
+                {
+                    entry.recent_activity.push_back(ActivityEntry {
+                        text,
+                        at: tokio::time::Instant::now(),
+                    });
+                    while entry.recent_activity.len() > RECENT_ACTIVITY_CAP {
+                        entry.recent_activity.pop_front();
+                    }
+                }
             }
             _ => {}
         }
@@ -533,7 +656,9 @@ impl Drop for ControlLease {
 }
 
 /// Last non-empty assistant message text from a session state, full text
-/// (joins `ContentPart::Text` parts; non-`Parts` content → `event_preview()`).
+/// (joins `ContentPart::Text` parts with a blank line — opencode #53040
+/// semantics: parts are separate paragraphs, and EMPTY parts must not
+/// inject stray blank lines; non-`Parts` content → `event_preview()`).
 /// Skips trailing tool/empty messages: a child that ended mid-tool-call or
 /// with a whitespace reply yields the previous real answer, or `None`.
 pub fn last_assistant_text(state: &SessionState) -> Option<String> {
@@ -545,11 +670,11 @@ pub fn last_assistant_text(state: &SessionState) -> Option<String> {
             MessageContent::Parts(parts) => parts
                 .iter()
                 .filter_map(|part| match part {
-                    ContentPart::Text { text } => Some(text.as_str()),
+                    ContentPart::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
-                .join("\n"),
+                .join("\n\n"),
             other => other.event_preview(),
         };
         if !text.trim().is_empty() {
@@ -576,6 +701,8 @@ fn response_from_state(session_id: &str, state: &SessionState) -> SubagentContro
         ok: true,
         error_message: None,
         generation: None,
+        recent_activity: Vec::new(),
+        cost: None,
     }
 }
 
@@ -691,7 +818,24 @@ pub fn subagent_control_consumer(
                             note: None,
                             ok: true,
                             error_message: None,
-                            generation: None,
+                            generation: Some(entry.generation),
+                            cost: (entry.accumulated_input_tokens > 0
+                                || entry.accumulated_output_tokens > 0)
+                                .then_some(
+                                    nca_core::tools::subagent_control::SubagentCostSummary {
+                                        input_tokens: entry.accumulated_input_tokens,
+                                        output_tokens: entry.accumulated_output_tokens,
+                                        cache_read_tokens: entry.accumulated_cache_read_tokens,
+                                    },
+                                ),
+                            // D6: newest-first activity projection (the ring
+                            // stores oldest-first, newest last).
+                            recent_activity: entry
+                                .recent_activity
+                                .iter()
+                                .rev()
+                                .map(|a| a.text.clone())
+                                .collect(),
                         },
                         // Registry miss → read-only disk fallback on the RAW
                         // original string: an alias never names a json on disk.
@@ -878,6 +1022,8 @@ async fn handle_message_request(
         ok,
         error_message: None,
         generation: None,
+        recent_activity: Vec::new(),
+        cost: None,
     };
     if entry.state != ChildSessionState::Running {
         return (
@@ -958,6 +1104,8 @@ async fn handle_cancel_request(
         ok,
         error_message: None,
         generation: Some(generation),
+        recent_activity: Vec::new(),
+        cost: None,
     };
     let Some(_lease) = registry.try_acquire_lease(&entry.session_id) else {
         return base(
@@ -1117,6 +1265,8 @@ async fn build_result_response(
         ok: true,
         error_message: None,
         generation: None,
+        recent_activity: Vec::new(),
+        cost: None,
     };
     if !state.is_terminal() {
         response.note = Some("task is still running".into());
@@ -1295,6 +1445,240 @@ mod tests {
         registry.record_terminal("ghost", ChildSessionState::Completed, Some("x".into()));
         assert!(registry.get("ghost").is_none());
         assert!(registry.list().is_empty());
+    }
+
+    // ── D5: terminal cost folding + resume rebuild ────────────
+
+    #[test]
+    fn child_session_cost_envelope_folds_into_accumulators() {
+        let registry = SubagentRegistry::new();
+        registry.record_spawned("parent", "c1", "t", "/ws".into(), None);
+
+        let cost_envelope = |generation: u64, input: u64, output: u64, cache_read: u64| {
+            EventEnvelope::new(
+                2,
+                AgentEvent::ChildSessionCost {
+                    parent_session_id: "parent".into(),
+                    child_session_id: "c1".into(),
+                    generation,
+                    input_tokens: input,
+                    output_tokens: output,
+                    cache_read_tokens: cache_read,
+                    estimated_cost_usd: 0.01,
+                },
+            )
+        };
+
+        // Each generation reports its LIFETIME total (resume seeds the child
+        // tracker with the prior generations), so replay yields the newest
+        // snapshot — summing would double-count generation 0.
+        registry.apply_envelope(&cost_envelope(0, 10_000, 2_500, 8_000));
+        registry.apply_envelope(&cost_envelope(1, 15_000, 3_000, 9_000));
+
+        let entry = registry.get("c1").expect("entry");
+        assert_eq!(entry.accumulated_input_tokens, 15_000);
+        assert_eq!(entry.accumulated_output_tokens, 3_000);
+        assert_eq!(entry.accumulated_cache_read_tokens, 9_000);
+    }
+
+    #[test]
+    fn child_session_cost_for_unknown_id_is_ignored() {
+        let registry = SubagentRegistry::new();
+        let envelope = EventEnvelope::new(
+            1,
+            AgentEvent::ChildSessionCost {
+                parent_session_id: "parent".into(),
+                child_session_id: "ghost".into(),
+                generation: 0,
+                input_tokens: 100,
+                output_tokens: 10,
+                cache_read_tokens: 0,
+                estimated_cost_usd: 0.0,
+            },
+        );
+        registry.apply_envelope(&envelope);
+        assert!(registry.get("ghost").is_none());
+    }
+
+    #[test]
+    fn child_session_cost_is_must_deliver_under_backpressure() {
+        // Low-frequency, terminal, one-shot: dropping it would silently hide
+        // child spend from the parent's log — deny by default policy.
+        let event = AgentEvent::ChildSessionCost {
+            parent_session_id: "p".into(),
+            child_session_id: "c".into(),
+            generation: 0,
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_tokens: 0,
+            estimated_cost_usd: 0.0,
+        };
+        assert!(!event.is_droppable_under_backpressure());
+        // Torn-tail tolerance: an older/missing-tail JSON still deserializes
+        // with zeroed numbers.
+        let raw = r#"{"type":"ChildSessionCost","parent_session_id":"p","child_session_id":"c"}"#;
+        let back: AgentEvent = serde_json::from_str(raw).expect("torn-tail tolerant");
+        assert!(matches!(back, AgentEvent::ChildSessionCost { .. }));
+    }
+
+    // ── D6: recent-activity ring + status projection ────────────
+
+    #[test]
+    fn recent_activity_ring_caps_at_eight_evicting_oldest() {
+        let registry = SubagentRegistry::new();
+        registry.record_spawned("parent", "c1", "t", "/ws".into(), None);
+
+        for i in 0..12 {
+            registry.note_activity_with("c1", Some(format!("[tool] step {i}")));
+        }
+        let entry = registry.get("c1").expect("entry");
+        assert_eq!(entry.recent_activity.len(), 8);
+        assert_eq!(entry.recent_activity.front().unwrap().text, "[tool] step 4");
+        assert_eq!(entry.recent_activity.back().unwrap().text, "[tool] step 11");
+    }
+
+    #[test]
+    fn note_activity_with_blank_text_stamps_heartbeat_without_ring_entry() {
+        let registry = SubagentRegistry::new();
+        registry.record_spawned("parent", "c1", "t", "/ws".into(), None);
+        let before = registry.get("c1").unwrap().last_activity;
+
+        registry.note_activity_with("c1", None);
+        registry.note_activity_with("c1", Some("   \n".into()));
+        registry.note_activity_with("c1", Some("real".into()));
+
+        let entry = registry.get("c1").expect("entry");
+        assert_eq!(entry.recent_activity.len(), 1);
+        assert_eq!(entry.recent_activity[0].text, "real");
+        assert!(entry.last_activity >= before);
+    }
+
+    #[test]
+    fn activity_envelope_folds_into_ring_and_resumes() {
+        let registry = SubagentRegistry::new();
+        let envelopes = vec![
+            spawned_envelope(1, "c1"),
+            EventEnvelope::new(
+                2,
+                AgentEvent::ChildSessionActivity {
+                    child_session_id: "c1".into(),
+                    phase: "read_file".into(),
+                    detail: "src/main.rs".into(),
+                },
+            ),
+            EventEnvelope::new(
+                3,
+                AgentEvent::ChildSessionActivity {
+                    child_session_id: "c1".into(),
+                    phase: "checkpoint".into(),
+                    detail: "halfway".into(),
+                },
+            ),
+        ];
+        for envelope in &envelopes {
+            registry.apply_envelope(envelope);
+        }
+        let entry = registry.get("c1").expect("entry");
+        let texts: Vec<&str> = entry
+            .recent_activity
+            .iter()
+            .map(|a| a.text.as_str())
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["[read_file] src/main.rs", "[checkpoint] halfway"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn task_status_reply_carries_recent_activity_newest_first() {
+        let (tx, rx) = mpsc::channel(8);
+        let registry = Arc::new(SubagentRegistry::new());
+        registry.record_spawned("parent", "c1", "t", "/ws".into(), None);
+        registry.note_activity_with("c1", Some("[tool] first".into()));
+        registry.note_activity_with("c1", Some("[tool] second".into()));
+        registry.note_activity_with("c1", Some("[checkpoint] third".into()));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::new(dir.path());
+        let _consumer = subagent_control_consumer(
+            rx,
+            registry,
+            store,
+            live_config(),
+            test_fs(),
+            std::path::PathBuf::from("/tmp/nca-registry-test-ws"),
+            None,
+        );
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(SubagentControlRequest::Status {
+            session_id: "c1".into(),
+            reply: reply_tx,
+        })
+        .await
+        .expect("send");
+        let resp = reply_rx.await.expect("reply");
+        assert!(resp.ok);
+        assert_eq!(
+            resp.recent_activity,
+            vec![
+                "[checkpoint] third".to_string(),
+                "[tool] second".to_string(),
+                "[tool] first".to_string(),
+            ],
+            "status output must carry newest-first activity"
+        );
+    }
+
+    #[test]
+    fn last_assistant_text_joins_nonempty_parts_with_blank_line() {
+        use nca_common::message::{ContentPart, MessageContent};
+        let part = |t: &str| ContentPart::Text { text: t.into() };
+        let mut state = empty_state("c1");
+        state.messages.push(nca_common::message::Message {
+            role: Role::Assistant,
+            content: MessageContent::Parts(vec![
+                part("first paragraph"),
+                part(""),      // empty part must not inject a blank line
+                part("   \n"), // whitespace-only likewise
+                part("second paragraph"),
+            ]),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+        });
+        let text = last_assistant_text(&state).expect("text");
+        assert_eq!(text, "first paragraph\n\nsecond paragraph");
+    }
+
+    fn empty_state(id: &str) -> SessionState {
+        SessionState {
+            meta: SessionMeta {
+                id: id.into(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                workspace: std::path::PathBuf::from("/tmp/ws"),
+                model: "m".into(),
+                status: SessionStatus::Completed,
+                pid: None,
+                socket_path: None,
+                worktree_path: None,
+                branch: None,
+                base_branch: None,
+                parent_session_id: None,
+                child_session_ids: Vec::new(),
+                inherited_summary: None,
+                spawn_reason: None,
+                session_summary: None,
+                session_title: None,
+                orchestration: None,
+                agent_name: None,
+            },
+            messages: Vec::new(),
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            estimated_cost_usd: 0.0,
+        }
     }
 
     #[test]
@@ -1871,9 +2255,11 @@ mod tests {
             reasoning_content: None,
         };
         let state = session_state(vec![assistant_parts], SessionStatus::Completed);
+        // D6: parts are paragraphs — joined with a blank line (opencode
+        // #53040 semantics).
         assert_eq!(
             last_assistant_text(&state).as_deref(),
-            Some("line one\nline two")
+            Some("line one\n\nline two")
         );
     }
 
@@ -2484,5 +2870,33 @@ mod tests {
             Some("another control operation is in flight for this task")
         );
         assert!(!leased_flag.load(std::sync::atomic::Ordering::SeqCst));
+    }
+    #[test]
+    fn record_cost_is_a_lifetime_snapshot_not_an_accumulator() {
+        // A revived child resumes the SAME session, so its tracker (and thus
+        // its report) already includes generation 1. Summing reports would
+        // double-count; the newest report must win.
+        let registry = SubagentRegistry::new();
+        registry.record_spawned("parent", "c1", "t", "/ws".into(), None);
+
+        // Generation 1: 12.3k in / 2.3k out.
+        registry.record_cost("c1", 12_345, 2_345, 9_000);
+        let entry = registry.get("c1").expect("entry");
+        assert_eq!(entry.accumulated_input_tokens, 12_345);
+
+        // Generation 2 report is the LIFETIME total (17.3k), not a delta.
+        registry.record_cost("c1", 17_345, 3_345, 12_000);
+        let entry = registry.get("c1").expect("entry");
+        assert_eq!(
+            entry.accumulated_input_tokens, 17_345,
+            "must be the lifetime snapshot, not 12_345 + 17_345"
+        );
+        assert_eq!(entry.accumulated_output_tokens, 3_345);
+        assert_eq!(entry.accumulated_cache_read_tokens, 12_000);
+
+        // An out-of-order/stale smaller report never shrinks the figure.
+        registry.record_cost("c1", 5_000, 1_000, 2_000);
+        let entry = registry.get("c1").expect("entry");
+        assert_eq!(entry.accumulated_input_tokens, 17_345);
     }
 }

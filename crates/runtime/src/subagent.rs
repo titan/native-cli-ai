@@ -523,11 +523,22 @@ pub async fn run_prepared_child(
         let id = child_id.clone();
         Arc::new(move || reg.note_activity(&id)) as crate::session_utils::ActivityHeartbeat
     });
+    // D6 activity projection: feed the registry's recent-activity ring from
+    // every parent-mappable event. Shares the registry Arc with the
+    // heartbeat — same lock domain, same "unknown id is a no-op" contract.
+    let activity_log = registry.as_ref().map(|reg| {
+        let reg = Arc::clone(reg);
+        let id = child_id.clone();
+        Arc::new(move |phase: &str, detail: &str| {
+            reg.note_activity_with(&id, Some(format!("[{phase}] {detail}")))
+        }) as Arc<dyn Fn(&str, &str) + Send + Sync>
+    });
     let parent_forward = match (&heartbeat, terminal_tx.as_ref()) {
         (beat, Some(tx)) => Some(crate::session_utils::ParentForward {
             child_id: child_id.clone(),
             tx: tx.clone(),
             heartbeat: beat.clone(),
+            activity_log: activity_log.clone(),
         }),
         // Registry-tracked child with no parent event channel (not a
         // production shape — every spawn consumer passes the session
@@ -541,6 +552,7 @@ pub async fn run_prepared_child(
                 child_id: child_id.clone(),
                 tx: dead_tx,
                 heartbeat: Some(Arc::clone(beat)),
+                activity_log,
             })
         }
         (None, None) => None,
@@ -608,6 +620,21 @@ pub async fn run_prepared_child(
     let wt_path = sup.worktree_path.clone().map(|p| p.display().to_string());
     let workspace_root = sup.workspace_root.display().to_string();
 
+    // D5 cost accounting — snapshot the child's own tracker BEFORE the
+    // supervisor is dropped. Reported as an INDEPENDENT account into the
+    // parent's event stream (never merged into the parent's tracker: the
+    // parent's CostGuard budget judgment must stay insensitive to child
+    // spend). The parent's registry folds it (resume-rebuildable).
+    let child_cost = {
+        let tracker = &sup.agent().cost_tracker;
+        (
+            tracker.input_tokens,
+            tracker.output_tokens,
+            tracker.cache_read_tokens,
+            tracker.estimated_cost_usd(),
+        )
+    };
+
     // Graceful drain: dropping `sup` closes the child's event channel (all
     // senders live inside `sup.agent`), letting the fanout drain its buffer
     // and hit the final commit-on-close. Bounded wait — liveness over
@@ -645,6 +672,31 @@ pub async fn run_prepared_child(
                 })
                 .await;
         }
+    }
+
+    // D5: terminal cost snapshot into the parent's event stream (after the
+    // status fold, before the result — ordering only matters for the log's
+    // readability; the registry folds it independently). Emitted even for
+    // registry-less runs when a parent channel exists (tests).
+    // The registry fold mirrors `apply_envelope`'s resume fold EXACTLY, and
+    // runs unconditionally (not only when a parent channel exists) so a
+    // registry-tracked child never reports stale zero usage through
+    // `task_status` just because no fanout was wired.
+    if let Some(ref registry) = registry {
+        registry.record_cost(&child_id, child_cost.0, child_cost.1, child_cost.2);
+    }
+    if let Some(ref tx) = terminal_tx {
+        let _ = tx
+            .send(AgentEvent::ChildSessionCost {
+                parent_session_id: parent_session_id.clone(),
+                child_session_id: child_id.clone(),
+                generation,
+                input_tokens: child_cost.0,
+                output_tokens: child_cost.1,
+                cache_read_tokens: child_cost.2,
+                estimated_cost_usd: child_cost.3,
+            })
+            .await;
     }
 
     ChildSessionResult {
@@ -737,6 +789,8 @@ pub async fn handle_revive_request(
             ok,
             error_message: error,
             generation: None,
+            recent_activity: Vec::new(),
+            cost: None,
         };
 
     // The lease covers only the mutation prefix (cancel-wait + resume +
@@ -897,6 +951,8 @@ pub async fn handle_revive_request(
         ok: true,
         error_message: None,
         generation: Some(generation),
+        recent_activity: Vec::new(),
+        cost: None,
     }
 }
 
@@ -1558,9 +1614,9 @@ async fn complete_child_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nca_common::config::AgentProfileConfig;
+    use nca_common::config::{AgentProfileConfig, PermissionMode};
     use nca_common::tool::{ToolCall, ToolDefinition, ToolResult};
-    use nca_core::provider::ProviderError;
+    use nca_core::provider::{Provider, ProviderError};
     use nca_core::tools::{ToolExecutor, ToolRegistry};
 
     #[test]
@@ -1573,6 +1629,143 @@ mod tests {
             "set flag wins even for a provider error"
         );
         assert!(!turn_was_cancelled(&other_err, false));
+    }
+
+    // ── D5: terminal cost snapshot into the parent event stream ──
+
+    /// Provider whose stream reports a Usage chunk before the answer, so
+    /// the child's `cost_tracker` accumulates known numbers.
+    struct UsageReportingProvider {
+        input: u64,
+        output: u64,
+        cache_read: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for UsageReportingProvider {
+        async fn chat(
+            &self,
+            _messages: &[nca_common::message::Message],
+            _tools: &[ToolDefinition],
+            _model: &str,
+            _workspace_root: &Path,
+        ) -> Result<mpsc::Receiver<nca_core::provider::StreamChunk>, ProviderError> {
+            let (tx, rx) = mpsc::channel(16);
+            let (input, output, cache_read) = (self.input, self.output, self.cache_read);
+            tokio::spawn(async move {
+                use nca_core::provider::StreamChunk;
+                let _ = tx
+                    .send(StreamChunk::Usage {
+                        input_tokens: input,
+                        output_tokens: output,
+                        cache_creation_tokens: 0,
+                        cache_read_tokens: cache_read,
+                    })
+                    .await;
+                let _ = tx.send(StreamChunk::TextDelta("done".into())).await;
+                let _ = tx
+                    .send(StreamChunk::Finish {
+                        reason: "stop".into(),
+                    })
+                    .await;
+                let _ = tx.send(StreamChunk::Done).await;
+            });
+            Ok(rx)
+        }
+    }
+
+    /// Offline child config mirroring the supervisor test harness shape.
+    fn offline_child_config() -> NcaConfig {
+        let mut config = NcaConfig::default();
+        config.provider.deepseek.api_key = Some("test-key".into());
+        config.permissions.mode = PermissionMode::BypassPermissions;
+        config.memory.context.auto_detect_context_window = false;
+        config.memory.context.query_provider_models_api = false;
+        config.memory.context.enable_auto_summarize = false;
+        config
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_prepared_child_reports_terminal_cost_equal_to_tracker_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = offline_child_config();
+        let provider = Arc::new(UsageReportingProvider {
+            input: 12_345,
+            output: 2_345,
+            cache_read: 9_000,
+        });
+        let registry = Arc::new(crate::subagent_registry::SubagentRegistry::new());
+        let (event_tx, mut event_rx) = mpsc::channel(256);
+
+        let (sup, prepared) = prepare_child_session(
+            ChildSessionConfig {
+                parent_session_id: "parent-1".into(),
+                task: "report cost".into(),
+                workspace_root: dir.path().to_path_buf(),
+                config,
+                parent_summary: "ctx".into(),
+                use_worktree: false,
+                focus_files: Vec::new(),
+                images: Vec::new(),
+                provider_override: None,
+                model_override: None,
+                specialist: None,
+                alias: None,
+                registry: Some(Arc::clone(&registry)),
+                provider: Some(provider as Arc<dyn nca_core::provider::Provider>),
+                plugins: None,
+                escaped_providers: HashSet::new(),
+            },
+            Some(event_tx),
+        )
+        .await
+        .expect("prepare child");
+
+        let result = run_prepared_child(sup, prepared).await;
+        assert_eq!(result.status, "completed");
+        eprintln!(
+            "DBG child status={} output={:?}",
+            result.status, result.output
+        );
+
+        // The terminal ChildSessionCost must carry exactly the child's
+        // tracker numbers (one provider call, one Usage chunk).
+        let mut cost: Option<(u64, u64, u64, f64)> = None;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_secs(5), event_rx.recv()).await
+        {
+            if let AgentEvent::ChildSessionCost {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                estimated_cost_usd,
+                child_session_id,
+                parent_session_id,
+                generation,
+            } = event
+            {
+                assert_eq!(child_session_id, result.child_session_id);
+                assert_eq!(parent_session_id, "parent-1");
+                assert_eq!(generation, 0);
+                cost = Some((
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    estimated_cost_usd,
+                ));
+            }
+        }
+        let (input, output, cache_read, est) = cost.expect("ChildSessionCost must be reported");
+        assert_eq!(input, 12_345);
+        assert_eq!(output, 2_345);
+        assert_eq!(cache_read, 9_000);
+        assert!(est > 0.0, "estimate must be computed, got {est}");
+
+        // Registry fold: the same numbers landed on the entry.
+        let entry = registry.get(&result.child_session_id).expect("entry");
+        assert_eq!(entry.accumulated_input_tokens, 12_345);
+        assert_eq!(entry.accumulated_output_tokens, 2_345);
+        assert_eq!(entry.accumulated_cache_read_tokens, 9_000);
     }
 
     #[test]

@@ -73,6 +73,29 @@ pub struct SubagentControlResponse {
     /// fresh spawn). Absent on P1 responses and pre-revive replies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation: Option<u64>,
+    /// The child's recent activity one-liners (`[phase] detail`), newest
+    /// first, capped at 8 entries. Present on `task_status` replies (the
+    /// child's live projection); empty when the registry has no activity
+    /// on record. `#[serde(default)]` keeps pre-D6 log JSON deserializable.
+    #[serde(default)]
+    pub recent_activity: Vec<String>,
+    /// The child's lifetime token usage as last reported (D5). Independent
+    /// account: never added to the parent's own cost tracker, so it cannot
+    /// move the parent's budget judgment. Absent until the child reaches a
+    /// terminal state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<SubagentCostSummary>,
+}
+
+/// Token usage a child task reported at its last terminal transition.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SubagentCostSummary {
+    /// Lifetime input tokens (all generations of the child session).
+    pub input_tokens: u64,
+    /// Lifetime output tokens.
+    pub output_tokens: u64,
+    /// Cache-read tokens (priced at 1/50 by the cost tracker).
+    pub cache_read_tokens: u64,
 }
 
 impl SubagentControlResponse {
@@ -93,6 +116,8 @@ impl SubagentControlResponse {
             ok: false,
             error_message: Some(message.into()),
             generation: None,
+            recent_activity: Vec::new(),
+            cost: None,
         }
     }
 }
@@ -259,9 +284,9 @@ impl ToolExecutor for TaskStatusTool {
             timeout_ms: None,
             name: "task_status".into(),
             description: "Read-only live status of a spawned subagent task: lifecycle state \
-                (running/completed/cancelled/failed), task text, workspace, branch, and result \
-                summary. Use the child session id returned by spawn_subagent. Never modifies \
-                the task."
+                (running/completed/cancelled/failed), task text, workspace, branch, result \
+                summary, and the child's recent activity. Use the child session id \
+                returned by spawn_subagent. Never modifies the task."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -516,6 +541,8 @@ mod tests {
             ok: true,
             error_message: None,
             generation: None,
+            recent_activity: Vec::new(),
+            cost: None,
         }
     }
 
@@ -534,6 +561,8 @@ mod tests {
             ok: true,
             error_message: None,
             generation: Some(2),
+            recent_activity: Vec::new(),
+            cost: None,
         }
     }
 
@@ -926,5 +955,9 @@ mod tests {
         let back: SubagentControlResponse =
             serde_json::from_value(p1).expect("P1 JSON must stay deserializable");
         assert_eq!(back.generation, None);
+        assert!(
+            back.recent_activity.is_empty(),
+            "pre-D6 JSON carries no activity — default empty"
+        );
     }
 }

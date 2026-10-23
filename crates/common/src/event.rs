@@ -251,6 +251,28 @@ pub enum AgentEvent {
         /// One-line detail for the sidebar/transcript.
         detail: String,
     },
+    /// Terminal cost snapshot of a finished child session, reported into
+    /// the parent's event stream by the child runner at terminal state
+    /// (independent account — NOT merged into the parent's cost tracker,
+    /// so `CostGuard` budget judgments are unchanged). Folded into the
+    /// parent's `SubagentRegistry` (P1 projection; rebuildable at resume).
+    /// Informational: replay surfaces ignore it.
+    ChildSessionCost {
+        parent_session_id: String,
+        child_session_id: String,
+        /// Generation the cost was accrued in (`task_revive` bumps it).
+        #[serde(default)]
+        generation: u64,
+        #[serde(default)]
+        input_tokens: u64,
+        #[serde(default)]
+        output_tokens: u64,
+        #[serde(default)]
+        cache_read_tokens: u64,
+        /// Estimate-grade USD cost (child's own rate table snapshot).
+        #[serde(default)]
+        estimated_cost_usd: f64,
+    },
     /// User must pick an option, use the suggested answer, or enter custom text.
     /// Emitted when the `ask_question` tool runs; answer via `AgentCommand::AnswerQuestion` or local CLI.
     QuestionRequested {
