@@ -138,6 +138,58 @@ impl ToolExecutor for McpTool {
     }
 }
 
+/// Normalize one MCP `inputSchema` into a provider-safe parameter schema.
+///
+/// MCP servers routinely omit `required` (or send it explicitly as `null`).
+/// Constructing the parameters object with `schema.get("required")` serializes
+/// the absent case as JSON `null`, and strict providers reject the whole
+/// request — DeepSeek answers `Invalid schema for function …: null is not of
+/// type "array"` for a single offending tool. Every `null` object member is
+/// dropped (recursively, including nested object schemas), then the
+/// object-schema invariants providers validate are normalized: `type` is
+/// forced to `"object"`, `properties` defaults to `{}`, and `required`
+/// defaults to `[]`.
+///
+/// Null members are only stripped from objects, never from arrays: `"enum":
+/// [null, "a"]` is meaningful and must survive intact.
+fn normalize_mcp_parameters(schema: &Value) -> Value {
+    let mut parameters = match schema {
+        Value::Object(map) => Value::Object(map.clone()),
+        _ => Value::Object(serde_json::Map::new()),
+    };
+    strip_null_members(&mut parameters);
+
+    if let Some(map) = parameters.as_object_mut() {
+        map.insert("type".to_string(), Value::String("object".to_string()));
+        if !matches!(map.get("properties"), Some(Value::Object(_))) {
+            map.insert("properties".to_string(), Value::Object(Default::default()));
+        }
+        if !matches!(map.get("required"), Some(Value::Array(_))) {
+            map.insert("required".to_string(), Value::Array(Vec::new()));
+        }
+    }
+
+    parameters
+}
+
+/// Recursively drop `null`-valued members from JSON objects.
+fn strip_null_members(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.retain(|_, member| !member.is_null());
+            for member in map.values_mut() {
+                strip_null_members(member);
+            }
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                strip_null_members(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Bounded stderr tail buffer shared with the background drain task.
 type StderrTail = Arc<Mutex<Vec<u8>>>;
 
@@ -341,12 +393,8 @@ async fn discover_server_tools(
     let result: Vec<McpTool> = tools
         .into_iter()
         .map(|tool| {
-            let schema = tool.input_schema.as_ref();
-            let parameters = serde_json::json!({
-                "type": "object",
-                "properties": schema.get("properties"),
-                "required": schema.get("required"),
-            });
+            let parameters =
+                normalize_mcp_parameters(&Value::Object(tool.input_schema.as_ref().clone()));
 
             McpTool {
                 server: server.clone(),
@@ -553,6 +601,117 @@ mod tests {
             elapsed < std::time::Duration::from_secs(2),
             "load must return within the budget, took {elapsed:?}"
         );
+    }
+
+    /// MCP server schema with no `required` must not leak `null` onto the
+    /// wire — strict providers (DeepSeek) reject the whole request with
+    /// `null is not of type "array"`, taking every other tool down with it.
+    #[test]
+    fn normalize_parameters_defaults_missing_required_to_empty_array() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "path": { "type": "string" } }
+        });
+        let parameters = normalize_mcp_parameters(&schema);
+
+        assert_eq!(parameters["type"], "object");
+        assert_eq!(parameters["required"], serde_json::json!([]));
+        assert_eq!(parameters["properties"]["path"]["type"], "string");
+    }
+
+    /// Explicit `"required": null` (seen from JVM/JS MCP servers) is
+    /// normalized the same way as an absent key.
+    #[test]
+    fn normalize_parameters_rewrites_explicit_null_required() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": null
+        });
+        let parameters = normalize_mcp_parameters(&schema);
+        assert_eq!(parameters["required"], serde_json::json!([]));
+    }
+
+    /// A schema with neither `properties` nor `required` (freerouting's
+    /// `create_session`) becomes a valid empty object schema.
+    #[test]
+    fn normalize_parameters_handles_empty_schema() {
+        let parameters = normalize_mcp_parameters(&serde_json::json!({}));
+        assert_eq!(parameters["type"], "object");
+        assert_eq!(parameters["properties"], serde_json::json!({}));
+        assert_eq!(parameters["required"], serde_json::json!([]));
+    }
+
+    /// Nested object schemas are sanitized too — one leaking `null` inside
+    /// `properties` fails validation just as hard as the top level.
+    #[test]
+    fn normalize_parameters_strips_nested_nulls() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "opts": {
+                    "type": "object",
+                    "properties": { "depth": { "type": "integer" } },
+                    "required": null,
+                    "description": null
+                }
+            },
+            "required": ["opts"]
+        });
+        let parameters = normalize_mcp_parameters(&schema);
+        let opts = &parameters["properties"]["opts"];
+
+        assert!(opts.get("required").is_none(), "nested null removed");
+        assert!(opts.get("description").is_none());
+        assert_eq!(opts["properties"]["depth"]["type"], "integer");
+        assert_eq!(parameters["required"], serde_json::json!(["opts"]));
+    }
+
+    /// `null` inside an array is semantic (`enum: [null, "a"]`) and must not
+    /// be stripped — only null *members* of objects are dropped.
+    #[test]
+    fn normalize_parameters_keeps_null_inside_arrays() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "mode": { "enum": [null, "wire", "via"] }
+            },
+            "required": ["mode"]
+        });
+        let parameters = normalize_mcp_parameters(&schema);
+        assert_eq!(
+            parameters["properties"]["mode"]["enum"],
+            serde_json::json!([null, "wire", "via"])
+        );
+    }
+
+    /// Rich schema details (descriptions, defaults, enums, nested $defs
+    /// references) survive normalization — the parameters are passed through
+    /// rather than rebuilt from three keys.
+    #[test]
+    fn normalize_parameters_preserves_schema_details() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "$defs": { "Layer": { "type": "string" } },
+            "properties": {
+                "layer": {
+                    "type": "string",
+                    "description": "Copper layer",
+                    "enum": ["F.Cu", "B.Cu"],
+                    "default": "F.Cu"
+                }
+            },
+            "required": ["layer"]
+        });
+        let parameters = normalize_mcp_parameters(&schema);
+
+        assert_eq!(parameters["$defs"]["Layer"]["type"], "string");
+        assert_eq!(
+            parameters["properties"]["layer"]["description"],
+            "Copper layer"
+        );
+        assert_eq!(parameters["properties"]["layer"]["default"], "F.Cu");
+        assert_eq!(parameters["required"], serde_json::json!(["layer"]));
     }
 
     /// Disabled servers are skipped entirely — no report, no spawn.
