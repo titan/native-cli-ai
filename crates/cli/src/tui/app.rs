@@ -74,6 +74,8 @@ pub enum TuiCmd {
 
     /// Open sessions picker/info.
     OpenSessions,
+    /// Open the subagent view modal (P2: family list + child readers).
+    OpenSubagentView,
     /// Cycle to the next recent model (F2 forward, Shift+F2 backward).
     CycleModel(bool),
     /// Validate an API key for onboarding (provider, api_key).

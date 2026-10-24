@@ -26,6 +26,7 @@ pub(crate) mod model_picker;
 pub(crate) mod permission_picker;
 pub(crate) mod provider_picker;
 pub(crate) mod session_picker;
+pub(crate) mod subagent_view;
 
 // ── Remaining stub components (not yet migrated) ────────────────
 
@@ -70,6 +71,7 @@ pub(crate) struct Components {
     pub(crate) agent_picker: Option<agent_picker::AgentPickerState>,
     pub(crate) permission_picker: Option<permission_picker::PermissionPickerState>,
     pub(crate) session_picker: Option<session_picker::SessionPickerState>,
+    pub(crate) subagent_view: Option<subagent_view::SubagentViewState>,
     pub(crate) connect_modal: Option<connect_modal::ConnectModalState>,
     pub(crate) api_key_modal: Option<api_key_modal::ApiKeyModalState>,
     pub(crate) info_modal: Option<info_modal::InfoModalState>,
@@ -93,6 +95,7 @@ impl Components {
             agent_picker: None,
             permission_picker: None,
             session_picker: None,
+            subagent_view: None,
             connect_modal: None,
             api_key_modal: None,
             info_modal: None,
@@ -111,6 +114,7 @@ impl Components {
             || self.agent_picker.is_some()
             || self.permission_picker.is_some()
             || self.session_picker.is_some()
+            || self.subagent_view.is_some()
             || self.connect_modal.is_some()
             || self.api_key_modal.is_some()
             || self.info_modal.is_some()
@@ -202,6 +206,12 @@ impl Components {
                             None
                         }
                     }
+                    CompId::SubagentView if self.subagent_view.is_some() => {
+                        // Keys need the reader viewport height for PgUp/PgDn,
+                        // which only the model knows — the model routes keys
+                        // for this modal itself (dispatch_popup_key).
+                        None
+                    }
                     CompId::ConnectModal if self.connect_modal.is_some() => {
                         if let Msg::Key(key) = ev {
                             let action = self.connect_modal.as_mut()?.handle_key(*key);
@@ -250,6 +260,13 @@ impl Components {
             command_palette::CommandPaletteAction::SubmitCommand(cmd) => {
                 self.command_palette = None;
                 Some(Msg::Cmd(TuiCmd::Submit(cmd)))
+            }
+            command_palette::CommandPaletteAction::OpenSubagentView => {
+                // Key routing for the subagent view lives in the model
+                // (needs the reader viewport height); the model also mounts
+                // it from this action, so the generic dispatch path never
+                // sees it.
+                None
             }
         }
     }

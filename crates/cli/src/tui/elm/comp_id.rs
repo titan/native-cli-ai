@@ -15,6 +15,7 @@ pub(crate) enum CompId {
     AgentPicker,
     PermissionPicker,
     SessionPicker,
+    SubagentView,
     ConnectModal,
     ApiKeyModal,
     InfoModal,

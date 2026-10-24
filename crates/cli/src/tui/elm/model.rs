@@ -15,12 +15,17 @@ use super::comp_id::CompId;
 use super::components::transcript::TranscriptAction;
 use super::components::{
     Components, agent_picker, api_key_modal, branch_picker, command_palette, connect_modal,
-    info_modal, model_picker, permission_picker, provider_picker, session_picker,
+    info_modal, model_picker, permission_picker, provider_picker, session_picker, subagent_view,
 };
 use super::feedback::TuiFeedbackMsg;
 use super::msg::Msg;
+use super::subagent_family::{
+    FamilyCache, LiveChild, build_family_index_cached, merge_live_entries,
+};
 use crate::tui::app::TuiCmd;
 use crate::tui::busy_indicator;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
@@ -132,6 +137,17 @@ pub(crate) struct NcaModel {
     pub(crate) last_animation_draw: Instant,
     /// Number of steering messages queued in the agent inbox during this turn.
     pub(crate) queued_count: u32,
+    /// Sessions dir (`<workspace>/.nca/sessions`) for the subagent view's
+    /// disk-side family scan + child log reads (P2). Empty in tests that
+    /// don't care.
+    pub(crate) sessions_dir: std::path::PathBuf,
+    /// Current session id (family root for the subagent view).
+    pub(crate) session_id: String,
+    /// mtime-keyed cache of per-file family facts (Fix A): lifecycle-event
+    /// rebuilds while the subagent view is open reuse unchanged files, so a
+    /// rebuild costs O(dir listing + changed files) instead of re-reading
+    /// and re-parsing every session json.
+    pub(crate) family_cache: FamilyCache,
 }
 
 impl NcaModel {
@@ -139,6 +155,24 @@ impl NcaModel {
         bridge_rx: tokio::sync::mpsc::UnboundedReceiver<TuiFeedbackMsg>,
         cmd_tx: tokio::sync::mpsc::UnboundedSender<Msg>,
         side_effects: SideEffectChannels,
+    ) -> Self {
+        Self::new_with_session(
+            bridge_rx,
+            cmd_tx,
+            side_effects,
+            PathBuf::new(),
+            String::new(),
+        )
+    }
+
+    /// Real constructor: carries the sessions dir + current session id the
+    /// subagent view needs for its disk-side family scan.
+    pub(crate) fn new_with_session(
+        bridge_rx: tokio::sync::mpsc::UnboundedReceiver<TuiFeedbackMsg>,
+        cmd_tx: tokio::sync::mpsc::UnboundedSender<Msg>,
+        side_effects: SideEffectChannels,
+        sessions_dir: std::path::PathBuf,
+        session_id: String,
     ) -> Self {
         Self {
             components: Components::new(),
@@ -152,6 +186,9 @@ impl NcaModel {
             size: (80, 24),
             last_animation_draw: Instant::now(),
             queued_count: 0,
+            sessions_dir,
+            session_id,
+            family_cache: FamilyCache::default(),
         }
     }
 
@@ -194,6 +231,16 @@ impl NcaModel {
 
         // 2. Drain bridge events (non-blocking, budgeted)
         self.drain_bridge();
+
+        // 2b. Subagent view live tail (P2 R6): only while the Reader is open
+        //     on a Running child; bounded incremental read on this (blocking)
+        //     thread. A tail append must force a redraw.
+        if let Some(ref mut v) = self.components.subagent_view
+            && v.wants_tail()
+        {
+            v.on_tick_tail();
+            self.redraw = true;
+        }
 
         // 3. Sync popup_open flag
         self.popup_open = self.components.sync_popup_open();
@@ -270,6 +317,11 @@ impl NcaModel {
                     command_palette::CommandPaletteAction::None => Msg::Redraw,
                     command_palette::CommandPaletteAction::Close => {
                         self.components.command_palette = None;
+                        Msg::Redraw
+                    }
+                    command_palette::CommandPaletteAction::OpenSubagentView => {
+                        self.components.command_palette = None;
+                        self.open_subagent_view();
                         Msg::Redraw
                     }
                     command_palette::CommandPaletteAction::SubmitCommand(cmd) => {
@@ -447,6 +499,26 @@ impl NcaModel {
                 return Some(msg);
             }
         }
+        if let Some(ref mut v) = self.components.subagent_view {
+            // PgUp/PgDn step by the reader viewport height; the popup spans
+            // ~70% of the terminal, minus borders + hint line.
+            let viewport_rows = (self.size.1 as usize)
+                .saturating_mul(7)
+                .div_ceil(10)
+                .saturating_sub(3)
+                .max(1);
+            let action = v.handle_key(key, viewport_rows);
+            match action {
+                subagent_view::SubagentViewAction::Close => {
+                    self.components.subagent_view = None;
+                }
+                subagent_view::SubagentViewAction::Refresh => {
+                    self.rebuild_subagent_family();
+                }
+                subagent_view::SubagentViewAction::None => {}
+            }
+            return Some(Msg::Redraw);
+        }
         None
     }
 
@@ -513,6 +585,9 @@ impl NcaModel {
                         session_id, model, ..
                     } => {
                         self.components.status_bar.update_session(session_id, model);
+                        // Family root may have changed (resume/switch): keep
+                        // the subagent view's root in sync.
+                        self.session_id = session_id.clone();
                     }
                     AgentEvent::CostUpdated {
                         input_tokens,
@@ -539,6 +614,33 @@ impl NcaModel {
                         // A queued steering message was claimed by the agent.
                         self.queued_count = self.queued_count.saturating_sub(1);
                         self.components.status_bar.set_queued(self.queued_count);
+                    }
+                    AgentEvent::ChildSessionSpawned {
+                        child_session_id, ..
+                    } => {
+                        self.observe_child(
+                            child_session_id,
+                            nca_common::session::ChildSessionState::Running,
+                        );
+                    }
+                    AgentEvent::ChildSessionStatusChanged {
+                        child_session_id,
+                        state,
+                        ..
+                    } => {
+                        self.observe_child(child_session_id, *state);
+                    }
+                    AgentEvent::ChildSessionCompleted {
+                        child_session_id,
+                        status,
+                        ..
+                    } => {
+                        // Terminal fold: map the spawn-status string the same
+                        // way the registry does (unknown → keep Running; the
+                        // authoritative StatusChanged follows for real runs).
+                        let state =
+                            nca_common::session::ChildSessionState::from_spawn_status(status);
+                        self.observe_child(child_session_id, state);
                     }
                     AgentEvent::TurnCompleted { .. } => {
                         self.queued_count = 0;
@@ -744,6 +846,9 @@ impl NcaModel {
                     .open(entries, current);
                 self.popup_open = true;
             }
+            TuiFeedbackMsg::OpenSubagentView => {
+                self.open_subagent_view();
+            }
             TuiFeedbackMsg::OpenConnectModal => {
                 self.components
                     .connect_modal
@@ -768,6 +873,7 @@ impl NcaModel {
                 self.components.status_bar.set_busy(state);
             }
             TuiFeedbackMsg::ResetSessionState { session_id, model } => {
+                self.session_id = session_id.clone();
                 self.components.transcript.clear();
                 self.components
                     .status_bar
@@ -820,6 +926,56 @@ impl NcaModel {
                 self.components.transcript.toggle_all_tool_output();
             }
         }
+    }
+
+    // ── Subagent view plumbing (P2) ────────────────────────────────
+
+    /// Record a live child observation; rebuild the open view's family so
+    /// lifecycle transitions are visible immediately.
+    fn observe_child(&mut self, child_id: &str, state: nca_common::session::ChildSessionState) {
+        if let Some(ref mut v) = self.components.subagent_view {
+            v.observe_live(child_id, state);
+            self.rebuild_subagent_family();
+        }
+    }
+
+    /// Rebuild the subagent view's family from disk + live observations.
+    /// No-op when the view is closed.
+    fn rebuild_subagent_family(&mut self) {
+        let Some(ref mut v) = self.components.subagent_view else {
+            return;
+        };
+        let disk = build_family_index_cached(
+            &self.sessions_dir,
+            &self.session_id,
+            &HashMap::new(),
+            &mut self.family_cache,
+        );
+        let merged = merge_live_entries(disk, &self.session_id, &v_live_snapshot(v));
+        v.refresh_entries(merged);
+    }
+
+    /// Open the subagent view modal (command palette "/jobs", or the
+    /// `OpenSubagentView` TuiCmd round-trip).
+    pub(crate) fn open_subagent_view(&mut self) {
+        let live = self
+            .components
+            .subagent_view
+            .as_ref()
+            .map(v_live_snapshot)
+            .unwrap_or_default();
+        let disk = build_family_index_cached(
+            &self.sessions_dir,
+            &self.session_id,
+            &HashMap::new(),
+            &mut self.family_cache,
+        );
+        let entries = merge_live_entries(disk, &self.session_id, &live);
+        self.components
+            .subagent_view
+            .get_or_insert_with(subagent_view::SubagentViewState::new)
+            .open(entries, live);
+        self.popup_open = true;
     }
 
     // ── Transcript action handling ──────────────────────────────
@@ -1098,6 +1254,9 @@ impl NcaModel {
             if let Some(ref mut p) = self.components.session_picker {
                 p.render(frame);
             }
+            if let Some(ref mut v) = self.components.subagent_view {
+                v.render(frame);
+            }
             if let Some(ref p) = self.components.connect_modal {
                 p.render(frame);
             }
@@ -1141,6 +1300,11 @@ impl NcaModel {
             composer: chunks[2],
         }
     }
+}
+
+/// Borrow the live-observation map out of a view state (for rebuilds).
+fn v_live_snapshot(v: &subagent_view::SubagentViewState) -> HashMap<String, LiveChild> {
+    v.live_observations()
 }
 
 struct LayoutAreas {

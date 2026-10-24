@@ -71,6 +71,9 @@ pub enum TuiFeedbackMsg {
         entries: Vec<SessionSnapshot>,
         current: String,
     },
+    /// Open the subagent view modal (P2: family list + child transcript
+    /// reader with live tail). `/jobs` in TUI mode routes here.
+    OpenSubagentView,
     /// Open the connect-provider modal.
     OpenConnectModal,
     /// Close the API key modal (used after key is saved).
@@ -141,6 +144,8 @@ pub trait TuiFeedback: Send + Sync {
     fn open_permission_picker(&self, current_index: usize);
     fn open_provider_picker(&self, for_api_key: bool);
     fn open_session_picker(&self, entries: Vec<SessionSnapshot>, current: String);
+    /// Open the subagent view modal (P2).
+    fn open_subagent_view(&self);
     fn open_connect_modal(&self);
     fn close_api_key_modal(&self);
     fn close_connect_modal(&self);
@@ -345,6 +350,9 @@ impl TuiFeedback for TuiFeedbackChannel {
         let _ = self
             .tx
             .send(TuiFeedbackMsg::OpenSessionPicker { entries, current });
+    }
+    fn open_subagent_view(&self) {
+        let _ = self.tx.send(TuiFeedbackMsg::OpenSubagentView);
     }
     fn open_connect_modal(&self) {
         let _ = self.tx.send(TuiFeedbackMsg::OpenConnectModal);

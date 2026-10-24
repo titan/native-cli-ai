@@ -11,3 +11,4 @@ pub mod feedback;
 pub(crate) mod model;
 pub(crate) mod msg;
 pub(crate) mod run;
+pub(crate) mod subagent_family;

@@ -56,6 +56,9 @@ pub(crate) struct NcaModelParams {
     pub agent_label: String,
     pub permission_mode: String,
     pub workspace_root: std::path::PathBuf,
+    /// Sessions dir for the subagent view's disk-side family scan (P2):
+    /// `<workspace_root>/<config.session.history_dir>`.
+    pub sessions_dir: std::path::PathBuf,
     pub skill_dirs: Vec<std::path::PathBuf>,
     pub plugin_commands: Vec<(String, Vec<String>)>,
 }
@@ -93,7 +96,7 @@ pub(crate) fn run_nca_model(
     install_terminal_signal_handlers();
 
     // Create NcaModel
-    let mut nca_model = NcaModel::new(
+    let mut nca_model = NcaModel::new_with_session(
         feedback_rx,
         cmd_tx,
         SideEffectChannels {
@@ -108,6 +111,8 @@ pub(crate) fn run_nca_model(
             busy_flag,
             kill_all_tx,
         },
+        params.sessions_dir,
+        params.session_id.clone(),
     );
 
     // Initialize composer with slash entries and workspace files

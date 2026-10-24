@@ -1619,10 +1619,17 @@ impl Repl {
                 }
             },
             "/jobs" | "/tasks" => {
-                // P1 read-only introspection: lines from the supervisor's
-                // subagent registry (spawn order, live lifecycle states).
-                for line in self.runtime.list_subagent_jobs() {
-                    out.println(&line);
+                if let ReplOutput::Tui(st) = &out {
+                    // P2: the subagent view modal (family list + child
+                    // readers + live tail) replaces the flat line dump in
+                    // full-screen TUI mode.
+                    st.open_subagent_view();
+                } else {
+                    // P1 read-only introspection: lines from the supervisor's
+                    // subagent registry (spawn order, live lifecycle states).
+                    for line in self.runtime.list_subagent_jobs() {
+                        out.println(&line);
+                    }
                 }
             }
             "/new" => {
@@ -2111,6 +2118,10 @@ impl Repl {
             agent_label: self.current_agent_label.clone(),
             permission_mode: perm.clone(),
             workspace_root: self.runtime.workspace_root().to_path_buf(),
+            sessions_dir: self
+                .runtime
+                .workspace_root()
+                .join(&self.runtime.config().session.history_dir),
             skill_dirs,
             plugin_commands: self.runtime.plugin_commands(),
         };
@@ -2320,6 +2331,10 @@ impl Repl {
                     }
                     TuiCmd::OpenSessions => {
                         self.handle_command("/sessions", ReplOutput::Tui(tui_feedback.as_ref()))
+                            .await?;
+                    }
+                    TuiCmd::OpenSubagentView => {
+                        self.handle_command("/jobs", ReplOutput::Tui(tui_feedback.as_ref()))
                             .await?;
                     }
                     TuiCmd::ResumeSession(session_id) => {

@@ -173,7 +173,6 @@ fn palette_command_for_label(label: &str) -> &'static str {
         "Connect provider" => "/connect",
         "Open editor" => "/editor",
         "Switch session" => "/sessions",
-        "Subagent jobs" => "/jobs",
         "New session" => "/new",
         "Compact" => "/compact",
         "Export session" => "/export",
@@ -208,6 +207,11 @@ pub(crate) enum CommandPaletteAction {
     None,
     Close,
     SubmitCommand(String),
+    /// Open the subagent view modal directly (P2 upgrade of the old
+    /// `/jobs` text-print entry). Kept as a distinct action so the
+    /// round-trip through the runtime command handler is unnecessary — the
+    /// modal is pure TUI state.
+    OpenSubagentView,
 }
 
 impl CommandPaletteState {
@@ -255,14 +259,17 @@ impl CommandPaletteState {
                 let filtered = filter_palette_rows(&self.query);
                 let selectable = palette_selectable_indices(&filtered);
                 let pick = self.index.min(selectable.len().saturating_sub(1));
-                let cmd = if let Some(&abs_idx) = selectable.get(pick)
+                if let Some(&abs_idx) = selectable.get(pick)
                     && let PaletteRow::Entry { label, .. } = filtered[abs_idx]
                 {
-                    palette_command_for_label(label).to_string()
-                } else {
-                    String::new()
-                };
-                CommandPaletteAction::SubmitCommand(cmd)
+                    if *label == "Subagent jobs" {
+                        return CommandPaletteAction::OpenSubagentView;
+                    }
+                    return CommandPaletteAction::SubmitCommand(
+                        palette_command_for_label(label).to_string(),
+                    );
+                }
+                CommandPaletteAction::SubmitCommand(String::new())
             }
             (KeyCode::Backspace, _) => {
                 self.query.pop();

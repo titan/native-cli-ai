@@ -5,7 +5,7 @@ use nca_common::event::{AgentEvent, EventEnvelope};
 use serde_json::Value;
 use std::path::Path;
 
-fn parse_json_values_on_line(line: &str) -> Vec<Value> {
+pub(crate) fn parse_json_values_on_line(line: &str) -> Vec<Value> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return Vec::new();
@@ -21,7 +21,7 @@ fn parse_json_values_on_line(line: &str) -> Vec<Value> {
     out
 }
 
-fn value_to_event(v: &Value) -> Option<AgentEvent> {
+pub(crate) fn value_to_event(v: &Value) -> Option<AgentEvent> {
     if v.get("event").is_some() {
         serde_json::from_value::<EventEnvelope>(v.clone())
             .ok()
@@ -32,11 +32,31 @@ fn value_to_event(v: &Value) -> Option<AgentEvent> {
 }
 
 /// Skip streaming deltas when replaying; final `MessageReceived` for assistant already has full text.
-fn should_skip_on_replay(ev: &AgentEvent) -> bool {
+pub(crate) fn should_skip_on_replay(ev: &AgentEvent) -> bool {
     matches!(
         ev,
         AgentEvent::TokensStreamed { .. } | AgentEvent::ReasoningStreamed { .. }
     )
+}
+
+/// Parse a raw `*.events.jsonl` string into replay-ready events.
+///
+/// Streaming deltas are skipped (same semantics as [`should_skip_on_replay`]);
+/// the final `MessageReceived`/`ToolCallCompleted` events already carry the
+/// full payload. Shared by the resume path (`replay_events_to_feedback`) and
+/// the subagent view's child-transcript reader.
+pub(crate) fn parse_events_from_str(raw: &str) -> Vec<AgentEvent> {
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        for v in parse_json_values_on_line(line) {
+            if let Some(ev) = value_to_event(&v)
+                && !should_skip_on_replay(&ev)
+            {
+                out.push(ev);
+            }
+        }
+    }
+    out
 }
 
 /// Replay persisted events from disk into the Elm feedback channel.
@@ -51,17 +71,9 @@ pub async fn replay_events_to_feedback(
     };
 
     let mut applied = 0u64;
-    for line in raw.lines() {
-        for v in parse_json_values_on_line(line) {
-            let Some(ev) = value_to_event(&v) else {
-                continue;
-            };
-            if should_skip_on_replay(&ev) {
-                continue;
-            }
-            let _ = tx.send(TuiFeedbackMsg::Agent(ev));
-            applied += 1;
-        }
+    for ev in parse_events_from_str(&raw) {
+        let _ = tx.send(TuiFeedbackMsg::Agent(ev));
+        applied += 1;
     }
 
     // Cleanup: reset transient state that may have been left mid-interaction.
@@ -111,6 +123,24 @@ mod tests {
         );
         let vals = parse_json_values_on_line(line);
         assert_eq!(vals.len(), 2);
+    }
+
+    #[test]
+    fn parse_events_from_str_skips_deltas_and_keeps_payloads() {
+        let user = r#"{"type":"MessageReceived","role":"user","content":"hi"}"#;
+        let delta = r#"{"type":"TokensStreamed","delta":"partial"}"#;
+        let assistant = r#"{"type":"MessageReceived","role":"assistant","content":"full answer"}"#;
+        let raw = format!("{user}\n{delta}\n{assistant}\n");
+        let events = parse_events_from_str(&raw);
+        assert_eq!(events.len(), 2, "the streamed delta must be skipped");
+        assert!(
+            matches!(&events[0], AgentEvent::MessageReceived { role, content, .. }
+            if role == "user" && content == "hi")
+        );
+        assert!(
+            matches!(&events[1], AgentEvent::MessageReceived { role, content, .. }
+            if role == "assistant" && content == "full answer")
+        );
     }
 
     #[test]
