@@ -13,6 +13,7 @@ mod tests {
     use crate::provider::{Provider, StreamChunk};
     use nca_common::config::{NcaConfig, ProviderKind};
     use nca_common::message::Message;
+    use nca_common::tool::ToolDefinition;
     use std::path::PathBuf;
 
     const ZHIPUAI_PROFILE: CompatProfile = CompatProfile {
@@ -80,14 +81,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zhipuai_prepare_strips_reasoning_content() {
+    async fn zhipuai_wire_strips_reasoning_content_even_with_tools() {
         // GLM thinking models (glm-5.x; 5.3 cannot disable thinking) stream
         // `reasoning_content`, but the API rejects the field when it appears
         // inside assistant history on a subsequent request — a plain 400 that
         // kills multi-turn tool loops (subagent runs) from the second turn
-        // onward. The profile must strip it before re-upload.
+        // onward. The Strip policy is UNCONDITIONAL (unlike DeepSeek's
+        // tools-gated pass-back): the wire body must omit the field even for
+        // a tools-bearing request. Since the 10-24 contract fix the decision
+        // is made at wire serialization (prepare is a no-op that never
+        // rewrites history), so the assertion targets the request body.
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"index\":0,\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .to_string();
+        let base_url = spawn_sse_server_with_body(body, 200, |_request, request_body| {
+            assert!(
+                !request_body.contains("reasoning_content"),
+                "Strip is unconditional for ZhipuAI: request must not echo reasoning_content: {request_body}"
+            );
+        });
+
         let mut config = NcaConfig::default();
         config.provider.zhipuai.api_key = Some("zhipuai-test-key".into());
+        config.provider.zhipuai.base_url = base_url;
+
         let provider = OpenAiCompatProvider::from_config(
             &config.provider.zhipuai,
             config.model.max_tokens,
@@ -95,25 +115,46 @@ mod tests {
             reqwest::header::HeaderMap::new(),
         )
         .expect("provider");
-
+        let mut assistant = Message::assistant("response").with_reasoning("thinking...".into());
+        assistant.tool_calls = Some(vec![nca_common::message::MessageToolCall {
+            id: "call_1".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({}),
+        }]);
         let mut messages = vec![
             Message::user("hello"),
-            Message::assistant("response").with_reasoning("thinking...".into()),
+            assistant,
             Message::tool("call_1", "result"),
         ];
-
+        // Mirror the driver contract: prepare (a no-op for this family) runs
+        // on a clone ahead of chat(); history stays untouched either way.
+        let history = messages.clone();
         provider
             .prepare_messages_for_request(&mut messages, std::path::Path::new("."))
             .await
             .expect("prepare");
+        assert_eq!(messages, history, "prepare must not rewrite history");
 
-        // reasoning_content must be stripped for ZhipuAI
-        assert!(messages[1].reasoning_content.is_none());
-        // Other fields unchanged
-        assert_eq!(messages[1].content.to_summary_text(), "response");
-        // User/tool messages unaffected
-        assert!(messages[0].reasoning_content.is_none());
-        assert!(messages[2].reasoning_content.is_none());
+        let stream = provider
+            .chat(
+                &messages,
+                &[ToolDefinition {
+                    timeout_ms: None,
+                    name: "lookup".into(),
+                    description: "Lookup a path".into(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {}
+                    }),
+                }],
+                "",
+                std::path::Path::new("."),
+            )
+            .await
+            .expect("chat stream");
+
+        let chunks = collect_chunks(stream).await;
+        assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
     }
 
     #[tokio::test]
@@ -145,10 +186,9 @@ mod tests {
 
         let provider =
             build_provider_for(&config, ProviderKind::ZhipuAI).expect("build zhipuai provider");
-        // Mirror the driver contract: prepare_messages_for_request runs on the
-        // history BEFORE chat() (agent_driver.rs calls it ahead of every
-        // request). The wire-level guarantee is "prepared history never
-        // carries reasoning_content", not "chat() re-normalizes internally".
+        // Wire-level pin: prepare is a no-op now; the Strip guarantee lives
+        // in chat()'s serialization (openai_request_body_with), so asserting
+        // on the request body is asserting the real contract.
         let mut history = vec![
             Message::user("hello"),
             Message::assistant("prior turn").with_reasoning("secret chain".into()),

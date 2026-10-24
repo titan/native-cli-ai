@@ -198,15 +198,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_strips_reasoning_content() {
+    async fn wire_strips_reasoning_content_when_thinking_disabled() {
         // MiMo streams DeepSeek-style reasoning_content, and this provider is
         // built via `from_config` WITHOUT `.with_thinking` — `thinking` is
         // None, which StripUnlessThinking treats as thinking-disabled, so
-        // prepare_messages_for_request must strip before re-upload (context
-        // savings, mirroring the DeepSeek profile). The pass-back-preserving
-        // branch only activates once thinking = {"type": "enabled"}.
+        // the wire body must OMIT reasoning_content (context savings; the
+        // pass-back-preserving branch only activates once
+        // thinking = {"type": "enabled"}). Since the 10-24 contract fix the
+        // decision is made at wire serialization — prepare is a no-op that
+        // never rewrites history — so the assertion targets the request body.
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"index\":0,\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .to_string();
+        let base_url = spawn_sse_server_with_body(body, 200, |_request, request_body| {
+            assert!(
+                !request_body.contains("reasoning_content"),
+                "thinking-disabled MiMo must not send reasoning_content: {request_body}"
+            );
+        });
+
         let mut config = NcaConfig::default();
         config.provider.mimo.api_key = Some("test".into());
+        config.provider.mimo.base_url = base_url;
         let provider = OpenAiCompatProvider::from_config(
             &config.provider.mimo,
             config.model.max_tokens,
@@ -215,34 +231,66 @@ mod tests {
         )
         .expect("provider");
 
+        let mut assistant = Message::assistant("response").with_reasoning("thinking...".into());
+        assistant.tool_calls = Some(vec![nca_common::message::MessageToolCall {
+            id: "call_1".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({}),
+        }]);
         let mut messages = vec![
             Message::user("hello"),
-            Message::assistant("response").with_reasoning("thinking...".into()),
+            assistant,
             Message::tool("call_1", "result"),
         ];
-
+        let history = messages.clone();
         provider
             .prepare_messages_for_request(&mut messages, Path::new("."))
             .await
             .expect("prepare");
+        assert_eq!(messages, history, "prepare must not rewrite history");
 
-        // reasoning_content must be stripped for MiMo
-        assert!(messages[1].reasoning_content.is_none());
-        // Other fields unchanged
-        assert_eq!(messages[1].content.to_summary_text(), "response");
-        // User/tool messages unaffected
-        assert!(messages[0].reasoning_content.is_none());
-        assert!(messages[2].reasoning_content.is_none());
+        let stream = provider
+            .chat(&messages, &[], "", Path::new("."))
+            .await
+            .expect("chat stream");
+        let chunks = collect_chunks(stream).await;
+        assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
     }
 
     #[tokio::test]
-    async fn prepare_keeps_reasoning_content_when_thinking_enabled() {
-        // Mirror of `prepare_strips_reasoning_content` for the thinking-enabled
-        // branch: MiMo's API requires reasoning_content pass-back on assistant
-        // messages carrying tool_calls once thinking = {"type": "enabled"}
-        // (missing it is a hard HTTP 400), so StripUnlessThinking must KEEP it.
+    async fn wire_keeps_reasoning_content_when_thinking_enabled() {
+        // Mirror of `wire_strips_reasoning_content_when_thinking_disabled` for
+        // the thinking-enabled branch: MiMo's API requires reasoning_content
+        // pass-back on assistant messages carrying tool_calls once
+        // thinking = {"type": "enabled"} (missing it is a hard HTTP 400), so
+        // StripUnlessThinking must KEEP it on the wire.
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"index\":0,\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .to_string();
+        let base_url = spawn_sse_server_with_body(body, 200, |_request, request_body| {
+            let parsed: serde_json::Value =
+                serde_json::from_str(request_body).expect("request body is JSON");
+            let assistants: Vec<&serde_json::Value> = parsed["messages"]
+                .as_array()
+                .expect("messages")
+                .iter()
+                .filter(|m| m["role"] == "assistant")
+                .collect();
+            assert!(!assistants.is_empty());
+            assert!(
+                assistants
+                    .iter()
+                    .all(|m| m["reasoning_content"].as_str() == Some("thinking...")),
+                "thinking-enabled MiMo must pass reasoning_content back verbatim: {request_body}"
+            );
+        });
+
         let mut config = NcaConfig::default();
         config.provider.mimo.api_key = Some("test".into());
+        config.provider.mimo.base_url = base_url;
         let provider = OpenAiCompatProvider::from_config(
             &config.provider.mimo,
             config.model.max_tokens,
@@ -258,31 +306,18 @@ mod tests {
             name: "read".into(),
             arguments: serde_json::json!({}),
         }]);
-        let mut messages = vec![
+        let messages = vec![
             Message::user("hello"),
             assistant,
             Message::tool("call_1", "result"),
         ];
 
-        provider
-            .prepare_messages_for_request(&mut messages, Path::new("."))
+        let stream = provider
+            .chat(&messages, &[], "", Path::new("."))
             .await
-            .expect("prepare");
-
-        // reasoning_content must survive on the assistant tool-call message
-        assert_eq!(
-            messages[1].reasoning_content.as_deref(),
-            Some("thinking...")
-        );
-        // Other fields unchanged
-        assert_eq!(messages[1].content.to_summary_text(), "response");
-        let tool_calls = messages[1].tool_calls.as_ref().expect("tool_calls kept");
-        assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0].id, "call_1");
-        assert_eq!(tool_calls[0].name, "read");
-        // User/tool messages unaffected
-        assert!(messages[0].reasoning_content.is_none());
-        assert!(messages[2].reasoning_content.is_none());
+            .expect("chat stream");
+        let chunks = collect_chunks(stream).await;
+        assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
     }
 
     #[tokio::test]

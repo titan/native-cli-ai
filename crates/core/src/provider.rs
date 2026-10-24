@@ -168,8 +168,10 @@ pub enum StreamChunk {
 /// Abstraction over LLM providers (Anthropic, OpenAI, Gemini, etc.).
 #[async_trait]
 pub trait Provider: Send + Sync {
-    /// Rewrite conversation history before an HTTP request (e.g. MiniMax `coding_plan/vlm` for images).
-    /// Default: no-op.
+    /// Request-time message normalization on a request-scoped view (e.g.
+    /// MiniMax `coding_plan/vlm` for images). MUST NOT destructively rewrite
+    /// session history — callers pass a clone; the session store retains
+    /// `reasoning_content` so wire-policy fixes can self-heal. Default: no-op.
     async fn prepare_messages_for_request(
         &self,
         _messages: &mut Vec<Message>,

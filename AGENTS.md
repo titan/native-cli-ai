@@ -52,7 +52,7 @@ Infrastructure modules in the same directory:
 - `test_support.rs` / `validate.rs` — test harness helpers and provider config validation.
 
 - `core` depends on `genai 0.5` (multi-provider LLM library) and `rmcp 1.7` (MCP client).
-- `prepare_messages_for_request()` is the hook for provider-specific message rewriting (e.g. provider-conditional `reasoning_content` handling).
+- `prepare_messages_for_request()` is the provider hook for request-time message normalization. Invariant: it must NOT destructively rewrite session history (`agent.messages`) — provider-specific `reasoning_content` keep/strip is decided at wire-serialization time inside `chat()`, where the `tools` parameter is visible (see Context & Cost Guardrails).
 - **Provider fallback** (`[fallback]`, default off): `factory::build_provider_with_events` wraps the primary in `provider::fallback::FallbackProvider` — tight failover classes (429/5xx/408/network/content-moderation 400/empty completion), zero-content mid-stream rule (never retry after any chunk was delivered), per-instance throttle (`initial_retry_delay_ms`/`retry_delay_ms`), loud `ProviderError::FallbackExhausted` on chain end, and an `AgentEvent::ProviderFallback` notification per switch (never silent).
 - Never hard-code a model name. Always read from config (`common::config::NcaConfig`).
 - Empty completions must fail loudly (never silently succeed).
@@ -108,7 +108,7 @@ The system has several size guards to prevent context window overflow:
 - `list_directory` capped at 1000 entries.
 - Skill descriptions clipped to 120 chars in system prompt index.
 - Skills index capped at 4000 chars in `harness.rs`.
-- `reasoning_content` wire contracts are MODE- AND PROVIDER-SPECIFIC (verify against the CURRENT API docs before changing): DeepSeek thinking models (`deepseek-reasoner`) REQUIRE pass-back on assistant history (omitting is a 400 since the 2026-10 thinking API; `deepseek-chat` strips to save ~500 tokens/turn); ZhipuAI GLM treats it as output-only (echoing is a 400); MiMo requires pass-back only when thinking is enabled; OpenAI/OpenRouter keep as-is. Encoded in `ReasoningWirePolicy` + `CompatProfile`.
+- `reasoning_content` wire contracts are MODE- AND PROVIDER-SPECIFIC (verify against the CURRENT API docs before changing). Current contract as of 2026-10-24 — DeepSeek: models are hybrid (`deepseek-flash` / `deepseek-v4-pro`; legacy `deepseek-chat`/`deepseek-reasoner` names discontinued 2026-07-24), thinking defaults on, and the pass-back obligation is gated on the request carrying `tools`: with `tools`, ALL prior assistant turns must pass `reasoning_content` back verbatim (omitting is a 400: "The `reasoning_content` in the thinking mode must be passed back to the API"); without `tools` it may be omitted (echoing is ignored). ZhipuAI GLM treats it as output-only (echoing is a 400); MiMo requires pass-back only when thinking is enabled; OpenAI/OpenRouter keep as-is. Encoded in `ReasoningWirePolicy` + `CompatProfile`; the keep/strip decision is made at wire-serialization time (`chat()`), never by mutating `agent.messages` — session history must retain `reasoning_content` so policy fixes can self-heal.
 - Cost tracker includes cache token accounting (cache_read priced at 1/50 of normal input).
 
 ## TUI Architecture

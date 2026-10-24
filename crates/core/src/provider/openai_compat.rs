@@ -18,6 +18,9 @@ use serde_json::{Value, json};
 /// 尤其重要——thinking 阶段总耗时常超过 120s，但 token 间隔很小。
 pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// Build an OpenAI-compatible chat request body, preserving
+/// `reasoning_content` on assistant history verbatim (the default wire
+/// contract; see [`to_openai_messages`]).
 pub fn openai_request_body(
     messages: &[Message],
     tools: &[ToolDefinition],
@@ -26,9 +29,34 @@ pub fn openai_request_body(
     temperature: f32,
     workspace_root: &Path,
 ) -> Result<Value, ProviderError> {
+    openai_request_body_with(
+        messages,
+        tools,
+        model,
+        max_tokens,
+        temperature,
+        workspace_root,
+        ReasoningOnWire::Keep,
+    )
+}
+
+/// [`openai_request_body`] with an explicit per-request
+/// `reasoning_content` policy: profile resolution (`ReasoningWirePolicy` ×
+/// this request's `tools`/thinking state) happens in the caller, which
+/// knows both — the keep/strip decision is a wire-serialization concern,
+/// not a message-history rewrite (see [`ReasoningWirePolicy`]).
+pub(crate) fn openai_request_body_with(
+    messages: &[Message],
+    tools: &[ToolDefinition],
+    model: &str,
+    max_tokens: u32,
+    temperature: f32,
+    workspace_root: &Path,
+    reasoning: ReasoningOnWire,
+) -> Result<Value, ProviderError> {
     let mut body = json!({
         "model": model,
-        "messages": to_openai_messages(messages, workspace_root)?,
+        "messages": to_openai_messages_with(messages, workspace_root, reasoning)?,
         "stream": true,
         "stream_options": {
             "include_usage": true
@@ -549,9 +577,20 @@ fn openai_user_content_value(
     }
 }
 
+/// Serialize `messages` to the OpenAI-compatible wire shape, preserving
+/// `reasoning_content` on assistant history (see [`ReasoningOnWire::Keep`]).
+#[cfg(test)]
 fn to_openai_messages(
     messages: &[Message],
     workspace_root: &Path,
+) -> Result<Vec<Value>, ProviderError> {
+    to_openai_messages_with(messages, workspace_root, ReasoningOnWire::Keep)
+}
+
+fn to_openai_messages_with(
+    messages: &[Message],
+    workspace_root: &Path,
+    reasoning: ReasoningOnWire,
 ) -> Result<Vec<Value>, ProviderError> {
     // Preflight: strict gateways (ZhipuAI error 1213 "未正常接收到prompt参数")
     // return an opaque 400 for empty prompt payloads. Fail loudly here with a
@@ -614,8 +653,10 @@ fn to_openai_messages(
                     },
                 });
 
-                if let Some(reasoning) = &message.reasoning_content {
-                    value["reasoning_content"] = json!(reasoning);
+                if let Some(reasoning_text) = &message.reasoning_content
+                    && reasoning.keep()
+                {
+                    value["reasoning_content"] = json!(reasoning_text);
                 }
 
                 if let Some(calls) = &message.tool_calls {
@@ -649,17 +690,90 @@ fn to_openai_messages(
     Ok(out)
 }
 
-/// How [`Provider::prepare_messages_for_request`] treats
-/// `reasoning_content` on assistant messages being re-uploaded.
+/// How a provider treats `reasoning_content` on assistant messages being
+/// re-uploaded, resolved PER REQUEST at wire-serialization time (see
+/// [`ReasoningOnWire`]). Resolution is a pure function of the policy plus
+/// facts only known at the request boundary (`tools`, thinking state) —
+/// never of the stored message history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningWirePolicy {
     /// Serialize reasoning_content as-is (default OpenAI-compat behavior).
     Keep,
-    /// Always strip reasoning_content before re-upload (DeepSeek).
+    /// Always strip reasoning_content before re-upload (ZhipuAI GLM: the
+    /// field is output-only there and echoing it in assistant history is a
+    /// 400).
     Strip,
+    /// DeepSeek V4 hybrid contract (verified against the official docs,
+    /// 2026-10-24): when the request carries a non-empty `tools` array, ALL
+    /// prior assistant messages must pass `reasoning_content` back — even
+    /// for turns where the model did not perform a tool call; omitting it
+    /// is rejected with a 400:
+    /// "The `reasoning_content` in the thinking mode must be passed back to
+    /// the API." Without `tools`, the field is ignored server-side, so it
+    /// is stripped to save context.
+    ///
+    /// Deliberately independent of the model name and the `thinking` field:
+    /// the legacy aliases `deepseek-chat`/`deepseek-reasoner` were
+    /// decommissioned 2026-07-24 and the current models
+    /// (`deepseek-flash`/`deepseek-v4-pro`) are hybrid (thinking is a
+    /// per-request field, default enabled), so neither carries the signal.
+    /// `chat(model)`'s model argument may also be overridden by the caller
+    /// (fallback pins), so the decision may only consult `tools`.
+    ToolsGated,
     /// Strip only when thinking is not "enabled" (MiMo: pass-back is
     /// mandatory for tool-call turns once thinking is on).
     StripUnlessThinking,
+}
+
+impl ReasoningWirePolicy {
+    /// Resolve this policy against one request's facts into a concrete
+    /// wire decision.
+    ///
+    /// `thinking_enabled` is the provider's own thinking state (vendor
+    /// `thinking` override or model-name marker — MiMo's
+    /// `StripUnlessThinking` semantics). Irrelevant for the other variants.
+    fn resolve(self, tools_nonempty: bool, thinking_enabled: bool) -> ReasoningOnWire {
+        match self {
+            ReasoningWirePolicy::Keep => ReasoningOnWire::Keep,
+            ReasoningWirePolicy::Strip => ReasoningOnWire::Strip,
+            ReasoningWirePolicy::ToolsGated => {
+                if tools_nonempty {
+                    ReasoningOnWire::Keep
+                } else {
+                    ReasoningOnWire::Strip
+                }
+            }
+            ReasoningWirePolicy::StripUnlessThinking => {
+                if thinking_enabled {
+                    ReasoningOnWire::Keep
+                } else {
+                    ReasoningOnWire::Strip
+                }
+            }
+        }
+    }
+}
+
+/// The per-request decision of whether the serialized wire body carries
+/// `reasoning_content` on assistant messages. Computed at the request
+/// boundary (where `tools` is known) by resolving a
+/// [`ReasoningWirePolicy`]; see `OpenAiCompatProvider::resolve_wire_reasoning`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReasoningOnWire {
+    /// Serialize `reasoning_content` as-is. Some providers require the
+    /// pass-back (DeepSeek tools-mode, MiMo thinking-on); OpenAI-compat
+    /// default.
+    Keep,
+    /// Omit the field on the wire. Output-only providers (ZhipuAI GLM)
+    /// reject the echoed field with a 400; context savings elsewhere.
+    Strip,
+}
+
+impl ReasoningOnWire {
+    /// Whether the wire body should carry `reasoning_content`.
+    pub(crate) fn keep(self) -> bool {
+        matches!(self, ReasoningOnWire::Keep)
+    }
 }
 
 /// Static profile describing the unique aspects of an OpenAI-compatible provider.
@@ -668,16 +782,16 @@ pub struct CompatProfile {
     pub name: &'static str,
     /// Provider-specific endpoint suffix appended to base_url.
     pub endpoint_suffix: &'static str,
-    /// How prepare_messages_for_request treats reasoning_content.
+    /// How this provider's reasoning_content wire contract resolves at
+    /// serialization time (see [`ReasoningWirePolicy::resolve`]).
     pub reasoning: ReasoningWirePolicy,
     /// Model-name marker implying thinking mode for providers whose thinking
-    /// is carried by the MODEL NAME rather than a `thinking` wire field
-    /// (DeepSeek: `deepseek-reasoner`). When the configured model contains
-    /// this marker, thinking is considered enabled — relevant only for
-    /// `StripUnlessThinking` policies: DeepSeek's thinking-mode API REQUIRES
-    /// `reasoning_content` pass-back on assistant history (omitting it is a
-    /// 400: "Then `reasoning_content` in the thinking mode must be passed
-    /// back to the API"), exactly like MiMo's thinking-on contract.
+    /// is carried by the MODEL NAME rather than a `thinking` wire field.
+    /// When the configured model contains this marker, thinking is considered
+    /// enabled — relevant only for `StripUnlessThinking` policies (MiMo's
+    /// semantics; DeepSeek no longer uses it since the 2026-07-24 alias
+    /// decommission made the name uninformative — see
+    /// [`ReasoningWirePolicy::ToolsGated`]).
     pub thinking_model_marker: Option<&'static str>,
     /// Whether to send `stream_options: {include_usage: true}` on the wire.
     pub send_stream_options: bool,
@@ -696,8 +810,8 @@ pub struct OpenAiCompatProvider {
     base_url: String,
     endpoint_suffix: &'static str,
     reasoning: ReasoningWirePolicy,
-    /// Model-name marker implying thinking mode (DeepSeek `deepseek-reasoner`);
-    /// see [`CompatProfile::thinking_model_marker`].
+    /// Model-name marker implying thinking mode (see
+    /// [`CompatProfile::thinking_model_marker`]).
     thinking_model_marker: Option<&'static str>,
     send_stream_options: bool,
     use_max_completion_tokens: bool,
@@ -784,7 +898,7 @@ impl OpenAiCompatProvider {
     /// Whether thinking mode is active for the provider's configured model:
     /// either the vendor `thinking` override is present and `"enabled"`, or
     /// the profile carries a [`CompatProfile::thinking_model_marker`] and the
-    /// configured model name contains it (DeepSeek `deepseek-reasoner`).
+    /// configured model name contains it.
     /// `None` (no override) and any other type value count as disabled.
     fn thinking_enabled(&self) -> bool {
         if self
@@ -796,6 +910,20 @@ impl OpenAiCompatProvider {
         }
         self.thinking_model_marker
             .is_some_and(|marker| self.model.contains(marker))
+    }
+
+    /// Resolve the profile's [`ReasoningWirePolicy`] against this request's
+    /// facts (`tools` presence, provider thinking state) into the concrete
+    /// wire decision. Called exactly once per serialized request body
+    /// (chat/keepalive) so the two paths cannot drift.
+    ///
+    /// Note: the decision deliberately never consults the model string — the
+    /// fallback chain and agent profiles may override the caller-supplied
+    /// model per request, and DeepSeek's [`ToolsGated`] contract is
+    /// model-name-independent by construction.
+    fn resolve_wire_reasoning(&self, tools: &[ToolDefinition]) -> ReasoningOnWire {
+        self.reasoning
+            .resolve(!tools.is_empty(), self.thinking_enabled())
     }
 
     /// Apply profile-specific wire-format tweaks to a request body built by
@@ -824,26 +952,19 @@ impl OpenAiCompatProvider {
 
 #[async_trait::async_trait]
 impl Provider for OpenAiCompatProvider {
+    /// No-op for the OpenAI-compat family: `reasoning_content` keep/strip
+    /// normalization has moved DOWN to wire serialization
+    /// ([`Self::resolve_wire_reasoning`] → [`openai_request_body_with`]),
+    /// where the per-request facts (`tools`, thinking state) are known.
+    /// This method must NOT rewrite history — `agent.messages` is the
+    /// session/replay source of truth, and a strip here is an irreversible
+    /// deletion (one wrong policy decision would destroy the reasoning for
+    /// every later turn; see task 10-24-deepseek-reasoning-wire-contract).
     async fn prepare_messages_for_request(
         &self,
-        messages: &mut Vec<Message>,
+        _messages: &mut Vec<Message>,
         _workspace_root: &Path,
     ) -> Result<(), ProviderError> {
-        let strip = match self.reasoning {
-            ReasoningWirePolicy::Keep => false,
-            ReasoningWirePolicy::Strip => true,
-            ReasoningWirePolicy::StripUnlessThinking => !self.thinking_enabled(),
-        };
-        // StripUnlessThinking providers (MiMo, DeepSeek): once thinking is
-        // active, assistant messages carrying tool_calls MUST pass
-        // reasoning_content back verbatim (omitting it is a guaranteed 400);
-        // with thinking off, stripping saves context (DeepSeek deepseek-chat,
-        // MiMo thinking disabled).
-        if strip {
-            for msg in messages.iter_mut() {
-                msg.reasoning_content = None;
-            }
-        }
         Ok(())
     }
 
@@ -865,13 +986,14 @@ impl Provider for OpenAiCompatProvider {
         // values (hard 400s). keepalive_ping bypasses this (max_tokens = 1).
         let max_tokens = nca_common::model_limits::clamp_max_tokens(&model, self.max_tokens);
 
-        let mut body = openai_request_body(
+        let mut body = openai_request_body_with(
             messages,
             tools,
             &model,
             max_tokens,
             self.temperature,
             workspace_root,
+            self.resolve_wire_reasoning(tools),
         )?;
         self.apply_profile_wire(&mut body);
         if let Some(thinking) = &self.thinking {
@@ -925,14 +1047,12 @@ impl Provider for OpenAiCompatProvider {
         &self,
         snapshot: &KeepaliveSnapshot,
     ) -> Result<PingUsage, ProviderError> {
-        // Normalize the prefix exactly like the next real request will: the
-        // snapshot is cloned from `agent.messages` at the tool-pause point,
-        // BEFORE the next turn's `prepare_messages_for_request` runs, so it
-        // can still carry output-only fields (e.g. `reasoning_content`) that
-        // strip-providers (DeepSeek, ZhipuAI GLM thinking) reject with a 400
-        // when echoed back. Stripping here both prevents that 400 and makes
-        // the warmed prefix byte-identical to the next request's prefix,
-        // maximizing the cache hit.
+        // The snapshot is cloned from `agent.messages` at the tool-pause
+        // point and may still carry `reasoning_content` on assistant
+        // history. The keep/strip decision is the SAME per-request
+        // resolution as the next real chat() call (`tools` presence included)
+        // so the warmed prefix is byte-identical to it, maximizing the cache
+        // hit — output-only providers (GLM) strip, pass-back providers keep.
         let mut messages = snapshot.messages.clone();
         self.prepare_messages_for_request(&mut messages, &snapshot.workspace_root)
             .await?;
@@ -941,13 +1061,14 @@ impl Provider for OpenAiCompatProvider {
         // The input prefix is what we're paying for — it refreshes the cache.
         // Deliberately NOT clamped: the capability clamp would raise this to
         // the 128K floor, billing a full completion just to refresh the cache.
-        let mut body = openai_request_body(
+        let mut body = openai_request_body_with(
             &messages,
             &snapshot.tools,
             &snapshot.model,
             1, // max_tokens = 1
             self.temperature,
             &snapshot.workspace_root,
+            self.resolve_wire_reasoning(&snapshot.tools),
         )?;
         self.apply_profile_wire(&mut body);
         if let Some(thinking) = &self.thinking {

@@ -2132,4 +2132,131 @@ mod tests {
             "pinned tier names canonicalize to the provider"
         );
     }
+
+    // ---- Wire-policy de-pollution across a failover switch ----
+    //
+    // The production incident shape: primary = GLM (Strip — reasoning is
+    // output-only there), fallback = DeepSeek (ToolsGated — reasoning MUST
+    // be passed back for tools requests, else the recurring 400: "The
+    // `reasoning_content` in the thinking mode must be passed back to the
+    // API."). Historically the primary's prepare stripped history IN PLACE,
+    // so the DeepSeek failover target received already-polluted messages and
+    // reproduced the 400 on a different provider. Since the keep/strip
+    // decision moved to per-provider wire serialization (and prepare became
+    // a no-op), each chain entry serializes the SAME original history under
+    // its OWN policy. This test pins that end-to-end against real
+    // OpenAiCompatProviders built by the factory over mock HTTP servers.
+    #[tokio::test]
+    async fn fallback_switch_serializes_under_target_policy_not_primary() {
+        use crate::provider::factory::build_provider_for;
+        use crate::provider::test_support::spawn_sse_server_with_body;
+        use nca_common::config::ProviderKind;
+
+        let sse_ok = || {
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"index\":0,\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .to_string()
+        };
+
+        // Primary (ZhipuAI/GLM, Strip): 429 on the first request so the
+        // chain advances. Any request it does send must be reasoning-free.
+        let glm_body = String::from("{\"error\":{\"message\":\"rate limited\"}}");
+        let glm_url = spawn_sse_server_with_body(glm_body, 429, |_request, request_body| {
+            assert!(
+                !request_body.contains("reasoning_content"),
+                "GLM (Strip) request must not echo reasoning_content: {request_body}"
+            );
+        });
+        // Target (DeepSeek, ToolsGated): assert ON the request body that the
+        // assistant reasoning_content IS present — the pass-back the tools
+        // contract demands.
+        let deepseek_url = spawn_sse_server_with_body(sse_ok(), 200, |_request, request_body| {
+            let parsed: serde_json::Value =
+                serde_json::from_str(request_body).expect("deepseek body is JSON");
+            let assistants: Vec<&serde_json::Value> = parsed["messages"]
+                .as_array()
+                .expect("messages")
+                .iter()
+                .filter(|m| m["role"] == "assistant")
+                .collect();
+            assert!(!assistants.is_empty());
+            assert!(
+                assistants.iter().all(|m| m
+                    .get("reasoning_content")
+                    .is_some_and(|r| r.as_str() == Some("survivor reasoning"))),
+                "DeepSeek failover target must receive reasoning_content under its own ToolsGated policy \
+                 (omitting it is the 400: 'The `reasoning_content` in the thinking mode must be passed back to the API.'): {request_body}"
+            );
+        });
+
+        let mut config = nca_common::config::NcaConfig::default();
+        config.provider.zhipuai.api_key = Some("glm-key".into());
+        config.provider.zhipuai.base_url = glm_url;
+        config.provider.zhipuai.model = "glm-5.3".into();
+        config.provider.deepseek.api_key = Some("deepseek-key".into());
+        config.provider.deepseek.base_url = deepseek_url;
+        config.provider.deepseek.model = "deepseek-flash".into();
+
+        let glm = build_provider_for(&config, ProviderKind::ZhipuAI).expect("glm provider");
+        let deepseek =
+            build_provider_for(&config, ProviderKind::DeepSeek).expect("deepseek provider");
+
+        let provider = FallbackProvider::new(
+            glm,
+            "ZhipuAI(glm-5.3)".into(),
+            vec![FallbackEntry {
+                name: "DeepSeek(deepseek-flash)".into(),
+                provider: deepseek,
+            }],
+            0, // instant switches: keep the test fast
+            0,
+            0,
+            None,
+        );
+
+        // Mirror the driver contract: history still carrying reasoning (the
+        // session source of truth), a tools-bearing request.
+        let mut assistant =
+            Message::assistant("prior turn").with_reasoning("survivor reasoning".into());
+        assistant.tool_calls = Some(vec![nca_common::message::MessageToolCall {
+            id: "call_1".into(),
+            name: "lookup".into(),
+            arguments: serde_json::json!({}),
+        }]);
+        let history = vec![
+            Message::user("hello"),
+            assistant,
+            Message::tool("call_1", "result"),
+            Message::user("continue"),
+        ];
+        // The driver calls prepare on a CLONE now, but even the legacy
+        // in-place call through the wrapper must not pollute history:
+        let mut prepared = history.clone();
+        provider
+            .prepare_messages_for_request(&mut prepared, Path::new("."))
+            .await
+            .expect("prepare");
+        assert_eq!(
+            prepared, history,
+            "prepare must not strip history ahead of the chain"
+        );
+
+        let tools = vec![ToolDefinition {
+            timeout_ms: None,
+            name: "lookup".into(),
+            description: "Lookup a path".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }];
+        let chunks = collect(
+            provider
+                .chat(&history, &tools, "glm-5.3", Path::new("."))
+                .await
+                .expect("deepseek failover stream"),
+        )
+        .await;
+        assert_eq!(text_of(&chunks), "ok");
+    }
 }

@@ -366,15 +366,24 @@ impl<'a> TurnDriver<'a> {
                 turn,
             })
             .await;
+        // Non-destructive normalization (10-24 contract fix): prepare runs on
+        // a CLONE, and only the clone feeds this request. `agent.messages` is
+        // the session/replay source of truth — the OpenAI-compat prepare is a
+        // no-op now, but any future provider side effect (MiniMax image
+        // materialization) must never rewrite the stored history
+        // irreversibly (a strip deletes reasoning_content forever; one wrong
+        // policy decision would corrupt every later turn).
+        let mut prepared_messages = agent.messages.clone();
         agent
             .provider
-            .prepare_messages_for_request(&mut agent.messages, self.workspace_root)
+            .prepare_messages_for_request(&mut prepared_messages, self.workspace_root)
             .await?;
         // Repair any orphaned `tool_calls` left by a previously interrupted
         // turn (budget/pipeline error) so strict providers like DeepSeek don't
         // reject the request with "tool_calls must be followed by tool
         // messages". Persisted to `agent.messages` so resumed sessions stay valid.
         crate::agent::sanitize_tool_call_pairs(&mut agent.messages);
+        crate::agent::sanitize_tool_call_pairs(&mut prepared_messages);
 
         // The chain owns request-view shaping now (CompactionMiddleware);
         // the driver hands the canonical post-prepare/sanitize history.
@@ -389,7 +398,7 @@ impl<'a> TurnDriver<'a> {
             .call(
                 &agent.provider,
                 StepRequest {
-                    messages: agent.messages.clone(),
+                    messages: prepared_messages,
                     tools: agent.tool_definitions(),
                     model: agent.model.clone(),
                     workspace_root: self.workspace_root.to_path_buf(),

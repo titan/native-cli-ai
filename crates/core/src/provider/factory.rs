@@ -46,16 +46,25 @@ const ZHIPUAI_PROFILE: CompatProfile = CompatProfile {
 const DEEPSEEK_PROFILE: CompatProfile = CompatProfile {
     name: "DeepSeek",
     endpoint_suffix: "chat/completions",
-    // DeepSeek's contract is MODE-DEPENDENT and changed with the thinking
-    // API: thinking models (deepseek-reasoner; marker below) REQUIRE
-    // reasoning_content pass-back on assistant history (omitting it is a
-    // 400: "Then `reasoning_content` in the thinking mode must be passed
-    // back to the API"); non-thinking models (deepseek-chat) reject the
-    // field / waste tokens on it, so it is stripped there. Same shape as
-    // MiMo's StripUnlessThinking. (History: the pre-2026-10 documented
-    // contract was output-only for ALL models — that flipped.)
-    reasoning: ReasoningWirePolicy::StripUnlessThinking,
-    thinking_model_marker: Some("reasoner"),
+    // DeepSeek V4 hybrid contract (verified against the official docs,
+    // 2026-10-24; see `ReasoningWirePolicy::ToolsGated` for the full dated
+    // rationale). The pass-back obligation keys on the REQUEST carrying
+    // `tools`, not on the model name or the `thinking` field:
+    // - tools present → ALL prior assistant messages must pass
+    //   `reasoning_content` back (even tool-less turns); omitting it is
+    //   rejected with a 400: "The `reasoning_content` in the thinking mode
+    //   must be passed back to the API." (the recurring production error)
+    // - no tools → the field is ignored server-side; stripped to save context.
+    //
+    // Dead-alias timeline (why the old model-name marker approach broke):
+    // `deepseek-chat`/`deepseek-reasoner` were decommissioned 2026-07-24
+    // (announced in the 2026-04-24 changelog). The current models
+    // `deepseek-flash`/`deepseek-v4-pro` are hybrid — thinking is a
+    // per-request `thinking.type` field (default enabled), so the model
+    // name carries no thinking signal. `thinking_model_marker` stays None
+    // here (the mechanism remains for MiMo's `StripUnlessThinking`).
+    reasoning: ReasoningWirePolicy::ToolsGated,
+    thinking_model_marker: None,
     send_stream_options: true,
     use_max_completion_tokens: false,
 };
