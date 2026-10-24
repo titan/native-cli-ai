@@ -512,6 +512,17 @@ pub async fn run_prepared_child(
     let event_rx = handle.take_event_rx();
     let log_path = handle.event_log_path.clone();
 
+    // P1 (subagent conversation visibility): wire the child's own IPC
+    // socket into its event fanout so `nca attach <child_id>` streams the
+    // child's live envelopes — the same wire contract as a top-level
+    // session. The command receiver from `into_parts` is deliberately
+    // dropped: children never serve attach-side commands (approvals and
+    // questions are parent-only surfaces; sends into a receiverless
+    // channel are ignored no-ops), and the accept loop keeps its own
+    // sender clone, so live connections stay healthy for the child's
+    // whole lifetime.
+    let ipc_bcast = handle.take_ipc_handle().map(|ipc| ipc.into_parts().0);
+
     let commit_tx = handle.take_turn_commit_tx().map(|(tx, _flag)| tx);
     // T1-3 liveness heartbeat: the parent registry's activity stamp for
     // this child, fired by the fanout for EVERY observed child event —
@@ -563,7 +574,7 @@ pub async fn run_prepared_child(
         spawn_event_fanout(
             rx,
             log_path,
-            None,
+            ipc_bcast,
             None,
             parent_forward,
             commit_tx,
@@ -1766,6 +1777,104 @@ mod tests {
         assert_eq!(entry.accumulated_input_tokens, 12_345);
         assert_eq!(entry.accumulated_output_tokens, 2_345);
         assert_eq!(entry.accumulated_cache_read_tokens, 9_000);
+    }
+
+    // ── P1 (subagent conversation visibility): child IPC broadcast ──
+
+    /// A spawned child's IPC socket must broadcast its events: `nca attach
+    /// <child_id>` connects with `IpcClient` and receives the same envelope
+    /// stream a top-level session produces (at minimum the terminal
+    /// `TurnCompleted`). Pins the fanout wiring — the child's socket used to
+    /// exist but its broadcast sender was never wired into the fanout, so
+    /// attach silently hung.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn child_session_broadcasts_events_over_ipc() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = offline_child_config();
+        let provider = Arc::new(UsageReportingProvider {
+            input: 10,
+            output: 5,
+            cache_read: 0,
+        });
+
+        let (sup, prepared) = prepare_child_session(
+            ChildSessionConfig {
+                parent_session_id: "parent-ipc".into(),
+                task: "broadcast over ipc".into(),
+                workspace_root: dir.path().to_path_buf(),
+                config,
+                parent_summary: "ctx".into(),
+                use_worktree: false,
+                focus_files: Vec::new(),
+                images: Vec::new(),
+                provider_override: None,
+                model_override: None,
+                specialist: None,
+                alias: None,
+                registry: None,
+                provider: Some(provider as Arc<dyn nca_core::provider::Provider>),
+                plugins: None,
+                escaped_providers: HashSet::new(),
+            },
+            None,
+        )
+        .await
+        .expect("prepare child");
+
+        let child_id = prepared.child_id.clone();
+        // Socket path as attach would resolve it: the session json records
+        // it, and `IpcServer::new` reconstructs it deterministically from the
+        // session id (same $XDG_RUNTIME_DIR/nca base).
+        let socket_path = {
+            let store = crate::session_store::SessionStore::new(dir.path().join(".nca/sessions"));
+            let session = tokio::time::timeout(Duration::from_secs(5), store.load(&child_id))
+                .await
+                .expect("load within timeout")
+                .expect("child session json written at prepare");
+            session
+                .meta
+                .socket_path
+                .expect("child session json records its socket path")
+        };
+
+        // Attach BEFORE the turn runs (the interesting window: live
+        // streaming, not just post-hoc log replay). A failed connect here
+        // would race the accept loop's first poll, so retry briefly.
+        let client = crate::ipc::IpcClient::new(socket_path);
+        let mut rx = {
+            let mut connected = None;
+            for _ in 0..50 {
+                if let Ok(rx) = client.connect().await {
+                    connected = Some(rx);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            connected.expect("IpcClient must connect to the child socket")
+        };
+
+        let result = run_prepared_child(sup, prepared).await;
+        assert_eq!(result.status, "completed", "output: {}", result.output);
+        assert_eq!(result.child_session_id, child_id);
+
+        // Drain the attach stream: ≥1 envelope, TurnCompleted present, and
+        // every envelope deserialized to the shared wire type.
+        let mut envelopes = Vec::new();
+        while let Ok(Some(envelope)) = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await
+        {
+            envelopes.push(envelope);
+        }
+        assert!(
+            !envelopes.is_empty(),
+            "attach must receive at least one envelope"
+        );
+        assert!(
+            envelopes
+                .iter()
+                .any(|e| matches!(e.event, AgentEvent::TurnCompleted { .. })),
+            "attach must receive TurnCompleted; got {:?}",
+            envelopes.iter().map(|e| &e.event).collect::<Vec<_>>()
+        );
     }
 
     #[test]

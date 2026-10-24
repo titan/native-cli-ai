@@ -1,4 +1,5 @@
 mod approval_prompts;
+mod attach_route;
 mod cli_index;
 mod file_mentions;
 mod format;
@@ -1323,17 +1324,59 @@ async fn attach_session(
     );
     let session = store.load(session_id).await.map_err(anyhow::Error::msg)?;
 
-    if let Some(socket_path) = session.meta.socket_path.clone() {
-        let client = nca_runtime::ipc::IpcClient::new(socket_path);
-        if let Ok(mut rx) = client.connect().await {
-            while let Some(envelope) = rx.recv().await {
-                print_event_envelope(&envelope, json)?;
-            }
-            return Ok(());
-        }
+    // Branch 1 — terminal-state sessions never connect: the event log is
+    // authoritative and durable, so print it instead of parking on a
+    // dead socket (P1 R2 no-hang contract).
+    if attach_route::route_initial(Some(session.meta.status.clone()))
+        == attach_route::AttachRoute::PrintLog
+    {
+        return print_log_file(config, workspace_root, session_id, json).await;
     }
 
-    print_log_file(config, workspace_root, session_id, json).await
+    let Some(socket_path) = session.meta.socket_path.clone() else {
+        return print_log_file(config, workspace_root, session_id, json).await;
+    };
+
+    // Branch 2 — bounded connect: a dead/stale socket (finished process,
+    // leftover file) fails or times out and falls back to the log.
+    let client = nca_runtime::ipc::IpcClient::new(socket_path);
+    let connect = tokio::time::timeout(attach_route::CONNECT_TIMEOUT, client.connect()).await;
+    let connect_ok = matches!(connect, Ok(Ok(_)));
+    if attach_route::route_after_connect(connect_ok) == attach_route::AttachRoute::PrintLog {
+        return print_log_file(config, workspace_root, session_id, json).await;
+    }
+    let Ok(Ok(mut rx)) = connect else {
+        unreachable!("route_after_connect(PrintLog) returned above");
+    };
+
+    // Branch 3 — connected: stream live envelopes with a bounded silence
+    // check. A silent stream re-reads the session json: terminal ⇒ the
+    // TurnCompleted envelope is already fsynced, so print the complete
+    // log and exit; still running ⇒ keep waiting (quiet live children are
+    // legal — tool steps can be silent for minutes).
+    loop {
+        let envelope = tokio::select! {
+            envelope = rx.recv() => match envelope {
+                Some(envelope) => envelope,
+                None => break,
+            },
+            _ = tokio::time::sleep(attach_route::SILENCE_CHECK) => {
+                // The session json is the cross-process source of truth
+                // (single writer: the owning supervisor). A load error is
+                // "still unknown", which the router resolves to keep
+                // waiting — never a wrong exit.
+                let status = store.load(session_id).await.ok().map(|s| s.meta.status);
+                if attach_route::route_on_silence(status)
+                    == attach_route::AttachRoute::PrintLog
+                {
+                    return print_log_file(config, workspace_root, session_id, json).await;
+                }
+                continue;
+            }
+        };
+        print_event_envelope(&envelope, json)?;
+    }
+    Ok(())
 }
 
 async fn show_status(

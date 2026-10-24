@@ -276,6 +276,26 @@ flowchart LR
   CliProcess -->|"send commands"| RuntimeServer
 ```
 
+### Subagent session sockets
+
+Every child session runs its own `IpcServer` on
+`$XDG_RUNTIME_DIR/nca/<child-session-id>.sock`, exactly like a top-level
+session. The child's event fanout broadcasts every `EventEnvelope` to this
+socket (wired via `SupervisorHandle::take_ipc_handle` →
+`IpcHandle::into_parts().0` in `run_prepared_child`), so `nca attach
+<child-id>` / `nca logs <child-id> -f` streams a running child's live
+conversation while it works — the child's `command_rx` is deliberately
+dropped (children never serve attach-side commands; the accept loop's own
+sender clones keep live connections healthy for the child's lifetime).
+
+The attach path is contractually hang-free (`attach_route` module,
+`crates/cli/src/attach_route.rs`): terminal-state sessions (status ≠
+`Running`) print the durable event log directly without connecting; a
+dead/stale socket fails a bounded 2s connect and falls back to the log; a
+connected-but-silent stream re-checks the session json after 5s of quiet —
+terminal ⇒ print the already-fsynced log, still-running ⇒ keep waiting (a
+quiet live child is legal; tool steps can be silent for minutes).
+
 ### Event Schema (common::event)
 
 ```rust
