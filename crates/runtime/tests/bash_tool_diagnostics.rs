@@ -17,8 +17,8 @@
 //!
 //! - signal death: `error` carries the synthesized diagnostics (signal
 //!   number + SIGKILL name, no-output note, timeout ceiling) — the field
-//! `format_tool_result` reads for failed results, i.e. what the model
-//! actually sees; `output` stays empty;
+//!   `format_tool_result` reads for failed results, i.e. what the model
+//!   actually sees; `output` stays empty;
 //! - non-zero exit WITH output: unchanged — raw stdout in `output`, `error`
 //!   stays `None` (no diagnostics appended; the model already has what it
 //!   needs to self-correct);

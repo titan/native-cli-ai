@@ -530,8 +530,10 @@ mod tests {
     async fn discover_times_out_on_hanging_server() {
         let dir = tempfile::tempdir().expect("tempdir");
         let server = hanging_server("hang", &["sleep 30"]);
-        let mut config = McpConfig::default();
-        config.startup_timeout_ms = 500;
+        let config = McpConfig {
+            startup_timeout_ms: 500,
+            ..Default::default()
+        };
 
         let started = std::time::Instant::now();
         let err = match discover_server_tools(dir.path(), &server, &config).await {
@@ -559,8 +561,10 @@ mod tests {
             "noisy-hang",
             &["echo 'NCA_TEST_STDERR_MARKER' >&2; sleep 30"],
         );
-        let mut config = McpConfig::default();
-        config.startup_timeout_ms = 500;
+        let config = McpConfig {
+            startup_timeout_ms: 500,
+            ..Default::default()
+        };
 
         let err = match discover_server_tools(dir.path(), &server, &config).await {
             Ok(_) => panic!("hanging server must fail"),
@@ -577,9 +581,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn load_mcp_tools_aggregates_failures_per_server() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut config = McpConfig::default();
-        config.startup_timeout_ms = 300;
-        config.servers = vec![hanging_server("rea", &["sleep 30"])];
+        let config = McpConfig {
+            startup_timeout_ms: 300,
+            servers: vec![hanging_server("rea", &["sleep 30"])],
+            ..Default::default()
+        };
 
         let started = std::time::Instant::now();
         let (tools, reports) = load_mcp_tools(dir.path(), &config).await;
@@ -720,9 +726,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut server = hanging_server("off", &["sleep 30"]);
         server.enabled = false;
-        let mut config = McpConfig::default();
-        config.startup_timeout_ms = 50;
-        config.servers = vec![server];
+        let config = McpConfig {
+            startup_timeout_ms: 50,
+            servers: vec![server],
+            ..Default::default()
+        };
 
         let (tools, reports) = load_mcp_tools(dir.path(), &config).await;
         assert!(tools.is_empty());
