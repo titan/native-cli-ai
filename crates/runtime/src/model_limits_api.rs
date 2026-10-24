@@ -485,7 +485,10 @@ pub async fn fetch_model_ids_for(config: &NcaConfig, kind: ProviderKind) -> Vec<
             "deepseek-reasoner".into(),
         ],
         ProviderKind::Kimi => vec![
+            "k3.1-pro".into(),
+            "k3.1-pro-highspeed".into(),
             "k3".into(),
+            "k3-256k".into(),
             "kimi-for-coding".into(),
             "kimi-for-coding-highspeed".into(),
         ],

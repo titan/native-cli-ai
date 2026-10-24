@@ -404,9 +404,8 @@ impl NcaConfig {
     pub fn provider_hint_for_alias(alias: &str) -> Option<ProviderKind> {
         match alias.trim().to_ascii_lowercase().as_str() {
             "minimax" | "m2.7" | "m3" => Some(ProviderKind::MiniMax),
-            "kimi" | "kimi-k2" | "kimi-k3" | "k3" | "moonshot" | "moonshot-v1" => {
-                Some(ProviderKind::Kimi)
-            }
+            "kimi" | "kimi-k2" | "kimi-k3" | "k3" | "k3.1-pro" | "k3.1-pro-highspeed"
+            | "k3-256k" | "moonshot" | "moonshot-v1" => Some(ProviderKind::Kimi),
             "openai" | "gpt" | "gpt4o" | "gpt4omini" => Some(ProviderKind::OpenAi),
             "claude" | "claude-sonnet" => Some(ProviderKind::Anthropic),
             "openrouter" => Some(ProviderKind::OpenRouter),
@@ -1383,7 +1382,9 @@ impl ProviderKind {
                 Some(Self::ZhipuAI)
             }
             "deepseek" => Some(Self::DeepSeek),
-            "kimi" | "k3" | "kimi-k3" => Some(Self::Kimi),
+            "kimi" | "k3" | "k3.1-pro" | "k3.1-pro-highspeed" | "k3-256k" | "kimi-k3" => {
+                Some(Self::Kimi)
+            }
             "mimo" | "xiaomi" => Some(Self::Mimo),
             "custom" => Some(Self::Custom),
             _ => None,
@@ -3194,6 +3195,10 @@ fn default_model_aliases() -> BTreeMap<String, String> {
         ("moonshot".into(), "k3".into()),
         ("k3".into(), "k3".into()),
         ("kimi-k3".into(), "k3".into()),
+        ("k3.1".into(), "k3.1-pro".into()),
+        ("k3.1-pro".into(), "k3.1-pro".into()),
+        ("k3.1-pro-highspeed".into(), "k3.1-pro-highspeed".into()),
+        ("k3-256k".into(), "k3-256k".into()),
         // Xiaomi MiMo
         ("mimo".into(), "mimo-v2.6-pro".into()),
         ("mimo-pro".into(), "mimo-v2.6-pro".into()),

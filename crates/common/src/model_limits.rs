@@ -237,6 +237,22 @@ pub const MODEL_CONTEXT_LIMITS: &[ModelContextLimits] = &[
         context_window: 8_192,
         max_output_tokens: 2048,
     },
+    // Kimi K3.1 Pro (Moonshot AI) — new flagship: 3T-class, 1M context,
+    // thinking-only (requests with thinking disabled are rejected by the
+    // API; nca never sends a disable field). 131K output floor applies.
+    // MUST precede "k3" — first-match-wins contains lookup.
+    ModelContextLimits {
+        pattern: "k3.1-pro",
+        context_window: 1_048_576,
+        max_output_tokens: 131_072,
+    },
+    // Kimi K3 — 256K context variant (image-only multimodal input).
+    // MUST precede bare "k3" — otherwise "k3-256k" contains-matches the 1M entry.
+    ModelContextLimits {
+        pattern: "k3-256k",
+        context_window: 262_144,
+        max_output_tokens: 131_072,
+    },
     // Kimi K3 (Moonshot AI) — 1M context, 131K output.
     // Reached via Kimi for Coding (model id "k3") or OpenRouter ("moonshotai/kimi-k3").
     ModelContextLimits {
@@ -252,17 +268,26 @@ pub const MODEL_CONTEXT_LIMITS: &[ModelContextLimits] = &[
         max_output_tokens: 131_072,
     },
     // Kimi K2.7 Code (256K context, 32K output) — OpenAI-compat model id,
-    // same specs as kimi-for-coding per that entry.
+    // same specs as kimi-for-coding-highspeed per that entry.
     ModelContextLimits {
         pattern: "kimi-k2.7-code",
         context_window: 262_144,
         max_output_tokens: 32_768,
     },
-    // Kimi K2.7 Code (256K context, 32K output) — Highspeed variant shares specs.
+    // Kimi K2.7 Code Highspeed (256K context, 32K output).
+    // MUST precede "kimi-for-coding" — that id now resolves to K2.8 Preview
+    // (1M context) since the 2026-10 Kimi Code lineup change.
     ModelContextLimits {
-        pattern: "kimi-for-coding",
+        pattern: "kimi-for-coding-highspeed",
         context_window: 262_144,
         max_output_tokens: 32_768,
+    },
+    // Kimi K2.8 Preview — the "kimi-for-coding" id now serves K2.8 Preview
+    // with a 1M context window (was K2.7 Code 256K before the 2026-10 change).
+    ModelContextLimits {
+        pattern: "kimi-for-coding",
+        context_window: 1_048_576,
+        max_output_tokens: 131_072,
     },
     // Default for unknown models
     ModelContextLimits {
@@ -437,12 +462,41 @@ mod tests {
         assert_eq!(detect_context_window("k3"), 1_048_576);
         assert_eq!(detect_max_output_tokens("k3"), 131_072);
         assert_eq!(detect_max_output_tokens("moonshotai/kimi-k3"), 131_072);
-        // K2.7 Code via OpenAI-compat endpoints shares kimi-for-coding specs.
-        assert_eq!(detect_context_window("kimi-k2.7-code"), 262_144);
-        assert_eq!(detect_max_output_tokens("kimi-k2.7-code"), 32_768);
+        // K3.1 Pro series (new flagship): 1M context, thinking-only.
+        assert_eq!(detect_context_window("k3.1-pro"), 1_048_576);
+        assert_eq!(detect_max_output_tokens("k3.1-pro"), 131_072);
+        assert_eq!(detect_context_window("k3.1-pro-highspeed"), 1_048_576);
+        assert_eq!(detect_max_output_tokens("k3.1-pro-highspeed"), 131_072);
+        // K3 256K variant — order-sensitive: must NOT match the bare-"k3" 1M entry.
+        assert_eq!(detect_context_window("k3-256k"), 262_144);
+        assert_eq!(detect_max_output_tokens("k3-256k"), 131_072);
+        // "kimi-for-coding" now serves K2.8 Preview (1M) — the 256K K2.7
+        // specs live only on the explicit highspeed id.
+        assert_eq!(detect_context_window("kimi-for-coding"), 1_048_576);
+        assert_eq!(detect_max_output_tokens("kimi-for-coding"), 131_072);
+        assert_eq!(detect_context_window("kimi-for-coding-highspeed"), 262_144);
         assert_eq!(
             detect_max_output_tokens("kimi-for-coding-highspeed"),
             32_768
+        );
+        // K2.7 Code via OpenAI-compat endpoints keeps its 256K/32K specs.
+        assert_eq!(detect_context_window("kimi-k2.7-code"), 262_144);
+        assert_eq!(detect_max_output_tokens("kimi-k2.7-code"), 32_768);
+    }
+
+    #[test]
+    fn kimi_pattern_order_is_first_match_wins() {
+        // Regression guard for the contains-based lookup: the specific
+        // variants must stay ABOVE their prefix parents in MODEL_CONTEXT_LIMITS.
+        assert_eq!(
+            detect_context_window("k3-256k"),
+            262_144,
+            "k3-256k must not match bare k3"
+        );
+        assert_eq!(
+            detect_context_window("kimi-for-coding-highspeed"),
+            262_144,
+            "highspeed must not match kimi-for-coding (K2.8 1M)"
         );
     }
 
@@ -474,6 +528,9 @@ mod tests {
             ("gpt-4o", 131_072, 16_384),
             ("claude-3-7-sonnet", 999_999, 8_192),
             ("kimi-k2.7-code", 131_072, 32_768),
+            ("kimi-for-coding-highspeed", 131_072, 32_768),
+            // New K3.1 flagship floors to 131K like the rest of the K3 family.
+            ("k3.1-pro", 8_192, 131_072),
             // Unknown models pass through unchanged.
             ("totally-unknown-xyz", 5_000, 5_000),
         ];
