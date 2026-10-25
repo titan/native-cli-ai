@@ -148,6 +148,14 @@ pub(crate) struct NcaModel {
     /// rebuild costs O(dir listing + changed files) instead of re-reading
     /// and re-parsing every session json.
     pub(crate) family_cache: FamilyCache,
+    /// Live child observations (Fix B): every `ChildSession*` event folds
+    /// here unconditionally, independent of whether the subagent view is
+    /// mounted. The user flow is "spawn first, open the view later" — the
+    /// old view-owned map dropped events that arrived before the view was
+    /// mounted, leaving a running child invisible. Model-lifetime state,
+    /// cleared on session switch (stale ids would synthesize bogus rows
+    /// under a new family root).
+    pub(crate) live_children: HashMap<String, LiveChild>,
 }
 
 impl NcaModel {
@@ -189,6 +197,7 @@ impl NcaModel {
             sessions_dir,
             session_id,
             family_cache: FamilyCache::default(),
+            live_children: HashMap::new(),
         }
     }
 
@@ -586,8 +595,14 @@ impl NcaModel {
                     } => {
                         self.components.status_bar.update_session(session_id, model);
                         // Family root may have changed (resume/switch): keep
-                        // the subagent view's root in sync.
+                        // the subagent view's root in sync, and drop live
+                        // observations from the OLD root — they would
+                        // synthesize bogus depth-0 rows under the new one.
+                        // (/new and /session also send ResetSessionState,
+                        // which clears first; this is defense-in-depth for
+                        // any future SessionStarted-only path.)
                         self.session_id = session_id.clone();
+                        self.live_children.clear();
                     }
                     AgentEvent::CostUpdated {
                         input_tokens,
@@ -874,6 +889,11 @@ impl NcaModel {
             }
             TuiFeedbackMsg::ResetSessionState { session_id, model } => {
                 self.session_id = session_id.clone();
+                // Session switch: drop the old session's live observations —
+                // a stale id synthesizes a bogus depth-0 row under the new
+                // family root (`merge_live_entries` keeps live ids not on
+                // disk).
+                self.live_children.clear();
                 self.components.transcript.clear();
                 self.components
                     .status_bar
@@ -931,10 +951,14 @@ impl NcaModel {
     // ── Subagent view plumbing (P2) ────────────────────────────────
 
     /// Record a live child observation; rebuild the open view's family so
-    /// lifecycle transitions are visible immediately.
+    /// lifecycle transitions are visible immediately. The observation is
+    /// model-owned state (Fix B): it is recorded UNCONDITIONALLY — events
+    /// that arrive while the view is closed must survive, or a child spawned
+    /// before the view was opened never shows up in the list.
     fn observe_child(&mut self, child_id: &str, state: nca_common::session::ChildSessionState) {
-        if let Some(ref mut v) = self.components.subagent_view {
-            v.observe_live(child_id, state);
+        self.live_children
+            .insert(child_id.to_string(), LiveChild { state });
+        if self.components.subagent_view.is_some() {
             self.rebuild_subagent_family();
         }
     }
@@ -951,30 +975,24 @@ impl NcaModel {
             &HashMap::new(),
             &mut self.family_cache,
         );
-        let merged = merge_live_entries(disk, &self.session_id, &v_live_snapshot(v));
+        let merged = merge_live_entries(disk, &self.session_id, &self.live_children);
         v.refresh_entries(merged);
     }
 
     /// Open the subagent view modal (command palette "/jobs", or the
     /// `OpenSubagentView` TuiCmd round-trip).
     pub(crate) fn open_subagent_view(&mut self) {
-        let live = self
-            .components
-            .subagent_view
-            .as_ref()
-            .map(v_live_snapshot)
-            .unwrap_or_default();
         let disk = build_family_index_cached(
             &self.sessions_dir,
             &self.session_id,
             &HashMap::new(),
             &mut self.family_cache,
         );
-        let entries = merge_live_entries(disk, &self.session_id, &live);
+        let entries = merge_live_entries(disk, &self.session_id, &self.live_children);
         self.components
             .subagent_view
             .get_or_insert_with(subagent_view::SubagentViewState::new)
-            .open(entries, live);
+            .open(entries);
         self.popup_open = true;
     }
 
@@ -1336,11 +1354,6 @@ impl NcaModel {
     }
 }
 
-/// Borrow the live-observation map out of a view state (for rebuilds).
-fn v_live_snapshot(v: &subagent_view::SubagentViewState) -> HashMap<String, LiveChild> {
-    v.live_observations()
-}
-
 struct LayoutAreas {
     status: Rect,
     transcript: Rect,
@@ -1484,6 +1497,120 @@ mod tests {
             BRIDGE_BULK_DRAIN_BUDGET + 100,
             "the remainder drains on the next tick"
         );
+    }
+
+    // ── Fix B: live observations survive until the view opens ─────────
+
+    fn model_with_sessions_dir(dir: &std::path::Path, session_id: &str) -> NcaModel {
+        let (bridge_tx, bridge_rx) = mpsc::unbounded_channel::<TuiFeedbackMsg>();
+        drop(bridge_tx); // no events sent on this bridge
+        let (_cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<Msg>();
+        let side_effects = SideEffectChannels {
+            question_answer_tx: None,
+            approval_answer_tx: None,
+            cancel_flag: None,
+            active_question_id: Arc::new(StdMutex::new(None)),
+            active_question_payload: Arc::new(StdMutex::new(None)),
+            active_approval_payload: Arc::new(StdMutex::new(None)),
+            staged_images: Arc::new(StdMutex::new(Vec::new())),
+            inbox_tx: None,
+            busy_flag: Arc::new(AtomicBool::new(false)),
+            kill_all_tx: None,
+        };
+        // No events are ever sent on this bridge; dropping the sender just
+        // closes the (unused) receiver.
+        NcaModel::new_with_session(
+            bridge_rx,
+            _cmd_tx,
+            side_effects,
+            dir.to_path_buf(),
+            session_id.to_string(),
+        )
+    }
+
+    #[test]
+    fn observe_child_before_view_mount_lists_child() {
+        // The real user flow: spawn first (view closed), open /jobs later.
+        // The spawn event's observation must NOT be dropped just because the
+        // view was not mounted — the list must synthesize a running row even
+        // with an empty sessions dir (nothing on disk yet).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut model = model_with_sessions_dir(dir.path(), "parent-1");
+
+        assert!(
+            model.components.subagent_view.is_none(),
+            "precondition: view not mounted"
+        );
+        model.observe_child("child-9", nca_common::session::ChildSessionState::Running);
+        assert!(
+            model.live_children.contains_key("child-9"),
+            "observation survives the unmounted view"
+        );
+
+        model.open_subagent_view();
+        let v = model
+            .components
+            .subagent_view
+            .as_ref()
+            .expect("view mounted by open");
+        let entry = v
+            .entries()
+            .iter()
+            .find(|e| e.session_id == "child-9")
+            .expect("spawned child must appear in the family list");
+        assert_eq!(entry.state, nca_common::session::ChildSessionState::Running);
+        assert_eq!(entry.parent_id, "parent-1", "synthesized as a direct child");
+    }
+
+    #[test]
+    fn observe_child_updates_state_for_already_listed_child() {
+        // Terminal transition after the view opened: the same model-owned map
+        // drives the refresh, so the row's state follows the event.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut model = model_with_sessions_dir(dir.path(), "parent-1");
+
+        model.observe_child("child-9", nca_common::session::ChildSessionState::Running);
+        model.open_subagent_view();
+        model.observe_child("child-9", nca_common::session::ChildSessionState::Completed);
+
+        let v = model
+            .components
+            .subagent_view
+            .as_ref()
+            .expect("view still mounted");
+        let entry = v
+            .entries()
+            .iter()
+            .find(|e| e.session_id == "child-9")
+            .expect("child still listed");
+        assert_eq!(
+            entry.state,
+            nca_common::session::ChildSessionState::Completed
+        );
+    }
+
+    #[test]
+    fn reset_session_state_clears_live_children() {
+        // Session switch (/new, /session): stale observations from the old
+        // session would synthesize bogus depth-0 rows under the new family
+        // root — they must be dropped.
+        let (mut model, bridge_tx) = test_model();
+        model.observe_child("child-9", nca_common::session::ChildSessionState::Running);
+        assert_eq!(model.live_children.len(), 1);
+
+        bridge_tx
+            .send(TuiFeedbackMsg::ResetSessionState {
+                session_id: "other".into(),
+                model: "m".into(),
+            })
+            .expect("send reset");
+        model.drain_bridge();
+
+        assert!(
+            model.live_children.is_empty(),
+            "session switch drops the old session's observations"
+        );
+        assert_eq!(model.session_id, "other");
     }
 
     #[test]

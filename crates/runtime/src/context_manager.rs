@@ -14,10 +14,24 @@ use std::collections::{HashMap, HashSet};
 const TODO_TOOL_NAME: &str = "update_todos";
 /// Heading under which the preserved todo snapshot is appended to the
 /// summary system message (deterministic content, never LLM-paraphrased).
-const TODO_PRESERVED_HEADING: &str = "### Current todo list (preserved verbatim)";
+/// Shared by `apply_summary` and the anchored sliding window so the
+/// producer and the resume extractor can never drift apart.
+pub(crate) const TODO_PRESERVED_HEADING: &str = "### Current todo list (preserved verbatim)";
+/// Heading of the summary system message produced by `apply_summary` (and
+/// the summary section of the anchored-window anchor). Also matched by the
+/// supervisor's resume extractor to recover the last AI summary.
+pub(crate) const SUMMARY_HEADER: &str = "## Conversation Summary (Earlier Context)";
+/// Heading of the UNCONDITIONAL base anchor the anchored sliding window
+/// inserts whenever it truncates — even with no summary and no todos, the
+/// model must learn that content was dropped (the original incident:
+/// first compaction + failed summary side-call + no `update_todos` use
+/// left a bare window indistinguishable from intact history).
+pub(crate) const ANCHOR_TRUNCATED_HEADER: &str = "## Context truncated (sliding window)";
 /// Hard cap (chars) on the preserved todo snapshot — truncate-protected so a
 /// pathological `update_todos` payload cannot bloat the summary message.
 const TODO_PRESERVED_MAX_CHARS: usize = 4_096;
+/// Cap for the summary section inside the anchored-window anchor message.
+const ANCHOR_SUMMARY_MAX_CHARS: usize = 2_000;
 
 /// The latest `update_todos` interaction in a message slice.
 ///
@@ -416,7 +430,8 @@ impl ContextManager {
             result.push(Message {
                 role: Role::System,
                 content: MessageContent::Text(format!(
-                    "## Conversation Summary (Earlier Context)\n\n{}{}",
+                    "{}\n\n{}{}",
+                    SUMMARY_HEADER,
                     summary,
                     todo_block.unwrap_or_default()
                 )),
@@ -455,6 +470,72 @@ impl ContextManager {
         let mut result: Vec<Message> = messages[..system_count].to_vec();
         result.extend_from_slice(&messages[cutoff..]);
 
+        result
+    }
+
+    /// Anchored sliding window — the fallback-compaction path's answer to
+    /// "the window dropped the thread". Same windowing as
+    /// [`Self::get_sliding_window`], plus ONE system anchor message stitched
+    /// right after the leading system messages whenever truncation actually
+    /// dropped content. The anchor is UNCONDITIONAL on truncation (PRD-1):
+    /// the base section always states that content was dropped and why, so
+    /// even the worst case — first compaction, failed summary side-call
+    /// (`last_summary == None`), no `update_todos` use — still leaves the
+    /// model knowing the history has a hole. Optional sections append in
+    /// order:
+    ///
+    /// - [`SUMMARY_HEADER`] + `last_summary` (capped) — a later fallback
+    ///   does not erase an earlier AI compaction's memory.
+    /// - [`TODO_PRESERVED_HEADING`] + the latest `update_todos` snapshot
+    ///   from the DROPPED region only (`&messages[..cutoff]`) — a snapshot
+    ///   still inside the window is live history and must not be duplicated.
+    ///
+    /// No truncation → the input verbatim (no anchor, no system synthesis).
+    pub fn get_anchored_sliding_window(
+        &self,
+        messages: &[Message],
+        last_summary: Option<&str>,
+    ) -> Vec<Message> {
+        let max = self.config.max_retained_messages;
+        let system_count = Self::count_system_messages(messages);
+
+        if messages.len() <= max {
+            return messages.to_vec();
+        }
+
+        let keep_count = max.saturating_sub(system_count);
+        let cutoff = messages.len() - keep_count;
+        let cutoff = Self::adjust_cutoff_for_tool_groups(messages, cutoff, system_count);
+
+        let dropped = &messages[system_count..cutoff];
+        let mut anchor = format!(
+            "{}\n\nEarlier conversation ({} messages) was dropped because context \
+             summarization was unavailable (provider error). If task context appears to be \
+             missing, re-read the task artifacts or ask the user before proceeding.",
+            ANCHOR_TRUNCATED_HEADER,
+            dropped.len(),
+        );
+        if let Some(summary) = last_summary.filter(|s| !s.trim().is_empty()) {
+            anchor.push_str("\n\n");
+            anchor.push_str(SUMMARY_HEADER);
+            anchor.push_str("\n\n");
+            anchor.push_str(&cap_chars(summary, ANCHOR_SUMMARY_MAX_CHARS));
+        }
+        if let Some(snapshot) = last_update_todos_snapshot(dropped) {
+            anchor.push_str("\n\n");
+            anchor.push_str(TODO_PRESERVED_HEADING);
+            anchor.push_str("\n\n");
+            anchor.push_str(&cap_chars(
+                &render_todo_snapshot(&snapshot),
+                TODO_PRESERVED_MAX_CHARS,
+            ));
+        }
+
+        let mut result: Vec<Message> =
+            Vec::with_capacity(system_count + 2 + (messages.len() - cutoff));
+        result.extend_from_slice(&messages[..system_count]);
+        result.push(Message::system(anchor));
+        result.extend_from_slice(&messages[cutoff..]);
         result
     }
 
@@ -686,6 +767,226 @@ mod tests {
                 }
             }
         }
+    }
+
+    // === Anchored sliding window (fallback-compaction anchors) ===
+
+    fn anchored_manager() -> ContextManager {
+        ContextManager::new(
+            ContextManagerConfig {
+                context_window_target: 32_000,
+                max_retained_messages: 4,
+                auto_summarize_threshold: 75,
+                enable_auto_summarize: true,
+                max_message_chars_for_summary: 10_000,
+            },
+            "test-model".to_string(),
+        )
+    }
+
+    /// History long enough to force truncation, with an update_todos pair in
+    /// the to-be-dropped region and a recent window after it.
+    fn anchored_history() -> Vec<Message> {
+        vec![
+            make_message(Role::System, "system prompt"),
+            make_message(Role::User, "kick off"),
+            Message::assistant_with_tool_calls(
+                "planning",
+                vec![make_todo_call("todo-anchored", "anchor-todo-marker")],
+            ),
+            Message::tool(
+                "todo-anchored",
+                "Updated 1 todos (0 pending, 1 in_progress, 0 completed)",
+            ),
+            make_message(Role::Assistant, "working"),
+            make_message(Role::User, "mid question"),
+            make_message(Role::Assistant, "mid answer"),
+            make_message(Role::User, "recent question"),
+            make_message(Role::Assistant, "recent answer"),
+        ]
+    }
+
+    #[test]
+    fn anchored_window_merges_summary_and_todo_into_single_anchor_after_system() {
+        let manager = anchored_manager();
+        let history = anchored_history();
+        let window = manager.get_anchored_sliding_window(&history, Some("earlier work summary"));
+
+        // Exactly ONE anchor message, directly after the system prefix,
+        // carrying the unconditional base section + summary + todo sections
+        // in order.
+        let texts: Vec<String> = window.iter().map(|m| m.content.to_summary_text()).collect();
+        let sys = texts
+            .iter()
+            .position(|t| t == "system prompt")
+            .expect("system");
+        let anchor_idx = texts
+            .iter()
+            .position(|t| t.contains(ANCHOR_TRUNCATED_HEADER))
+            .expect("base anchor present");
+        assert_eq!(anchor_idx, sys + 1, "single anchor directly after system");
+        assert_eq!(
+            window[anchor_idx].role,
+            Role::System,
+            "anchor is a system message"
+        );
+        let anchor = &texts[anchor_idx];
+        assert!(
+            anchor.contains("5 messages"),
+            "dropped count in base section: {anchor}"
+        );
+        let summary_pos = anchor.find(SUMMARY_HEADER).expect("summary section");
+        let todo_pos = anchor.find(TODO_PRESERVED_HEADING).expect("todo section");
+        assert!(
+            summary_pos < todo_pos,
+            "summary section before todo section"
+        );
+        assert!(anchor.contains("earlier work summary"));
+        assert!(anchor.contains("anchor-todo-marker"));
+
+        assert_no_orphaned_tool_results(&window);
+    }
+
+    #[test]
+    fn anchored_window_without_truncation_returns_input_verbatim() {
+        let manager = anchored_manager();
+        let short = vec![
+            make_message(Role::System, "system prompt"),
+            make_message(Role::User, "one"),
+            make_message(Role::Assistant, "two"),
+        ];
+        let window = manager.get_anchored_sliding_window(&short, Some("summary"));
+        assert_eq!(window.len(), short.len());
+        assert_eq!(window, short, "no truncation → no anchors, verbatim input");
+    }
+
+    #[test]
+    fn anchored_window_base_anchor_is_unconditional_on_truncation() {
+        // PRD-1 original incident shape: first compaction (no prior summary)
+        // + failed summary side-call (None) + no update_todos use. The base
+        // anchor must STILL fire — a bare window indistinguishable from
+        // intact history is the failure being fixed.
+        let manager = anchored_manager();
+        let history = vec![
+            make_message(Role::System, "system prompt"),
+            make_message(Role::User, "old 1"),
+            make_message(Role::Assistant, "old 2"),
+            make_message(Role::User, "old 3"),
+            make_message(Role::Assistant, "old 4"),
+            make_message(Role::User, "old 5"),
+            make_message(Role::Assistant, "old 6"),
+            make_message(Role::User, "recent question"),
+            make_message(Role::Assistant, "recent answer"),
+        ];
+        let window = manager.get_anchored_sliding_window(&history, None);
+
+        let texts: Vec<String> = window.iter().map(|m| m.content.to_summary_text()).collect();
+        let sys = texts
+            .iter()
+            .position(|t| t == "system prompt")
+            .expect("system");
+        let anchor_idx = texts
+            .iter()
+            .position(|t| t.contains(ANCHOR_TRUNCATED_HEADER))
+            .expect("base anchor must exist even with None/None inputs");
+        assert_eq!(anchor_idx, sys + 1);
+        assert!(
+            texts[anchor_idx].contains("5 messages"),
+            "dropped count must be stated: {}",
+            texts[anchor_idx]
+        );
+        assert!(
+            !texts[anchor_idx].contains(SUMMARY_HEADER),
+            "no summary section"
+        );
+        assert!(
+            !texts[anchor_idx].contains(TODO_PRESERVED_HEADING),
+            "no todo section"
+        );
+    }
+
+    #[test]
+    fn anchored_window_without_summary_still_anchors_todo() {
+        let manager = anchored_manager();
+        let history = anchored_history();
+        let window = manager.get_anchored_sliding_window(&history, None);
+        let texts: Vec<String> = window.iter().map(|m| m.content.to_summary_text()).collect();
+        let anchor_idx = texts
+            .iter()
+            .position(|t| t.contains(ANCHOR_TRUNCATED_HEADER))
+            .expect("base anchor");
+        assert!(!texts[anchor_idx].contains(SUMMARY_HEADER));
+        assert!(texts[anchor_idx].contains(TODO_PRESERVED_HEADING));
+        assert!(texts[anchor_idx].contains("anchor-todo-marker"));
+    }
+
+    #[test]
+    fn anchored_window_todo_inside_window_is_not_duplicated() {
+        // The update_todos pair sits INSIDE the retained window: the anchor
+        // must not fire (the window already holds it live), and the pair must
+        // survive intact.
+        let manager = anchored_manager();
+        let history = vec![
+            make_message(Role::System, "system prompt"),
+            make_message(Role::User, "old 1"),
+            make_message(Role::Assistant, "old 2"),
+            make_message(Role::User, "old 3"),
+            make_message(Role::Assistant, "old 4"),
+            Message::assistant_with_tool_calls(
+                "planning",
+                vec![make_todo_call("todo-live", "live-todo-marker")],
+            ),
+            Message::tool("todo-live", "Updated 1 todos"),
+            make_message(Role::User, "recent question"),
+        ];
+        let window = manager.get_anchored_sliding_window(&history, None);
+
+        let texts: Vec<String> = window.iter().map(|m| m.content.to_summary_text()).collect();
+        assert!(
+            !texts
+                .iter()
+                .any(|t| t.contains("Current todo list (preserved verbatim)"))
+        );
+        assert_no_orphaned_tool_results(&window);
+        let ids: Vec<&str> = window
+            .iter()
+            .flat_map(|m| m.tool_calls.iter().flatten())
+            .map(|c| c.id.as_str())
+            .collect();
+        assert!(ids.contains(&"todo-live"), "live pair must stay in window");
+    }
+
+    #[test]
+    fn anchored_window_never_breaks_tool_pairing() {
+        // Force the naive cutoff onto a tool_result message: the adjust walk
+        // must keep the pair together with the anchors present.
+        let manager = ContextManager::new(
+            ContextManagerConfig {
+                context_window_target: 32_000,
+                max_retained_messages: 3,
+                auto_summarize_threshold: 75,
+                enable_auto_summarize: true,
+                max_message_chars_for_summary: 10_000,
+            },
+            "test-model".to_string(),
+        );
+        let history = vec![
+            make_message(Role::System, "system prompt"),
+            make_message(Role::User, "kick off"),
+            Message::assistant_with_tool_calls(
+                "planning",
+                vec![make_todo_call("todo-anchor-2", "marker")],
+            ),
+            Message::tool("todo-anchor-2", "Updated 1 todos"),
+            Message::assistant_with_tool_calls(
+                "reading",
+                vec![make_tool_call("read-3", "read_file")],
+            ),
+            Message::tool("read-3", "file contents"),
+            make_message(Role::User, "recent question"),
+        ];
+        let window = manager.get_anchored_sliding_window(&history, Some("summary"));
+        assert_no_orphaned_tool_results(&window);
     }
 
     #[test]

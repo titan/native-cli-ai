@@ -30,7 +30,7 @@ use nca_common::event::AgentEvent;
 use nca_common::session::ChildSessionState;
 
 use super::searchable_list::{ClearWidget, centered_rect, theme};
-use crate::tui::elm::subagent_family::{LiveChild, SubagentEntry};
+use crate::tui::elm::subagent_family::SubagentEntry;
 use crate::tui::replay::parse_events_from_str;
 use crate::tui::text_utils::truncate;
 
@@ -87,8 +87,6 @@ pub(crate) struct SubagentViewState {
     reader_child_running: bool,
     /// Per-child read offset for incremental tail (byte offset into the log).
     tail_offsets: HashMap<String, u64>,
-    /// Live child observations merged over disk facts (model-owned, passed in).
-    live: HashMap<String, LiveChild>,
     /// Reader scroll offset for the open child (clamped at render;
     /// `usize::MAX` is the bottom-anchor sentinel).
     reader_scroll: usize,
@@ -107,7 +105,6 @@ impl SubagentViewState {
             reader_truncated: false,
             reader_child_running: false,
             tail_offsets: HashMap::new(),
-            live: HashMap::new(),
             reader_scroll: 0,
         }
     }
@@ -116,10 +113,16 @@ impl SubagentViewState {
         true // mounted = open
     }
 
+    /// Read-only access to the merged family rows (tests assert on these).
+    pub(crate) fn entries(&self) -> &[SubagentEntry] {
+        &self.entries
+    }
+
     /// Open the modal: (re)build the family from disk + live observations.
-    pub(crate) fn open(&mut self, entries: Vec<SubagentEntry>, live: HashMap<String, LiveChild>) {
+    /// The caller (`NcaModel`) has already merged its live observations into
+    /// `entries` — the view holds only the merged rows.
+    pub(crate) fn open(&mut self, entries: Vec<SubagentEntry>) {
         self.entries = entries;
-        self.live = live;
         self.mode = SubagentMode::List;
         self.selected = self.selected.min(self.entries.len().saturating_sub(1));
         self.list_scroll = 0;
@@ -173,16 +176,6 @@ impl SubagentViewState {
                 .map(|e| !e.state.is_terminal())
                 .unwrap_or(false);
         }
-    }
-
-    /// Record a live child observation (model forwards lifecycle events).
-    pub(crate) fn observe_live(&mut self, child_id: &str, state: ChildSessionState) {
-        self.live.insert(child_id.to_string(), LiveChild { state });
-    }
-
-    /// Read-only view of the live observations (for model-side rebuilds).
-    pub(crate) fn live_observations(&self) -> HashMap<String, LiveChild> {
-        self.live.clone()
     }
 
     /// Whether the 40ms tick should tail the open child's log.
@@ -792,13 +785,10 @@ mod tests {
     #[test]
     fn list_navigation_moves_and_clamps() {
         let mut v = SubagentViewState::new();
-        v.open(
-            vec![
-                entry("c1", ChildSessionState::Running, Some("a")),
-                entry("c2", ChildSessionState::Completed, Some("b")),
-            ],
-            HashMap::new(),
-        );
+        v.open(vec![
+            entry("c1", ChildSessionState::Running, Some("a")),
+            entry("c2", ChildSessionState::Completed, Some("b")),
+        ]);
         assert_eq!(v.selected, 0);
         assert_eq!(
             v.handle_key(key(KeyCode::Down), 10),
@@ -818,10 +808,7 @@ mod tests {
     #[test]
     fn esc_in_list_closes_but_esc_in_reader_goes_back() {
         let mut v = SubagentViewState::new();
-        v.open(
-            vec![entry("c1", ChildSessionState::Running, None)],
-            HashMap::new(),
-        );
+        v.open(vec![entry("c1", ChildSessionState::Running, None)]);
         assert_eq!(
             v.handle_key(key(KeyCode::Esc), 10),
             SubagentViewAction::Close
@@ -846,14 +833,11 @@ mod tests {
     #[test]
     fn tab_cycles_between_running_children_from_list() {
         let mut v = SubagentViewState::new();
-        v.open(
-            vec![
-                entry("c1", ChildSessionState::Completed, None),
-                entry("c2", ChildSessionState::Running, None),
-                entry("c3", ChildSessionState::Running, None),
-            ],
-            HashMap::new(),
-        );
+        v.open(vec![
+            entry("c1", ChildSessionState::Completed, None),
+            entry("c2", ChildSessionState::Running, None),
+            entry("c3", ChildSessionState::Running, None),
+        ]);
         v.selected = 1;
         v.handle_key(key(KeyCode::Tab), 10);
         assert_eq!(v.selected, 2, "c2 → c3");
@@ -870,7 +854,7 @@ mod tests {
         e2.log_path = write_log(dir.path(), "c2", &format!("{ASSISTANT_LINE}\n"));
 
         let mut v = SubagentViewState::new();
-        v.open(vec![e1, e2], HashMap::new());
+        v.open(vec![e1, e2]);
         v.handle_key(key(KeyCode::Enter), 10); // open c1 reader
         assert_eq!(v.reader_session_id.as_deref(), Some("c1"));
         v.handle_key(key(KeyCode::Tab), 10);
@@ -894,7 +878,7 @@ mod tests {
         e.log_path = write_log(dir.path(), "c1", &body);
 
         let mut v = SubagentViewState::new();
-        v.open(vec![e], HashMap::new());
+        v.open(vec![e]);
         v.handle_key(key(KeyCode::Enter), 10);
 
         let rendered: Vec<String> = v
@@ -928,7 +912,7 @@ mod tests {
         e.log_path = write_log(dir.path(), "c1", &body);
 
         let mut v = SubagentViewState::new();
-        v.open(vec![e], HashMap::new());
+        v.open(vec![e]);
         v.handle_key(key(KeyCode::Enter), 10);
         let joined = lines_to_string(&v.reader_lines);
         assert!(!joined.contains("partial"), "deltas must not render");
@@ -946,7 +930,7 @@ mod tests {
         e2.log_path = write_log(dir.path(), "c2", &format!("{ASSISTANT_LINE}\n"));
 
         let mut v = SubagentViewState::new();
-        v.open(vec![e1.clone(), e2], HashMap::new());
+        v.open(vec![e1.clone(), e2]);
         v.selected = 0;
         v.handle_key(key(KeyCode::Enter), 10);
         v.reader_scroll = 3;
@@ -976,7 +960,7 @@ mod tests {
         e.log_path = write_log(dir.path(), "c1", &format!("{USER_LINE}\n"));
 
         let mut v = SubagentViewState::new();
-        v.open(vec![e.clone()], HashMap::new());
+        v.open(vec![e.clone()]);
         v.handle_key(key(KeyCode::Enter), 10);
         assert!(v.wants_tail(), "running child + Reader open");
         let before = v.reader_lines.len();
@@ -1016,7 +1000,7 @@ mod tests {
         e.log_path = write_log(dir.path(), "c1", &format!("{USER_LINE}\n"));
 
         let mut v = SubagentViewState::new();
-        v.open(vec![e.clone()], HashMap::new());
+        v.open(vec![e.clone()]);
         v.handle_key(key(KeyCode::Enter), 10);
 
         // Append HALF an event line (writer mid-append).
@@ -1052,7 +1036,7 @@ mod tests {
         e.log_path = write_log(dir.path(), "c1", &format!("{USER_LINE}\n"));
 
         let mut v = SubagentViewState::new();
-        v.open(vec![e.clone()], HashMap::new());
+        v.open(vec![e.clone()]);
         assert!(!v.wants_tail(), "list mode never tails");
         v.handle_key(key(KeyCode::Enter), 10);
         assert!(!v.wants_tail(), "finished child never tails");
@@ -1075,13 +1059,10 @@ mod tests {
     #[test]
     fn refresh_keeps_selection_by_id_and_updates_live_state() {
         let mut v = SubagentViewState::new();
-        v.open(
-            vec![
-                entry("c1", ChildSessionState::Running, None),
-                entry("c2", ChildSessionState::Running, None),
-            ],
-            HashMap::new(),
-        );
+        v.open(vec![
+            entry("c1", ChildSessionState::Running, None),
+            entry("c2", ChildSessionState::Running, None),
+        ]);
         v.selected = 1;
         v.refresh_entries(vec![
             entry("c1", ChildSessionState::Completed, None),
@@ -1097,7 +1078,7 @@ mod tests {
         let mut e = entry("c1", ChildSessionState::Running, None);
         e.log_path = write_log(dir.path(), "c1", &format!("{USER_LINE}\n"));
         let mut v = SubagentViewState::new();
-        v.open(vec![e], HashMap::new());
+        v.open(vec![e]);
         v.handle_key(key(KeyCode::Enter), 10);
         assert_eq!(v.mode, SubagentMode::Reader);
         v.refresh_entries(vec![entry("c2", ChildSessionState::Running, None)]);
@@ -1110,7 +1091,7 @@ mod tests {
         let mut e = entry("c1", ChildSessionState::Running, None);
         e.log_path = write_log(dir.path(), "c1", &format!("{USER_LINE}\n"));
         let mut v = SubagentViewState::new();
-        v.open(vec![e], HashMap::new());
+        v.open(vec![e]);
         v.handle_key(key(KeyCode::Enter), 10);
         assert!(v.wants_tail());
         v.refresh_entries(vec![entry("c1", ChildSessionState::Completed, None)]);
@@ -1136,7 +1117,7 @@ mod tests {
         std::fs::write(&e.log_path, &body).unwrap();
 
         let mut v = SubagentViewState::new();
-        v.open(vec![e], HashMap::new());
+        v.open(vec![e]);
         v.handle_key(key(KeyCode::Enter), 10);
         assert!(v.reader_truncated);
         let joined = lines_to_string(&v.reader_lines);
@@ -1193,7 +1174,7 @@ mod tests {
         std::fs::write(&e.log_path, &file_bytes).unwrap();
 
         let mut v = SubagentViewState::new();
-        v.open(vec![e], HashMap::new());
+        v.open(vec![e]);
         v.handle_key(key(KeyCode::Enter), 10);
         assert!(v.reader_truncated);
         let joined = lines_to_string(&v.reader_lines);
@@ -1221,7 +1202,7 @@ mod tests {
         e.log_path = write_log(dir.path(), "c1", &format!("{USER_LINE}\n"));
 
         let mut v = SubagentViewState::new();
-        v.open(vec![e.clone()], HashMap::new());
+        v.open(vec![e.clone()]);
         v.handle_key(key(KeyCode::Enter), 10);
 
         // Append an assistant event, then 1 byte of a 3-byte char (torn).

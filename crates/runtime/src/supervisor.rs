@@ -9,7 +9,9 @@ pub use crate::session_utils::{
     spawn_command_consumer_with_store, spawn_event_fanout,
 };
 
-use crate::context_manager::{ContextManager, ContextManagerConfig, ContextStats};
+use crate::context_manager::{
+    ContextManager, ContextManagerConfig, ContextStats, SUMMARY_HEADER, TODO_PRESERVED_HEADING,
+};
 use crate::ipc::{IpcHandle, IpcServer};
 use crate::last_session::LastSessionStore;
 use crate::memory_store::{MemoryNote, MemoryStore};
@@ -126,6 +128,13 @@ pub struct Supervisor {
     plugin_disable_reported: HashSet<String>,
     context_manager: ContextManager,
     last_summary_at_tokens: usize,
+    /// Text of the last AI compaction summary (header stripped), recovered
+    /// at resume from the summary system message and fed to
+    /// [`ContextManager::get_anchored_sliding_window`] so a fallback
+    /// compaction does not erase an earlier compaction's memory. `None` for
+    /// fresh sessions, after `/new`, and until the first successful AI
+    /// summary.
+    last_summary_text: Option<String>,
     fs: Arc<dyn WorkspaceFs>,
     pty: Arc<PtyManager>,
     /// Sender half of the turn-commit watch, handed to the fanout via
@@ -466,6 +475,30 @@ pub(crate) fn select_resume_messages(
         out.extend(snapshot_non_system);
         (out, ResumeMessageSource::Snapshot)
     }
+}
+
+/// Extract the last AI summary text from a persisted history: the LAST
+/// system message carrying the [`SUMMARY_HEADER`], with the header (and the
+/// verbatim todo block that may follow it) stripped so only the summary
+/// prose remains. Best-effort — returns `None` when no such message exists.
+fn last_summary_from_history(messages: &[Message]) -> Option<String> {
+    let text = messages
+        .iter()
+        .rev()
+        .filter(|m| m.role == Role::System)
+        .map(|m| m.content.to_summary_text())
+        .find(|t| t.contains(SUMMARY_HEADER))?;
+    let body = text.split_once(SUMMARY_HEADER)?.1.trim();
+    // `apply_summary` appends the preserved-todo block with a blank-line
+    // separator; strip it so the anchor carries prose only (the anchored
+    // window re-derives its own todo anchor from live history).
+    let todo_separator = format!("\n\n{}", TODO_PRESERVED_HEADING);
+    let body = body
+        .split_once(&todo_separator)
+        .map(|(prose, _)| prose)
+        .unwrap_or(body);
+    let trimmed = body.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// Seed the cost tracker from the last cumulative `CostUpdated` in the event
@@ -1121,6 +1154,7 @@ impl Supervisor {
             plugin_disable_reported: HashSet::new(),
             context_manager,
             last_summary_at_tokens: 0,
+            last_summary_text: None,
             fs: fs_for_supervisor,
             pty: pty_for_supervisor,
             turn_commit_tx,
@@ -1205,6 +1239,11 @@ impl Supervisor {
             sup.session_title = loaded.meta.session_title.clone();
             sup.orchestration = loaded.meta.orchestration.clone();
             sup.context_manager = Self::make_context_manager(&sup.config, &sup.model).await;
+            // Recover the last AI summary text so fallback compactions after
+            // resume still anchor on it. Best-effort scan of the persisted
+            // history: an old-format log or a header-less summary simply
+            // yields None.
+            sup.last_summary_text = last_summary_from_history(&loaded.messages);
         }
         sup.pid = Some(std::process::id());
         sup.session_store = store;
@@ -1862,9 +1901,10 @@ impl Supervisor {
 
         if messages_to_summarize.is_empty() {
             // Nothing to summarize, use sliding window instead
-            let compacted = self
-                .context_manager
-                .get_sliding_window(&self.agent.messages, None);
+            let compacted = self.context_manager.get_anchored_sliding_window(
+                &self.agent.messages,
+                self.last_summary_text.as_deref(),
+            );
             self.emit_history_replaced(&compacted).await;
             self.agent.messages = compacted;
             let tokens_after = self
@@ -1891,7 +1931,15 @@ impl Supervisor {
         // summary-instruction user message appended. A shared prefix with
         // the main conversation lets DeepSeek-style disk caches hit on the
         // prefix (cache_read priced at 1/50 of normal input).
-        let summary = self.summarize_conversation_with_ai(&summary_prompt).await;
+        // F3: transient summary failures (rate limits, mid-stream resets)
+        // deserve exactly one delayed retry before the lossy fallback — the
+        // fallback erases the to-be-summarized region, so it must be the
+        // last resort, not the first.
+        let mut summary = self.summarize_conversation_with_ai(&summary_prompt).await;
+        if summary.is_err() {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            summary = self.summarize_conversation_with_ai(&summary_prompt).await;
+        }
 
         // Try to use the AI to summarize. If the provider supports a quick call,
         // we can use it. Otherwise, fall back to extractive summarization.
@@ -1903,6 +1951,7 @@ impl Supervisor {
                     .apply_summary(&self.agent.messages, &summary);
                 self.emit_history_replaced(&replaced).await;
                 self.agent.messages = replaced;
+                self.last_summary_text = (!summary.trim().is_empty()).then(|| summary.clone());
                 self.last_summary_at_tokens = self
                     .context_manager
                     .stats(&self.agent.messages)
@@ -1920,9 +1969,10 @@ impl Supervisor {
             Err(e) => {
                 // Fallback: just use sliding window
                 tracing::warn!("AI summarization failed, using sliding window: {}", e);
-                let compacted = self
-                    .context_manager
-                    .get_sliding_window(&self.agent.messages, None);
+                let compacted = self.context_manager.get_anchored_sliding_window(
+                    &self.agent.messages,
+                    self.last_summary_text.as_deref(),
+                );
                 self.emit_history_replaced(&compacted).await;
                 self.agent.messages = compacted;
                 self.last_summary_at_tokens = self
@@ -2653,6 +2703,7 @@ impl Supervisor {
         self.status = SessionStatus::Running;
         self.created_at = Utc::now();
         self.last_summary_at_tokens = 0;
+        self.last_summary_text = None;
         self.session_store =
             SessionStore::new(self.workspace_root.join(&self.config.session.history_dir));
     }
@@ -4027,6 +4078,17 @@ mod tests {
         main: Arc<RecordingProvider>,
         context: ContextConfig,
     ) -> Supervisor {
+        let provider: Arc<dyn Provider> = main;
+        supervisor_with_injected_provider(root, provider, context).await
+    }
+
+    /// Same wiring, generic over the injected provider (F3 retry tests use
+    /// `FailThenOkProvider`).
+    async fn supervisor_with_injected_provider(
+        root: &Path,
+        main: Arc<dyn Provider>,
+        context: ContextConfig,
+    ) -> Supervisor {
         let _guard = SUPERVISOR_CREATE_LOCK.lock().await;
         let mut config = NcaConfig::default();
         config.provider.deepseek.api_key = Some("test-key".into());
@@ -4052,6 +4114,134 @@ mod tests {
         })
         .await
         .expect("supervisor")
+    }
+
+    // === F3: exactly-one delayed retry for a failed AI summary ===
+
+    /// Provider that fails the first N chat calls then answers like
+    /// `RecordingProvider`. Drives the F3 retry test offline.
+    struct FailThenOkProvider {
+        calls: std::sync::Mutex<Vec<(String, String)>>,
+        fail_first: std::sync::atomic::AtomicU32,
+        answer: &'static str,
+    }
+
+    impl FailThenOkProvider {
+        fn new(fail_first: u32, answer: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                fail_first: std::sync::atomic::AtomicU32::new(fail_first),
+                answer,
+            })
+        }
+
+        fn calls(&self) -> Vec<(String, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for FailThenOkProvider {
+        async fn chat(
+            &self,
+            messages: &[Message],
+            _tools: &[nca_common::tool::ToolDefinition],
+            model: &str,
+            _workspace_root: &Path,
+        ) -> Result<tokio::sync::mpsc::Receiver<nca_core::provider::StreamChunk>, ProviderError>
+        {
+            self.calls.lock().unwrap().push((
+                model.to_string(),
+                messages
+                    .last()
+                    .map(|m| m.content.event_preview())
+                    .unwrap_or_default(),
+            ));
+            let (tx, rx) = tokio::sync::mpsc::channel(8);
+            if self.fail_first.fetch_sub(1, Ordering::Relaxed) > 0 {
+                let _ = tx
+                    .send(nca_core::provider::StreamChunk::Error(
+                        ProviderError::Other("transient".into()),
+                    ))
+                    .await;
+                return Ok(rx);
+            }
+            let answer = self.answer.to_string();
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(nca_core::provider::StreamChunk::TextDelta(answer))
+                    .await;
+                let _ = tx.send(nca_core::provider::StreamChunk::Done).await;
+            });
+            Ok(rx)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_ai_summary_retries_once_then_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = FailThenOkProvider::new(1, "retried summary");
+        let ctx = ContextConfig {
+            // Tiny window relative to history so get_messages_to_summarize
+            // is non-empty and the AI path runs.
+            context_window_target: 2_000,
+            ..Default::default()
+        };
+        let mut sup = supervisor_with_injected_provider(dir.path(), main.clone(), ctx).await;
+
+        // Seed enough history to force a summarize range.
+        for i in 0..40 {
+            sup.agent.messages.push(Message::user(format!(
+                "question number {i} with some padding text"
+            )));
+            sup.agent.messages.push(Message::assistant(format!(
+                "answer number {i} with some padding text"
+            )));
+        }
+
+        sup.perform_auto_summarize("auto_summarize")
+            .await
+            .expect("compaction succeeds after one retry");
+
+        // Exactly two side-calls: initial + the single F3 retry.
+        assert_eq!(main.calls().len(), 2, "fail → one retry → success");
+        // The AI summary path won: the summary text is remembered for later
+        // anchored fallback compactions.
+        assert_eq!(sup.last_summary_text.as_deref(), Some("retried summary"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_ai_summary_retries_once_then_falls_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = FailThenOkProvider::new(u32::MAX, "never returned");
+        let ctx = ContextConfig {
+            context_window_target: 2_000,
+            ..Default::default()
+        };
+        let mut sup = supervisor_with_injected_provider(dir.path(), main.clone(), ctx).await;
+
+        for i in 0..40 {
+            sup.agent.messages.push(Message::user(format!(
+                "question number {i} with some padding text"
+            )));
+            sup.agent.messages.push(Message::assistant(format!(
+                "answer number {i} with some padding text"
+            )));
+        }
+
+        sup.perform_auto_summarize("auto_summarize")
+            .await
+            .expect("fallback compaction still succeeds");
+
+        // Initial + exactly one retry, then the sliding-window fallback.
+        assert_eq!(main.calls().len(), 2, "exactly one retry, no more");
+        assert!(sup.last_summary_text.is_none(), "no AI summary to remember");
+        // The fallback kept recent history bounded by the window.
+        assert!(
+            sup.agent.messages.len() < 80,
+            "fallback must actually compact; got {}",
+            sup.agent.messages.len()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

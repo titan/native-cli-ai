@@ -266,8 +266,29 @@ impl AgentLoop {
         // isn't left in a corrupted state (consecutive user messages with no
         // assistant reply confuses providers and causes repeated empty
         // responses).
-        if result.is_err() {
+        //
+        // Receipt for what was rolled back: if the truncate dropped anything
+        // the model could see besides the turn's user message (assistant
+        // replies / tool traffic from steps that completed before the
+        // failure), push a system note so the next request carries an
+        // explicit "this happened, then failed" marker instead of a silent
+        // gap the model cannot explain. The matching `TurnInterruptedNote`
+        // event is emitted AFTER `TurnCompleted` closes the failed bracket;
+        // replay re-materializes the note from it (a `MessageRecorded` here
+        // would land inside the failed bracket and be dropped by the fold).
+        let mut interrupted_note: Option<String> = None;
+        if let Err(error) = result.as_ref() {
+            let dropped_work = self.messages[baseline..]
+                .iter()
+                .any(|m| m.role != Role::User);
             self.messages.truncate(baseline);
+            if dropped_work {
+                interrupted_note = Some(format!(
+                    "[turn {turn_id} interrupted] The previous exchange was rolled back after a provider failure: {}. \
+                         Treat the conversation as continuing from before that exchange; the user will re-state anything still needed.",
+                    error
+                ));
+            }
         }
 
         self.emit(AgentEvent::TurnCompleted {
@@ -275,6 +296,11 @@ impl AgentLoop {
             duration_ms: turn_start.elapsed().as_millis() as u64,
         })
         .await;
+        if let Some(note) = interrupted_note {
+            self.messages.push(Message::system(note.clone()));
+            self.emit(AgentEvent::TurnInterruptedNote { turn_id, note })
+                .await;
+        }
         self.emit(AgentEvent::BusyStateChanged {
             state: BusyState::Idle,
         })
@@ -1010,6 +1036,131 @@ mod tests {
             .expect("normal turn");
         assert_eq!(text, "all done");
         assert_eq!(agent.messages.len(), 2, "user + assistant messages");
+    }
+
+    #[tokio::test]
+    async fn failed_turn_pushes_interrupted_receipt_and_event_after_completed() {
+        // Step 1: a tool call to an unknown tool completes as a failed tool
+        // RESULT (non-fatal — the turn continues, assistant+tool messages
+        // land). Step 2: provider error → turn fails; truncate then drops
+        // the user message AND step 1's messages → a receipt must land in
+        // the history.
+        let round_tools = vec![
+            StreamChunk::ToolUse(ToolCall {
+                id: "call_1".into(),
+                name: "nonexistent_tool".into(),
+                input: serde_json::json!({}),
+            }),
+            StreamChunk::Finish {
+                reason: "tool_calls".into(),
+            },
+        ];
+        let round_err = vec![StreamChunk::Error(ProviderError::Other("boom".into()))];
+        let (provider, _calls) = ScriptedProvider::new(vec![round_tools, round_err]);
+        let mut agent = test_agent(Arc::new(provider));
+
+        let _ = agent
+            .run_turn("do the thing", Path::new("."), &[])
+            .await
+            .expect_err("turn must fail");
+
+        // History: the failed turn's user + assistant messages are gone; a
+        // system receipt sits at the tail.
+        let tail = agent.messages.last().expect("receipt present");
+        assert_eq!(tail.role, Role::System);
+        let note = tail.content.to_summary_text();
+        assert!(
+            note.contains("interrupted"),
+            "receipt must say interrupted: {note}"
+        );
+        assert!(
+            !agent
+                .messages
+                .iter()
+                .any(|m| m.content.to_summary_text() == "do the thing"),
+            "the failed turn's user message must be rolled back"
+        );
+        assert!(
+            !agent
+                .messages
+                .iter()
+                .any(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("call_1")),
+            "step 1's tool result must be rolled back with the turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_turn_emits_turn_interrupted_note_after_turn_completed() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+        let round_tools = vec![
+            StreamChunk::ToolUse(ToolCall {
+                id: "call_1".into(),
+                name: "nonexistent_tool".into(),
+                input: serde_json::json!({}),
+            }),
+            StreamChunk::Finish {
+                reason: "tool_calls".into(),
+            },
+        ];
+        let round_err = vec![StreamChunk::Error(ProviderError::Other("boom".into()))];
+        let provider = ScriptedProvider {
+            rounds: vec![round_tools, round_err],
+            calls: Arc::new(AtomicU32::new(0)),
+        };
+        let mut agent = AgentLoop::new(
+            Arc::new(provider),
+            ToolRegistry::new(),
+            ApprovalPolicy::new(PermissionConfig::default()),
+            "glm-5.3".into(),
+            tx,
+            10,
+            16,
+            0,
+            None,
+        );
+
+        let _ = agent
+            .run_turn("do the thing", Path::new("."), &[])
+            .await
+            .expect_err("turn must fail");
+
+        let mut saw_completed = false;
+        let mut note_after_completed = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AgentEvent::TurnCompleted { .. } => saw_completed = true,
+                AgentEvent::TurnInterruptedNote { note, .. } => {
+                    note_after_completed = saw_completed;
+                    assert!(note.contains("interrupted"));
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_completed, "TurnCompleted must be emitted");
+        assert!(
+            note_after_completed,
+            "TurnInterruptedNote must arrive after TurnCompleted closed the failed bracket"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_turn_emits_no_interrupted_note() {
+        let (provider, _calls) = ScriptedProvider::new(vec![vec![
+            StreamChunk::TextDelta("all done".into()),
+            StreamChunk::Finish {
+                reason: "stop".into(),
+            },
+        ]]);
+        let mut agent = test_agent(Arc::new(provider));
+
+        agent
+            .run_turn("hi", Path::new("."), &[])
+            .await
+            .expect("turn");
+
+        assert_eq!(agent.messages.len(), 2, "user + assistant only, no receipt");
+        assert_eq!(agent.messages[0].role, Role::User);
+        assert_eq!(agent.messages[1].role, Role::Assistant);
     }
 
     // P4 wait-guard turn boundary: the wait-tool repeat counter is

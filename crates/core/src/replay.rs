@@ -55,6 +55,15 @@ pub fn replay_surface_events(envelopes: &[EventEnvelope]) -> Vec<Message> {
                     out.extend(buf);
                 }
             }
+            // Post-mortem receipt for a failed turn. The emit site guarantees
+            // it arrives after `TurnCompleted` closed the bracket; the
+            // `bracket.is_none()` guard makes that ordering a contract: a
+            // note inside an open bracket is ignored rather than folded
+            // (it would otherwise survive into a projection whose turn was
+            // dropped, and a second note would duplicate).
+            AgentEvent::TurnInterruptedNote { note, .. } if bracket.is_none() => {
+                out.push(Message::system(note.clone()));
+            }
             _ => {}
         }
     }
@@ -210,6 +219,61 @@ mod tests {
             replayed[0].content,
             nca_common::message::MessageContent::text("kept")
         );
+    }
+
+    // T14 — TurnInterruptedNote emitted after the failed bracket closed is
+    // folded as a system message; the failed turn's own messages stay
+    // dropped.
+    #[test]
+    fn t14_interrupted_note_after_failed_bracket_is_folded() {
+        let envs = envelopes(vec![
+            AgentEvent::TurnStarted { turn_id: 1 },
+            AgentEvent::MessageRecorded {
+                message: Message::user("go"),
+            },
+            AgentEvent::MessageRecorded {
+                message: Message::assistant("partial"),
+            },
+            AgentEvent::StepFailed {
+                turn_id: 1,
+                step_index: 1,
+                duration_ms: 1,
+                error: "reasoning_content 400".into(),
+            },
+            AgentEvent::TurnCompleted {
+                turn_id: 1,
+                duration_ms: 2,
+            },
+            AgentEvent::TurnInterruptedNote {
+                turn_id: 1,
+                note: "[turn 1 interrupted] rolled back".into(),
+            },
+        ]);
+        assert_eq!(
+            replay_surface_events(&envs),
+            vec![Message::system("[turn 1 interrupted] rolled back")]
+        );
+    }
+
+    // T15 — a TurnInterruptedNote inside an open bracket (mis-ordered log,
+    // crash mid-emit) is ignored, never folded.
+    #[test]
+    fn t15_interrupted_note_inside_bracket_is_ignored() {
+        let envs = envelopes(vec![
+            AgentEvent::TurnStarted { turn_id: 1 },
+            AgentEvent::TurnInterruptedNote {
+                turn_id: 1,
+                note: "stray".into(),
+            },
+            AgentEvent::MessageRecorded {
+                message: Message::user("kept"),
+            },
+            AgentEvent::TurnCompleted {
+                turn_id: 1,
+                duration_ms: 0,
+            },
+        ]);
+        assert_eq!(replay_surface_events(&envs), vec![Message::user("kept")]);
     }
 
     // T5 — old-style logs (no MessageRecorded) fold to empty without panic.

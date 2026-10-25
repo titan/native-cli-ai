@@ -127,6 +127,20 @@ pub enum AgentEvent {
         #[serde(default)]
         error: String,
     },
+    /// Post-mortem receipt for a failed turn, emitted AFTER `TurnCompleted`
+    /// closed the failed bracket. Its payload is also pushed to
+    /// `agent.messages` as a system note (the user message and any
+    /// model-visible messages recorded before the failure were rolled back
+    /// by truncate-to-baseline), so the replay projection must re-materialize
+    /// it outside the bracket — hence this dedicated event instead of a
+    /// `MessageRecorded` that the bracket rule would drop. Replay folds it to
+    /// a system message only when no bracket is open.
+    TurnInterruptedNote {
+        #[serde(default)]
+        turn_id: u64,
+        #[serde(default)]
+        note: String,
+    },
     TokensStreamed {
         delta: String,
     },

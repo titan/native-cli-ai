@@ -357,6 +357,21 @@ pub async fn prepare_child_session(
         }
     }
 
+    // Persist the parent linkage (and worktree/branch meta when set) NOW —
+    // after `set_parent` and the worktree switch, BEFORE the spawned event.
+    // `Supervisor::create` already wrote a seed json, but at that point
+    // `parent_session_id` was still None, and the json is only rewritten at
+    // create/resume/finish (single-writer discipline) — without this save
+    // the child's json stays parent-less for its WHOLE run, invisible to any
+    // disk-side family scan (the subagent view's by-parent BFS) until the
+    // child finishes. The writer is still this child's own supervisor (the
+    // spawn flow holds it — no second writer), and a failed save is
+    // non-fatal: the turn itself doesn't depend on the json (same tolerance
+    // as the `finish()` path).
+    if let Err(e) = sup.save().await {
+        tracing::warn!("Failed to persist child session meta ({child_id}) at spawn: {e}");
+    }
+
     if let Some(ref tx) = event_tx {
         let _ = tx
             .send(AgentEvent::ChildSessionSpawned {
@@ -1777,6 +1792,152 @@ mod tests {
         assert_eq!(entry.accumulated_input_tokens, 12_345);
         assert_eq!(entry.accumulated_output_tokens, 2_345);
         assert_eq!(entry.accumulated_cache_read_tokens, 9_000);
+    }
+
+    // ── Fix A: child json carries parent linkage from spawn time ──
+
+    /// `prepare_child_session` must re-save the child's session json AFTER
+    /// `set_parent` — `Supervisor::create`'s seed write happens before the
+    /// parent linkage exists, and the json is only rewritten at
+    /// create/resume/finish, so without this save a RUNNING child is
+    /// invisible to any disk-side family scan (parent_session_id = null on
+    /// disk for the child's whole run).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepare_child_session_persists_parent_linkage_immediately() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = offline_child_config();
+        let provider = Arc::new(UsageReportingProvider {
+            input: 1,
+            output: 1,
+            cache_read: 0,
+        });
+
+        let (_sup, prepared) = prepare_child_session(
+            ChildSessionConfig {
+                parent_session_id: "parent-link".into(),
+                task: "persist linkage".into(),
+                workspace_root: dir.path().to_path_buf(),
+                config,
+                parent_summary: "ctx".into(),
+                use_worktree: false,
+                focus_files: Vec::new(),
+                images: Vec::new(),
+                provider_override: None,
+                model_override: None,
+                specialist: None,
+                alias: None,
+                registry: None,
+                provider: Some(provider as Arc<dyn nca_core::provider::Provider>),
+                plugins: None,
+                escaped_providers: HashSet::new(),
+            },
+            None,
+        )
+        .await
+        .expect("prepare child");
+
+        // Read the json straight off disk — before any turn / finish ran.
+        let store = crate::session_store::SessionStore::new(dir.path().join(".nca/sessions"));
+        let session = tokio::time::timeout(Duration::from_secs(5), store.load(&prepared.child_id))
+            .await
+            .expect("load within timeout")
+            .expect("child json must exist after prepare (spawn-time save)");
+        assert_eq!(
+            session.meta.parent_session_id.as_deref(),
+            Some("parent-link"),
+            "the spawn-time save must carry the parent linkage — this is what \
+             the subagent view's disk-side family scan filters on"
+        );
+        // The spawn reason rides the same save.
+        assert_eq!(
+            session.meta.spawn_reason.as_deref(),
+            Some("persist linkage")
+        );
+    }
+
+    /// A `git init`-ed workspace with one commit (worktree creation requires
+    /// a real HEAD) in a fresh tempdir — same shape as the integration tests.
+    fn git_workspace() -> tempfile::TempDir {
+        let ws = tempfile::tempdir().expect("tempdir");
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(ws.path())
+                .status()
+                .expect("git must be installed");
+            assert!(status.success(), "git {args:?} must succeed");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "test@nca"]);
+        run(&["config", "user.name", "nca test"]);
+        std::fs::write(ws.path().join("README.md"), "workspace\n").expect("write");
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+        ws
+    }
+
+    /// Worktree variant: the spawn-time save happens AFTER the worktree
+    /// switch, so the json must also carry `worktree_path`/`branch` from the
+    /// very first persisted version (resume/revive and the family view read
+    /// these fields).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepare_child_session_persists_worktree_meta_immediately() {
+        let ws = git_workspace();
+        let config = offline_child_config();
+        let provider = Arc::new(UsageReportingProvider {
+            input: 1,
+            output: 1,
+            cache_read: 0,
+        });
+
+        let (_sup, prepared) = prepare_child_session(
+            ChildSessionConfig {
+                parent_session_id: "parent-wt".into(),
+                task: "persist worktree meta".into(),
+                workspace_root: ws.path().to_path_buf(),
+                config,
+                parent_summary: "ctx".into(),
+                use_worktree: true,
+                focus_files: Vec::new(),
+                images: Vec::new(),
+                provider_override: None,
+                model_override: None,
+                specialist: None,
+                alias: None,
+                registry: None,
+                provider: Some(provider as Arc<dyn nca_core::provider::Provider>),
+                plugins: None,
+                escaped_providers: HashSet::new(),
+            },
+            None,
+        )
+        .await
+        .expect("prepare child");
+
+        let store = crate::session_store::SessionStore::new(ws.path().join(".nca/sessions"));
+        let session = tokio::time::timeout(Duration::from_secs(5), store.load(&prepared.child_id))
+            .await
+            .expect("load within timeout")
+            .expect("child json must exist after prepare (spawn-time save)");
+        assert_eq!(session.meta.parent_session_id.as_deref(), Some("parent-wt"));
+        let wt_path = session
+            .meta
+            .worktree_path
+            .as_ref()
+            .expect("worktree_path persisted at spawn");
+        assert!(
+            wt_path.starts_with(ws.path().join(".nca").join("worktrees")),
+            "worktree path under the parent's worktrees dir: {wt_path:?}"
+        );
+        assert!(
+            session
+                .meta
+                .branch
+                .as_deref()
+                .is_some_and(|b| b.starts_with("nca/")),
+            "branch persisted at spawn: {:?}",
+            session.meta.branch
+        );
     }
 
     // ── P1 (subagent conversation visibility): child IPC broadcast ──
