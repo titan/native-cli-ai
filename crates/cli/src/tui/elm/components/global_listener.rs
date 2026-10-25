@@ -69,8 +69,10 @@ impl GlobalListener {
                 None // Will be wired in Phase 3
             }
             (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
-                // Ctrl+P: open command palette. Will be wired in Phase 2.
-                None
+                // Ctrl+P: open command palette. Handled locally by NcaModel
+                // (mounting the popup must not depend on the cmd_rx loop,
+                // which may be blocked inside `run_turn`).
+                Some(Msg::OpenCommandPalette)
             }
             (KeyCode::Char('x'), KeyModifiers::CONTROL) => {
                 self.leader_pending = true;

@@ -32,6 +32,15 @@ pub(crate) enum Msg {
     /// kill_all_tx`), never `cmd_tx` — the whole point is working while
     /// the cmd_rx loop is blocked inside a long `run_turn`.
     KillAllSubagents,
+    /// Open the command palette (Ctrl+P). Local-only: mounting the popup
+    /// happens directly in the model so it works while the cmd_rx loop is
+    /// blocked inside `run_turn` (thinking/tool execution).
+    OpenCommandPalette,
+    /// Open the subagent view locally (`/jobs` typed while a turn runs —
+    /// the queued TuiCmd would only be handled after the turn ends, so
+    /// the Elm model intercepts the slash command and opens the modal
+    /// directly, same bypass rationale as `OpenCommandPalette`).
+    OpenSubagentViewLocal,
     /// Raw input for the active question — parsed and routed by the model.
     QuestionSubmit(String),
     /// Raw input for the active approval — parsed and routed by the model.

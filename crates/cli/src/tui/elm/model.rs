@@ -1034,6 +1034,22 @@ impl NcaModel {
                 }
                 let _ = self.cmd_tx.send(Msg::Cmd(cmd));
             }
+            Msg::OpenCommandPalette => {
+                // Ctrl+P: mount the palette locally. Never routed through
+                // cmd_tx — the cmd_rx loop may be blocked inside run_turn,
+                // and the palette is pure local UI state.
+                self.components
+                    .command_palette
+                    .get_or_insert_with(command_palette::CommandPaletteState::new)
+                    .open();
+                self.popup_open = true;
+            }
+            Msg::OpenSubagentViewLocal => {
+                // `/jobs` typed while a turn runs: the queued TuiCmd would
+                // only be handled after the turn ends. Open the modal
+                // directly instead (same rationale as OpenCommandPalette).
+                self.open_subagent_view();
+            }
             Msg::KillAllSubagents => {
                 // T2-1: emergency batch-cancel of every Running child.
                 // Never routed through cmd_tx — the cmd_rx loop may be
@@ -1097,6 +1113,24 @@ impl NcaModel {
                             }
                         }
                     }
+                }
+                // Busy-aware local slash commands: `/jobs` / `/tasks` open
+                // the subagent view directly when the cmd_rx loop is blocked
+                // inside run_turn — otherwise the command would only run
+                // after the turn ends (invisible delay). The modal is pure
+                // local state (disk + already-delivered events), so opening
+                // it mid-turn is safe. When idle, the normal path takes over
+                // (same end state via TuiFeedbackMsg::OpenSubagentView).
+                if let TuiCmd::Submit(ref raw) = cmd
+                    && matches!(raw.trim(), "/jobs" | "/tasks")
+                    && self
+                        .side_effects
+                        .busy_flag
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    self.open_subagent_view();
+                    self.redraw = true;
+                    return;
                 }
                 let _ = self.cmd_tx.send(Msg::Cmd(cmd));
             }
