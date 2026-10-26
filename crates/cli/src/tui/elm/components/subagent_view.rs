@@ -16,6 +16,14 @@
 //! Reader mode is open AND the viewed child is Running, stat the log and
 //! parse the newly appended bytes (bounded reads; the Elm thread is a
 //! blocking thread by design).
+//!
+//! The Reader's live feel is a TRANSIENT partial line: a second, cheap
+//! parse pass over the appended bytes picks `TokensStreamed`/
+//! `ReasoningStreamed` deltas out (substring prefilter — deltas are 96%+
+//! of the bytes, so a full serde pass is off the table) and renders them
+//! as one last line (text + `▌`, or muted italic `thinking…`). The next
+//! final event replaces the whole line: deltas never become permanent
+//! rows.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -53,6 +61,10 @@ const RENDER_TARGET_EVENTS: usize = 400;
 const MAX_SCAN_BYTES: u64 = 64 * 1024 * 1024;
 /// Suffix of the truncated-earlier notice line.
 const TRUNCATED_NOTICE: &str = "… log truncated (older events not loaded)";
+/// Rolling window kept for the transient streaming line's text: a long
+/// thinking stream must not grow the line unboundedly — only its tail is
+/// shown.
+const PARTIAL_TAIL_WINDOW: usize = 200;
 
 // ── Actions ──────────────────────────────────────────────────────
 
@@ -73,6 +85,27 @@ pub(crate) enum SubagentViewAction {
 pub(crate) enum SubagentMode {
     List,
     Reader,
+}
+
+// ── Transient streaming tail ─────────────────────────────────────
+
+/// Which live stream a delta belongs to (drives the transient line's look).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TailKind {
+    /// `TokensStreamed` — normal text color + `▌` cursor.
+    Text,
+    /// `ReasoningStreamed` — muted italic behind a `thinking…` prefix.
+    Reasoning,
+}
+
+/// The transient "now streaming" line: live deltas accumulate here while
+/// the child streams; the next final event REPLACES the whole line. Never
+/// a permanent `reader_lines` entry (deltas are 96%+ of child-log bytes —
+/// making them permanent rows is the row-explosion Fix C removed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PartialTail {
+    kind: TailKind,
+    text: String,
 }
 
 // ── State ────────────────────────────────────────────────────────
@@ -100,6 +133,10 @@ pub(crate) struct SubagentViewState {
     /// Reader scroll offset for the open child (clamped at render;
     /// `usize::MAX` is the bottom-anchor sentinel).
     reader_scroll: usize,
+    /// Transient streaming line for the open child (see [`PartialTail`]).
+    /// Rendered one line past the bottom of `reader_lines`, never part of
+    /// it; cleared on every final/terminal event and Reader lifecycle hop.
+    partial: Option<PartialTail>,
 }
 
 impl SubagentViewState {
@@ -116,6 +153,7 @@ impl SubagentViewState {
             reader_child_running: false,
             tail_offsets: HashMap::new(),
             reader_scroll: 0,
+            partial: None,
         }
     }
 
@@ -146,6 +184,7 @@ impl SubagentViewState {
         self.reader_lines = Vec::new();
         self.reader_truncated = false;
         self.reader_child_running = false;
+        self.partial = None;
     }
 
     /// Swap in a freshly rebuilt family (child lifecycle event while open).
@@ -166,12 +205,20 @@ impl SubagentViewState {
             None => 0,
         };
         self.selected = self.selected.min(self.entries.len().saturating_sub(1));
-        if let Some(id) = self.reader_session_id.as_ref() {
+        let open_id = self.reader_session_id.clone();
+        if let Some(id) = open_id.as_ref() {
             if !self.entries.iter().any(|e| &e.session_id == id) {
                 // The open child vanished (session pruned); fall back to list.
                 self.close_reader();
             } else {
                 self.sync_reader_running();
+                if !self.reader_child_running {
+                    // Terminal state: the stream is over, and with it the
+                    // transient partial — even when its closing final event
+                    // never reached the log, a live "streaming" line must
+                    // not linger next to a completed/failed marker.
+                    self.partial = None;
+                }
             }
         }
     }
@@ -243,8 +290,44 @@ impl SubagentViewState {
             *self.tail_offsets.get_mut(&id).unwrap_or(&mut 0) = offset;
             return;
         }
-        for ev in parse_events_from_str(&new_text) {
-            self.reader_lines.extend(event_to_lines(&ev));
+        // Dual-path parse — the ORDERING is the contract: final events
+        // first; any assistant message / tool start / stream-terminal
+        // event in this tick REPLACES the transient partial (the final's
+        // own full text supersedes the deltas that streamed before it);
+        // only then are this tick's deltas folded in. When both arrive in
+        // one tick, the final wins.
+        let finals = parse_events_from_str(&new_text);
+        let final_replaces = finals.iter().any(|ev| {
+            matches!(
+                ev,
+                AgentEvent::MessageReceived { .. }
+                    | AgentEvent::MessageRecorded { .. }
+                    | AgentEvent::ToolCallStarted { .. }
+                    | AgentEvent::StepFailed { .. }
+                    | AgentEvent::TurnCompleted { .. }
+                    | AgentEvent::SessionEnded { .. }
+            )
+        });
+        // A terminal event cuts the stream for the WHOLE tick: deltas that
+        // share the tick with `StepFailed`/`TurnCompleted`/`SessionEnded`
+        // are (at most) the head of a NEXT turn and must not re-arm the
+        // transient line — the acceptance is "terminal ⇒ cleared".
+        let terminal_cut = finals.iter().any(|ev| {
+            matches!(
+                ev,
+                AgentEvent::StepFailed { .. }
+                    | AgentEvent::TurnCompleted { .. }
+                    | AgentEvent::SessionEnded { .. }
+            )
+        });
+        for ev in &finals {
+            self.reader_lines.extend(event_to_lines(ev));
+        }
+        if final_replaces {
+            self.partial = None;
+        }
+        if !terminal_cut {
+            self.absorb_stream_deltas(&new_text);
         }
         // Re-anchor after append (see `at_bottom` above): usize::MAX is the
         // bottom-anchor sentinel — render clamps it to max_scroll.
@@ -253,9 +336,47 @@ impl SubagentViewState {
         }
     }
 
+    /// Fold this tick's delta lines into the transient partial line.
+    ///
+    /// Cheap by design: delta lines are 96%+ of a child log's bytes, so
+    /// [`parse_stream_delta`] is a substring prefilter that rejects almost
+    /// every line without touching serde; only a hit pays one small
+    /// single-line JSON parse for the `delta` field. Same-kind deltas
+    /// accumulate ACROSS ticks (the stream spans ticks); a kind switch
+    /// resets the text. Deltas never become permanent
+    /// [`Self::reader_lines`] entries.
+    fn absorb_stream_deltas(&mut self, new_text: &str) {
+        let mut pending: Option<PartialTail> = None;
+        for line in new_text.lines() {
+            let Some((kind, delta)) = parse_stream_delta(line) else {
+                continue;
+            };
+            match &mut pending {
+                // Same stream: append.
+                Some(p) if p.kind == kind => p.text.push_str(&delta),
+                // First delta, or a kind switch (text → reasoning or back):
+                // a new stream starts, so the text resets.
+                _ => pending = Some(PartialTail { kind, text: delta }),
+            }
+        }
+        if let Some(p) = pending {
+            match &mut self.partial {
+                // The stream continues across the tick boundary: append.
+                Some(cur) if cur.kind == p.kind => cur.text.push_str(&p.text),
+                // A new stream (or a final cleared the old one): replace.
+                _ => self.partial = Some(p),
+            }
+        }
+        // No delta this tick: keep the existing partial — a mid-stream
+        // pause (a tool running between text chunks) must not blank the
+        // transient line.
+    }
+
     /// Enter Reader mode for the selected row (loads the child log with the
     /// tail cap) — or directly for a given child (Tab cycle from List).
     pub(crate) fn open_reader(&mut self, session_id: Option<&str>) {
+        // Switching children invalidates any transient line immediately.
+        self.partial = None;
         let idx = session_id.and_then(|id| self.entries.iter().position(|e| e.session_id == id));
         let idx = match idx {
             Some(i) => i,
@@ -309,6 +430,7 @@ impl SubagentViewState {
         self.mode = SubagentMode::List;
         self.reader_lines = Vec::new();
         self.reader_child_running = false;
+        self.partial = None;
     }
 
     /// Tab: cycle to the next running child (from List or Reader alike —
@@ -512,6 +634,17 @@ impl SubagentViewState {
         for l in &self.reader_lines[start..end] {
             lines.push(l.clone());
         }
+        // The transient streaming line rides ONE line past the permanent
+        // content: drawn only while the viewport sits at the bottom edge
+        // (`start == max_scroll` after clamping — the sentinel was already
+        // resolved above). It never enters `reader_lines`, `max_scroll`, or
+        // the per-child scroll memory, so scrolling up to read history
+        // hides it without touching any anchor semantics.
+        if start >= max_scroll
+            && let Some(line) = self.partial.as_ref().map(partial_tail_line)
+        {
+            lines.push(line);
+        }
         lines.push(Line::default());
         lines.push(muted_line(format!(
             " {}/{}{live_tag} · j/k PgUp/PgDn scroll · Tab next running · Esc back",
@@ -546,6 +679,65 @@ pub(crate) fn reader_viewport_rows(popup_area: Rect) -> usize {
 
 fn muted_line(s: String) -> Line<'static> {
     Line::from(Span::styled(s, Style::default().fg(theme::MUTED)))
+}
+
+/// Substring prefilter markers for delta lines — the hot path of
+/// [`absorb_stream_deltas`]. A full serde pass per line would re-parse the
+/// 96%+ of child-log bytes the replay parser already drops; a substring
+/// scan over these static markers rejects almost everything with no
+/// allocation and no parse tree. Two spellings: serde_json's compact
+/// `"type":"X"` and the pretty `"type": "X"`. Marker safety: no other
+/// `AgentEvent` variant serializes a type string containing these markers
+/// as a substring.
+const TEXT_DELTA_COMPACT: &str = "\"type\":\"TokensStreamed\"";
+const TEXT_DELTA_PRETTY: &str = "\"type\": \"TokensStreamed\"";
+const REASON_DELTA_COMPACT: &str = "\"type\":\"ReasoningStreamed\"";
+const REASON_DELTA_PRETTY: &str = "\"type\": \"ReasoningStreamed\"";
+
+/// Extract a streaming delta from one (complete) log line, iff it is a
+/// `TokensStreamed`/`ReasoningStreamed` event. The prefilter is the cost
+/// model: allocation-free substring scans; only a hit pays one small
+/// single-line JSON parse for the `delta` field.
+fn parse_stream_delta(line: &str) -> Option<(TailKind, String)> {
+    let kind = if line.contains(TEXT_DELTA_COMPACT) || line.contains(TEXT_DELTA_PRETTY) {
+        TailKind::Text
+    } else if line.contains(REASON_DELTA_COMPACT) || line.contains(REASON_DELTA_PRETTY) {
+        TailKind::Reasoning
+    } else {
+        return None;
+    };
+    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    let delta = v.get("delta")?.as_str()?.to_string();
+    Some((kind, delta))
+}
+
+/// The rendered transient streaming line: `Text` = normal color + `▌`
+/// cursor; `Reasoning` = muted italic behind a `thinking…` prefix. The text
+/// is a rolling tail window ([`PARTIAL_TAIL_WINDOW`]) so a long thinking
+/// stream cannot stretch the line without bound.
+fn partial_tail_line(p: &PartialTail) -> Line<'static> {
+    let tail = window_tail(&p.text, PARTIAL_TAIL_WINDOW);
+    match p.kind {
+        TailKind::Text => Line::from(Span::styled(
+            format!("  {tail}▌"),
+            Style::default().fg(theme::TEXT),
+        )),
+        TailKind::Reasoning => Line::from(Span::styled(
+            format!("  thinking… {tail}"),
+            Style::default()
+                .fg(theme::MUTED)
+                .add_modifier(Modifier::ITALIC),
+        )),
+    }
+}
+
+/// The last `max_chars` Unicode scalar values of `s` — no panic on char
+/// boundaries and no allocation when the text already fits.
+fn window_tail(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    s.chars().skip(s.chars().count() - max_chars).collect()
 }
 
 /// State icon for a child lifecycle state.
@@ -1518,6 +1710,282 @@ mod tests {
             final_len,
             "offset advances past the completed line"
         );
+    }
+
+    // ── transient streaming line (partial tail) ─────────────────
+
+    const TOKEN_DELTA: fn(&str) -> String =
+        |d: &str| format!(r#"{{"type":"TokensStreamed","delta":"{d}"}}"#);
+    const REASON_DELTA: fn(&str) -> String =
+        |d: &str| format!(r#"{{"type":"ReasoningStreamed","delta":"{d}"}}"#);
+
+    fn open_running_reader(body: &str) -> (tempfile::TempDir, SubagentViewState, PathBuf) {
+        let dir = tmpdir();
+        let mut e = entry("c1", ChildSessionState::Running, None);
+        e.log_path = write_log(dir.path(), "c1", body);
+        let mut v = SubagentViewState::new();
+        v.open(vec![e.clone()]);
+        v.handle_key(key(KeyCode::Enter), 10);
+        assert_eq!(v.mode, SubagentMode::Reader);
+        assert!(v.wants_tail());
+        (dir, v, e.log_path)
+    }
+
+    fn append_line(p: &PathBuf, line: &str) {
+        let mut f = std::fs::OpenOptions::new().append(true).open(p).unwrap();
+        writeln!(f, "{line}").unwrap();
+    }
+
+    #[test]
+    fn partial_appears_and_accumulates_from_deltas() {
+        let (_dir, mut v, log) = open_running_reader(&format!("{USER_LINE}\n"));
+        append_line(&log, &TOKEN_DELTA("Hel"));
+        v.on_tick_tail();
+        let p = v.partial.clone().expect("first delta mounts the partial");
+        assert_eq!(p.kind, TailKind::Text);
+        assert_eq!(p.text, "Hel");
+        assert!(
+            !lines_to_string(&v.reader_lines).contains("Hel"),
+            "partial is never a permanent line"
+        );
+
+        append_line(&log, &TOKEN_DELTA("lo world"));
+        v.on_tick_tail();
+        let p = v.partial.as_ref().expect("second delta keeps the partial");
+        assert_eq!(p.text, "Hel".to_string() + "lo world");
+
+        // A tick with no new bytes keeps the partial untouched.
+        v.on_tick_tail();
+        assert_eq!(
+            v.partial.as_ref().map(|p| p.text.clone()),
+            Some("Hello world".to_string()),
+            "an idle tick must not blank the transient line"
+        );
+    }
+
+    #[test]
+    fn partial_kind_switch_resets_text() {
+        let (_dir, mut v, log) = open_running_reader(&format!("{USER_LINE}\n"));
+        append_line(&log, &REASON_DELTA("plan it "));
+        append_line(&log, &TOKEN_DELTA("answer"));
+        v.on_tick_tail();
+        let p = v.partial.clone().expect("a delta arrived");
+        assert_eq!(p.kind, TailKind::Text);
+        assert_eq!(
+            p.text, "answer",
+            "the kind switch (reasoning → text) resets the accumulated text"
+        );
+    }
+
+    #[test]
+    fn partial_switch_between_reasoning_and_text() {
+        let (_dir, mut v, log) = open_running_reader(&format!("{USER_LINE}\n"));
+        append_line(&log, &TOKEN_DELTA("ans"));
+        append_line(&log, &REASON_DELTA("plan"));
+        v.on_tick_tail();
+        let p = v.partial.clone().expect("a delta arrived");
+        assert_eq!(p.kind, TailKind::Reasoning);
+        assert_eq!(p.text, "plan");
+    }
+
+    #[test]
+    fn same_tick_final_event_replaces_the_partial() {
+        let (_dir, mut v, log) = open_running_reader(&format!("{USER_LINE}\n"));
+        append_line(&log, &TOKEN_DELTA("partial words"));
+        v.on_tick_tail();
+        assert!(v.partial.is_some());
+
+        // Same tick: the final AND a next-stream delta land together.
+        append_line(&log, &ASSISTANT_LINE);
+        append_line(&log, &TOKEN_DELTA("next"));
+        v.on_tick_tail();
+        assert!(v.partial.is_some(), "the next stream's delta re-arms");
+        assert_eq!(v.partial.as_ref().unwrap().text, "next");
+        let joined = lines_to_string(&v.reader_lines);
+        assert!(joined.contains("done"), "the final line renders");
+
+        // Final alone (no trailing delta): the transient line disappears.
+        append_line(&log, &TOKEN_DELTA("more"));
+        v.on_tick_tail();
+        append_line(&log, &ASSISTANT_LINE);
+        v.on_tick_tail();
+        assert!(v.partial.is_none(), "a final with no next delta clears");
+        assert!(lines_to_string(&v.reader_lines).matches("done").count() >= 2);
+    }
+
+    #[test]
+    fn turn_completed_and_step_failed_clear_the_partial() {
+        let (_dir, mut v, log) = open_running_reader(&format!("{USER_LINE}\n"));
+        append_line(&log, &REASON_DELTA("deep"));
+        v.on_tick_tail();
+        assert!(v.partial.is_some());
+
+        let turn_done = r#"{"type":"TurnCompleted","turn_id":1,"duration_ms":5}"#;
+        append_line(&log, turn_done);
+        v.on_tick_tail();
+        assert!(
+            v.partial.is_none(),
+            "TurnCompleted clears the transient line"
+        );
+
+        append_line(&log, &REASON_DELTA("again"));
+        v.on_tick_tail();
+        assert!(v.partial.is_some());
+
+        let step_failed =
+            r#"{"type":"StepFailed","turn_id":1,"step_index":0,"duration_ms":3,"error":"boom"}"#;
+        append_line(&log, step_failed);
+        v.on_tick_tail();
+        assert!(v.partial.is_none(), "StepFailed clears the transient line");
+
+        let ended = r#"{"type":"SessionEnded","reason":{"Completed":null}}"#;
+        append_line(&log, &REASON_DELTA("x"));
+        append_line(&log, ended);
+        v.on_tick_tail();
+        assert!(
+            v.partial.is_none(),
+            "SessionEnded clears the transient line"
+        );
+    }
+
+    #[test]
+    fn terminal_refresh_and_close_clear_the_partial() {
+        let (_dir, mut v, _log) = open_running_reader(&format!("{USER_LINE}\n"));
+        // Seed a partial directly: only the last tick's new lines matter, so
+        // a log-only seed cannot survive a tick boundary (the holdback has
+        // already consumed the seed bytes).
+        v.partial = Some(PartialTail {
+            kind: TailKind::Text,
+            text: "live".into(),
+        });
+        assert!(v.partial.is_some());
+
+        // Child reaches a terminal state via a lifecycle refresh.
+        v.refresh_entries(vec![entry("c1", ChildSessionState::Completed, None)]);
+        assert!(v.partial.is_none(), "terminal refresh clears the partial");
+
+        // Reader open on a terminal child: never any partial again.
+        v.open_reader(None);
+        assert!(v.partial.is_none());
+
+        // Reader still on a running child: closing it drops the partial.
+        v.refresh_entries(vec![entry("c1", ChildSessionState::Running, None)]);
+        v.open_reader(None);
+        v.partial = Some(PartialTail {
+            kind: TailKind::Text,
+            text: "x".into(),
+        });
+        v.handle_key(key(KeyCode::Esc), 10);
+        assert!(v.partial.is_none(), "back to List clears the partial");
+
+        v.handle_key(key(KeyCode::Enter), 10);
+        v.partial = Some(PartialTail {
+            kind: TailKind::Text,
+            text: "y".into(),
+        });
+        v.close_reader();
+        assert!(v.partial.is_none(), "close_reader clears the partial");
+    }
+
+    #[test]
+    fn long_reasoning_shows_only_the_tail_window() {
+        let long: String = "αβγδ".repeat(100); // 400 chars, multibyte
+        let (_dir, mut v, log) = open_running_reader(&format!("{USER_LINE}\n"));
+        append_line(&log, &REASON_DELTA(&long));
+        v.on_tick_tail();
+        let p = v.partial.as_ref().expect("delta mounted");
+        let line = partial_tail_line(p);
+        let text: String = line.spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(
+            text.contains("thinking…"),
+            "reasoning renders behind the prefix: {text}"
+        );
+        assert_eq!(text.chars().count(), "  thinking… ".chars().count() + 200);
+        assert!(text.ends_with('δ'), "the window keeps the stream's tail");
+    }
+
+    #[test]
+    fn torn_delta_line_is_held_back_until_complete() {
+        let (dir, mut v, log) = open_running_reader(&format!("{USER_LINE}\n"));
+        // Write half of a delta line (no trailing newline): the JSON is
+        // missing its closing `"}` — mid-append torn.
+        let torn_head = {
+            let full = TOKEN_DELTA("TO");
+            let cut = full.len() - "\"}".len();
+            full[..cut].to_string()
+        };
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        write!(f, "{torn_head}").unwrap();
+        drop(f);
+        v.on_tick_tail();
+        assert!(
+            v.partial.is_none(),
+            "a torn (newline-less) delta line must not render this tick"
+        );
+
+        // Complete the line: the next tick shows the delta.
+        append_line(&log, "\"}");
+        v.on_tick_tail();
+        let p = v
+            .partial
+            .as_ref()
+            .expect("completed line mounts the partial");
+        assert!(
+            p.text.contains("TO"),
+            "the held-back delta renders: {}",
+            p.text
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn partial_renders_one_line_past_content_only_when_bottom_anchored() {
+        // TestBackend render: the transient line is visible when
+        // bottom-anchored and hidden when scrolled up.
+        let (dir, mut v, log) = open_running_reader(&format!("{USER_LINE}\n"));
+        for i in 0..80 {
+            append_line(
+                &log,
+                &format!(r#"{{"type":"MessageReceived","role":"assistant","content":"msg {i}"}}"#),
+            );
+        }
+        append_line(&log, &TOKEN_DELTA("typing now"));
+        v.on_tick_tail();
+        assert!(v.partial.is_some());
+
+        let render_text = |view: &mut SubagentViewState| -> String {
+            let backend = ratatui::backend::TestBackend::new(100, 24);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|f| view.render(f)).unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol().to_string())
+                .collect()
+        };
+
+        // Bottom-anchored: visible.
+        assert!(v.reader_scroll == usize::MAX || v.reader_scroll > 0);
+        let text = render_text(&mut v);
+        assert!(
+            text.contains("typing now"),
+            "bottom-anchored reader shows the transient line"
+        );
+        // And it is transient: never part of the permanent lines.
+        assert!(!lines_to_string(&v.reader_lines).contains("typing now"));
+
+        // Scrolled up: hidden, and the scroll state itself is untouched.
+        v.handle_key(key(KeyCode::PageUp), 10);
+        let scroll_after_key = v.reader_scroll;
+        let text = render_text(&mut v);
+        assert!(
+            !text.contains("typing now"),
+            "a scrolled-up reader hides the transient line"
+        );
+        assert_eq!(v.reader_scroll, scroll_after_key);
+        let _ = dir;
     }
 
     fn lines_to_string(lines: &[Line<'static>]) -> String {
