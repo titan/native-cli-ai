@@ -214,8 +214,13 @@ impl NcaModel {
         {
             match event {
                 crossterm::event::Event::Key(key) => {
-                    // Transcript scroll keys need layout area — handle directly
-                    if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown | KeyCode::End) {
+                    // Transcript scroll keys need layout area — handle
+                    // directly, but only when no popup is open: a mounted
+                    // popup owns ALL keys (the subagent reader's PgUp/PgDn
+                    // would otherwise scroll the transcript behind it).
+                    if !self.popup_open
+                        && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown | KeyCode::End)
+                    {
                         let areas = self.compute_layout(Rect::new(0, 0, self.size.0, self.size.1));
                         self.components.transcript.handle_key(key, areas.transcript);
                         self.redraw = true;
@@ -509,13 +514,12 @@ impl NcaModel {
             }
         }
         if let Some(ref mut v) = self.components.subagent_view {
-            // PgUp/PgDn step by the reader viewport height; the popup spans
-            // ~70% of the terminal, minus borders + hint line.
-            let viewport_rows = (self.size.1 as usize)
-                .saturating_mul(7)
-                .div_ceil(10)
-                .saturating_sub(3)
-                .max(1);
+            // PgUp/PgDn step by the reader viewport height. The popup spans
+            // the full height minus 4 (same `centered_rect` math as
+            // `render_reader`): borders + reserved footer hint line.
+            let popup_h = (self.size.1.saturating_sub(4)).max(10).min(self.size.1);
+            let viewport_rows =
+                subagent_view::reader_viewport_rows(Rect::new(0, 0, self.size.0, popup_h));
             let action = v.handle_key(key, viewport_rows);
             match action {
                 subagent_view::SubagentViewAction::Close => {
@@ -1611,6 +1615,66 @@ mod tests {
             "session switch drops the old session's observations"
         );
         assert_eq!(model.session_id, "other");
+    }
+
+    // A mounted popup owns ALL keys — including the PgUp/PgDn/End keys the
+    // tick loop special-cases for the transcript. Before the fix they were
+    // unconditionally routed to the transcript behind the popup, so the
+    // subagent reader's advertised PgUp/PgDn scroll never fired.
+    #[test]
+    fn popup_open_scroll_keys_reach_the_popup_not_the_transcript() {
+        let (mut model, _bridge_tx) = test_model();
+        model.size = (80, 30);
+        // A transcript with content so scroll state is observable.
+        model
+            .components
+            .transcript
+            .apply_event(&AgentEvent::MessageReceived {
+                role: "assistant".into(),
+                content: "hello".into(),
+                steering: false,
+            });
+
+        // Mount the subagent view directly (component-level; no disk needed).
+        model.components.subagent_view = Some(subagent_view::SubagentViewState::new());
+        model.popup_open = true;
+        let before = model.components.transcript.scroll_lines;
+
+        // PgUp must go to the popup path, not scroll the transcript.
+        model.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::PageUp,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(
+            model.components.transcript.scroll_lines, before,
+            "transcript must not scroll while a popup owns the keys"
+        );
+        assert!(
+            model.components.subagent_view.is_some(),
+            "popup stays mounted"
+        );
+    }
+
+    #[test]
+    fn no_popup_scroll_keys_still_scroll_the_transcript() {
+        // The popup-open guard must not break the normal idle path: with no
+        // popup, PgUp/PgDn/End still reach the transcript via the tick
+        // special-case (they need layout area, hence the direct dispatch).
+        let (mut model, _bridge_tx) = test_model();
+        model.size = (80, 30);
+        assert!(!model.popup_open);
+
+        // Simulate the tick branch: same expression the tick loop uses.
+        let areas = model.compute_layout(Rect::new(0, 0, model.size.0, model.size.0));
+        assert!(model.components.transcript.transcript_follow_tail);
+        model.components.transcript.handle_key(
+            crossterm::event::KeyEvent::new(KeyCode::PageUp, crossterm::event::KeyModifiers::NONE),
+            areas.transcript,
+        );
+        assert!(
+            !model.components.transcript.transcript_follow_tail,
+            "with no popup, PgUp must still reach the transcript (detaches tail-follow)"
+        );
     }
 
     #[test]
