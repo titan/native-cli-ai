@@ -19,6 +19,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -38,9 +39,18 @@ use crate::tui::text_utils::truncate;
 
 /// Visible list rows in List mode.
 const LIST_MAX_ROWS: usize = 12;
-/// Initial-load tail cap: parse at most the last 2MB of a child log so a
-/// huge finished log cannot stall a frame on open (design §risks).
-const INITIAL_TAIL_BYTES: u64 = 2 * 1024 * 1024;
+/// Backward-scan block size: the initial load walks a child log from EOF
+/// toward the head in chunks of this many bytes, counting renderable events
+/// (deltas don't count — they're the 96% of bytes the parser drops anyway).
+const SCAN_BLOCK_BYTES: u64 = 256 * 1024;
+/// Initial-load target: stop the backward scan once this many renderable
+/// events are in the window. 400 ≈ several screens of transcript — enough
+/// to see the conversation without bounded-IO concerns.
+const RENDER_TARGET_EVENTS: usize = 400;
+/// Hard cap on backward scanning from EOF: a pathological log (e.g. tens of
+/// MB of reasoning deltas with almost no renderable events) must not cause
+/// unbounded IO on open. Beyond this, older events are simply not loaded.
+const MAX_SCAN_BYTES: u64 = 64 * 1024 * 1024;
 /// Suffix of the truncated-earlier notice line.
 const TRUNCATED_NOTICE: &str = "… log truncated (older events not loaded)";
 
@@ -210,6 +220,12 @@ impl SubagentViewState {
         if len <= offset {
             return; // no growth (or truncate: only forward tails are parsed)
         }
+        // Bottom-anchor continuity: while the reader sits at (or beyond) the
+        // last content edge, new lines keep the view pinned to the bottom —
+        // the "live tail" the title advertises. Any deliberate scroll up
+        // (reader_scroll < max_scroll) detaches: the user is reading history
+        // and appends must not yank the viewport.
+        let at_bottom = self.reader_scroll >= self.reader_lines.len().saturating_sub(2);
         let mut new_text = match read_from(&path, offset, len) {
             Some(t) => t,
             None => return,
@@ -229,6 +245,11 @@ impl SubagentViewState {
         }
         for ev in parse_events_from_str(&new_text) {
             self.reader_lines.extend(event_to_lines(&ev));
+        }
+        // Re-anchor after append (see `at_bottom` above): usize::MAX is the
+        // bottom-anchor sentinel — render clamps it to max_scroll.
+        if at_bottom {
+            self.reader_scroll = usize::MAX;
         }
     }
 
@@ -466,8 +487,7 @@ impl SubagentViewState {
     fn render_reader(&mut self, frame: &mut Frame) {
         let area = frame.area();
         let popup_area = centered_rect(area, 80, (area.height.saturating_sub(4)).max(10));
-        let vis_h = popup_area.height.saturating_sub(2) as usize; // minus borders
-        let vis_h = vis_h.max(1);
+        let vis_h = reader_viewport_rows(popup_area);
         let total = self.reader_lines.len();
         let max_scroll = total.saturating_sub(vis_h);
         // Bottom-anchor (usize::MAX sentinel from open_reader / live tail).
@@ -515,6 +535,14 @@ impl SubagentViewState {
 }
 
 // ── Row/line rendering helpers ───────────────────────────────────
+
+/// Content rows the reader can actually show: popup height minus borders
+/// (2) minus the reserved footer (blank separator + key-hint line).
+/// Exported so the model can pass the SAME height to `handle_key` for
+/// PgUp/PgDn — a page step must match what the viewport shows.
+pub(crate) fn reader_viewport_rows(popup_area: Rect) -> usize {
+    popup_area.height.saturating_sub(4).max(1) as usize
+}
 
 fn muted_line(s: String) -> Line<'static> {
     Line::from(Span::styled(s, Style::default().fg(theme::MUTED)))
@@ -714,32 +742,78 @@ fn read_from(path: &PathBuf, offset: u64, len: u64) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// Load a child log for the reader with the tail cap: when the log exceeds
-/// [`INITIAL_TAIL_BYTES`], read only the last cap bytes (starting after a
-/// newline boundary so the first parsed line is complete).
+/// Load a child log for the reader (Fix C): a chunked backward scan from
+/// EOF that bounds the window by RENDERABLE EVENTS, not bytes.
+///
+/// The old 2MB tail cap was byte-delimited, but 96%+ of child-log bytes are
+/// `ReasoningStreamed`/`TokensStreamed` delta lines the parser drops — the
+/// byte window was consumed before the skip, so a long thinking-heavy log
+/// rendered as the last few fragments (observed: 7.4MB log, 2MB tail → 12
+/// renderable events vs 140 in the whole file). The new scan walks
+/// [`SCAN_BLOCK_BYTES`] blocks from EOF toward the head, counting events
+/// that `event_to_lines` renders non-empty, and stops at
+/// [`RENDER_TARGET_EVENTS`] — or at the file head, or at the
+/// [`MAX_SCAN_BYTES`] hard cap for pathological logs.
+///
+/// Per-block counting skips each block's own partial head line (the byte
+/// cut); a line straddling a block boundary reappears complete once the
+/// older block is prepended, so the final rendered set is never smaller
+/// than what the count promised — the count may undercount by ≤1 event per
+/// boundary, which only ever makes the scan slightly longer, never shorter.
 ///
 /// Returns `(text, next_offset, truncated)` where `next_offset` is where
-/// incremental tailing should resume.
+/// incremental tailing should resume: the scan always reaches EOF, so this
+/// is the file length; only the START boundary changed. `truncated` is
+/// `true` when the window starts above the file head (target reached or
+/// hard cap) — the caller then shows [`TRUNCATED_NOTICE`].
 fn load_log_tailed(path: &PathBuf) -> (String, u64, bool) {
     let Ok(meta) = std::fs::metadata(path) else {
         return (String::new(), 0, false);
     };
     let len = meta.len();
-    if len <= INITIAL_TAIL_BYTES {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return (String::new(), 0, false);
-        };
-        let end = text.len() as u64;
-        return (text, end, false);
+    if len == 0 {
+        return (String::new(), 0, false);
     }
-    let start = len - INITIAL_TAIL_BYTES;
-    let mut text = read_from(path, start, len).unwrap_or_default();
-    // Drop a possibly-partial first line.
-    if let Some(nl) = text.find('\n') {
-        text.drain(..=nl);
+
+    let scan_floor = len.saturating_sub(MAX_SCAN_BYTES);
+    let mut window = String::new();
+    let mut window_start = len;
+    let mut renderable = 0usize;
+    let mut block_end = len;
+
+    while block_end > scan_floor {
+        let block_start = block_end.saturating_sub(SCAN_BLOCK_BYTES).max(scan_floor);
+        let block = read_from(path, block_start, block_end).unwrap_or_default();
+        block_end = block_start;
+
+        // Count this block's renderable events from its first complete line
+        // (the head line may be cut mid-JSON by the byte boundary; it either
+        // reappears complete in the final window or was never a full event).
+        let count_from = block.find('\n').map(|nl| nl + 1).unwrap_or(block.len());
+        renderable += parse_events_from_str(&block[count_from..])
+            .iter()
+            .filter(|ev| !event_to_lines(ev).is_empty())
+            .count();
+
+        // Prepend the block, keeping its raw head (the straddled line's
+        // completion lives here; the one partial line that can remain is at
+        // the window head and is drained once below).
+        let mut combined = block;
+        combined.push_str(&window);
+        window = combined;
+        window_start = block_start;
+
+        if renderable >= RENDER_TARGET_EVENTS || block_start == 0 {
+            break;
+        }
     }
-    let consumed = start + (text.len() as u64);
-    (text, consumed, true)
+
+    let truncated = window_start > 0;
+    if truncated && let Some(nl) = window.find('\n') {
+        // Drop the window's partial first line (byte-cut mid-JSON).
+        window.drain(..=nl);
+    }
+    (window, len, truncated)
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -954,6 +1028,61 @@ mod tests {
     // ── live tail ────────────────────────────────────────────────
 
     #[test]
+    fn tail_appends_keep_bottom_anchor_but_detached_scrolling_is_left_alone() {
+        // Live tail + bottom anchor: while the reader sits at the bottom,
+        // appended events keep it pinned there (usize::MAX sentinel,
+        // clamped to max_scroll at render). Once the user scrolls up, the
+        // viewport must NOT be yanked back down by appends.
+        let dir = tmpdir();
+        let mut e = entry("c1", ChildSessionState::Running, None);
+        e.log_path = write_log(dir.path(), "c1", &format!("{USER_LINE}\n"));
+
+        let mut v = SubagentViewState::new();
+        v.open(vec![e.clone()]);
+        v.handle_key(key(KeyCode::Enter), 10);
+
+        // At the bottom (sentinel): append re-anchors.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&e.log_path)
+            .unwrap();
+        writeln!(f, "{ASSISTANT_LINE}").unwrap();
+        drop(f);
+        v.on_tick_tail();
+        assert_eq!(
+            v.reader_scroll,
+            usize::MAX,
+            "bottom-anchored reader stays anchored across appends"
+        );
+
+        // Scrolled up (reading history): append must not move the viewport.
+        v.reader_scroll = 0;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&e.log_path)
+            .unwrap();
+        writeln!(f, "{ASSISTANT_LINE}").unwrap();
+        drop(f);
+        v.on_tick_tail();
+        assert_eq!(
+            v.reader_scroll, 0,
+            "a detached (scrolled-up) viewport is never yanked by appends"
+        );
+    }
+
+    #[test]
+    fn reader_viewport_rows_reserve_the_footer() {
+        // The reader renders vis_h content rows PLUS a blank + hint line
+        // inside the popup: reserving only borders (old `height - 2`) pushed
+        // vis_h + 2 rows into a vis_h-row area, clipping the last content
+        // line and the key hints off screen. `height - 4` reserves the
+        // footer so everything fits.
+        assert_eq!(reader_viewport_rows(Rect::new(0, 0, 80, 30)), 26);
+        assert_eq!(reader_viewport_rows(Rect::new(0, 0, 80, 5)), 1, "min 1");
+        assert_eq!(reader_viewport_rows(Rect::new(0, 0, 80, 3)), 1, "min 1");
+    }
+
+    #[test]
     fn tail_appends_new_events_incrementally() {
         let dir = tmpdir();
         let mut e = entry("c1", ChildSessionState::Running, None);
@@ -1101,19 +1230,83 @@ mod tests {
     // ── tail cap on initial load ─────────────────────────────────
 
     #[test]
-    fn huge_log_is_tail_capped_with_notice() {
+    fn delta_heavy_log_loads_target_renderable_events() {
+        // Fix C acceptance: a >2MB log that is >90% streaming-delta lines.
+        // The old byte-delimited 2MB cap kept only the last ~10 renderable
+        // events (deltas consumed the window before the parser could skip
+        // them); the event-counted backward scan must surface the full
+        // conversation (all 500 renderable events live before the delta
+        // flood, so the whole file is scanned and nothing is dropped).
         let dir = tmpdir();
         let mut e = entry("c1", ChildSessionState::Completed, None);
         e.log_path = dir.path().join("c1.events.jsonl");
-        // Build a log bigger than the cap: N filler lines then the payload.
-        let filler = USER_LINE.replace("do the thing", &"x".repeat(400));
+
+        const N_RENDERABLE: usize = 500;
         let mut body = String::new();
-        while (body.len() as u64) < INITIAL_TAIL_BYTES + 4096 {
-            body.push_str(&filler);
+        // Renderable traffic first (small byte share)…
+        for i in 0..N_RENDERABLE {
+            body.push_str(&USER_LINE.replace("do the thing", &format!("msg {i}")));
             body.push('\n');
         }
-        body.push_str(ASSISTANT_LINE);
-        body.push('\n');
+        // …then the delta flood: >2MB of lines the parser drops.
+        let delta = r#"{"type":"ReasoningStreamed","delta":"thinking tokens fill the log here"}"#;
+        while body.len() < 3 * 1024 * 1024 {
+            body.push_str(delta);
+            body.push('\n');
+        }
+        std::fs::write(&e.log_path, &body).unwrap();
+        assert!(
+            body.len() > 2 * 1024 * 1024,
+            "precondition: exceeds the old byte cap"
+        );
+
+        let mut v = SubagentViewState::new();
+        v.open(vec![e]);
+        v.handle_key(key(KeyCode::Enter), 10);
+        // The scan walks the delta flood (each block contributes 0
+        // renderable events, so the old byte cap can no longer starve the
+        // window), reaches the renderable region, and stops once 400 of the
+        // 500 events are in hand: the newest 400 render, the oldest 100
+        // stay unloaded — instead of the old ~10 surviving fragments.
+        assert!(v.reader_truncated);
+        let joined = lines_to_string(&v.reader_lines);
+        assert!(joined.contains(TRUNCATED_NOTICE));
+        let rendered = v
+            .reader_lines
+            .iter()
+            .filter(|l| !l.spans.is_empty())
+            .count();
+        assert!(
+            rendered >= RENDER_TARGET_EVENTS,
+            "window must hold ≥{RENDER_TARGET_EVENTS} renderable events (old logic: <10); got {rendered}"
+        );
+        assert!(joined.contains("msg 499"), "the newest event renders");
+        assert!(
+            !joined.contains("msg 0\n"),
+            "events older than the target stay unloaded"
+        );
+    }
+
+    #[test]
+    fn render_target_bounds_the_window_with_notice() {
+        // More than RENDER_TARGET_EVENTS renderable events: the scan stops
+        // at the target and reports truncation (older events not loaded).
+        let dir = tmpdir();
+        let mut e = entry("c1", ChildSessionState::Completed, None);
+        e.log_path = dir.path().join("c1.events.jsonl");
+
+        // Geometry: SHORT lines (~60B) so one 256KB block holds ~4k
+        // renderable events — the target is reached inside the LAST block,
+        // so the scan stops before the head and reports truncation. (Long
+        // lines can never trigger the cap: <400 events fit in a block, so
+        // the scan would always reach the head.)
+        const N: usize = RENDER_TARGET_EVENTS * 12;
+        let mut body = String::new();
+        for i in 0..N {
+            body.push_str(&USER_LINE.replace("do the thing", &format!("msg {i}")));
+            body.push('\n');
+        }
+        assert!(body.len() as u64 > SCAN_BLOCK_BYTES);
         std::fs::write(&e.log_path, &body).unwrap();
 
         let mut v = SubagentViewState::new();
@@ -1122,13 +1315,84 @@ mod tests {
         assert!(v.reader_truncated);
         let joined = lines_to_string(&v.reader_lines);
         assert!(joined.contains(TRUNCATED_NOTICE));
-        assert!(joined.contains("done"), "the recent tail is present");
+        // The newest events are in the window; the very oldest are not.
+        let last = format!("msg {}", N - 1);
+        assert!(joined.contains(&last), "the newest events must render");
+        assert!(
+            !joined.contains("msg 0 "),
+            "events older than the target stay unloaded"
+        );
+    }
+
+    #[test]
+    fn small_log_loads_fully_without_truncation() {
+        // < one scan block: whole file, no notice — identical to the old
+        // small-log behavior.
+        let dir = tmpdir();
+        let mut e = entry("c1", ChildSessionState::Completed, None);
+        e.log_path = dir.path().join("c1.events.jsonl");
+        let body = format!("{USER_LINE}\n{ASSISTANT_LINE}\n");
+        std::fs::write(&e.log_path, &body).unwrap();
+
+        let (text, next_offset, truncated) = load_log_tailed(&e.log_path);
+        assert_eq!(text, body, "small log loads verbatim");
+        assert_eq!(next_offset, body.len() as u64, "tail resumes at EOF");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn partial_first_line_at_window_head_is_dropped() {
+        // Force truncation with a single-block scan: renderable events past
+        // the target make the window start mid-file, and the head line is
+        // cut mid-JSON — it must be dropped, not parsed as garbage.
+        let dir = tmpdir();
+        let mut e = entry("c1", ChildSessionState::Completed, None);
+        e.log_path = dir.path().join("c1.events.jsonl");
+
+        // Same short-line geometry as the bounds test: one block holds
+        // well over the target, so the window head lands mid-file and its
+        // first line is a byte-cut fragment.
+        const N: usize = RENDER_TARGET_EVENTS * 12;
+        let mut body = String::new();
+        for i in 0..N {
+            body.push_str(&USER_LINE.replace("do the thing", &format!("msg {i}")));
+            body.push('\n');
+        }
+        assert!(body.len() as u64 > SCAN_BLOCK_BYTES);
+        std::fs::write(&e.log_path, &body).unwrap();
+
+        let (text, next_offset, truncated) = load_log_tailed(&e.log_path);
+        assert!(
+            truncated,
+            "window stops at the render target, above the head"
+        );
+        assert_eq!(next_offset, body.len() as u64, "tail resumes at EOF");
+        // The window text starts at a line boundary: the byte-cut partial
+        // head line is dropped, so parsing sees only complete lines.
+        assert!(
+            text.starts_with('{'),
+            "window must start on a complete line"
+        );
+        let parsed = parse_events_from_str(&text);
+        assert!(
+            parsed.len() >= RENDER_TARGET_EVENTS,
+            "window holds at least the render target: {}",
+            parsed.len()
+        );
+        // Every dropped byte belonged to the partial head line: the parsed
+        // set is exactly the complete lines in the window.
+        assert_eq!(parsed.len(), text.lines().count());
     }
 
     // ── Fix B: UTF-8 lossy at the tail-cap cut ───────────────────
 
     #[test]
     fn truncated_multibyte_log_still_renders_content() {
+        // (Fix C rework) The backward scan's window head can land mid-UTF-8
+        // character inside the delta/zh flood: lossy decoding must degrade
+        // the cut to U+FFFD and the partial-first-line drain must keep the
+        // residue out of the rendered output — same contract as Fix B, new
+        // cut geometry (event-counted block walk instead of a fixed 2MB cap).
         // A >2MB log whose cap cut lands INSIDE a multi-byte char: with the
         // old strict `from_utf8` this produced an empty string (whole read
         // lost) and parked the offset on an invalid boundary (every later
@@ -1145,31 +1409,42 @@ mod tests {
         let mut e = entry("c1", ChildSessionState::Completed, None);
         e.log_path = dir.path().join("c1.events.jsonl");
 
+        // zh filler: no renderable events, >1 block so the scan walks at
+        // least one boundary; the USER payload at the end stops the scan on
+        // the first block. The window head then sits inside the zh flood at
+        // an arbitrary byte offset — steer it onto a continuation byte with
+        // a small head pad (line period 19 bytes, 12 of 19 positions are
+        // continuation bytes).
         let zh = "中文日志内容"; // 6 chars × 3 bytes
         let line = format!("{zh}\n"); // 19 bytes per line
-        let payload = format!("{ASSISTANT_LINE}\n");
-        let cap = INITIAL_TAIL_BYTES as usize;
-        let lines: Vec<u8> = line.as_bytes().repeat(cap / line.len() + 64);
-        assert!(lines.len() + payload.len() > cap);
+        // The last block must hold ≥target renderable events by itself, so
+        // the scan stops after ONE block and the head lands in the flood.
+        let mut payload = String::new();
+        for i in 0..RENDER_TARGET_EVENTS {
+            payload.push_str(&USER_LINE.replace("do the thing", &format!("zh-test {i}")));
+            payload.push('\n');
+        }
+        payload.push_str(ASSISTANT_LINE);
+        payload.push('\n');
+        let flood: Vec<u8> = line
+            .as_bytes()
+            .repeat((SCAN_BLOCK_BYTES / line.len() as u64 + 8) as usize);
 
         let mut file_bytes = Vec::new();
-        for tail_pad in 0..19usize {
-            let candidate = [lines.as_slice(), payload.as_bytes(), &vec![b' '; tail_pad]].concat();
-            let start = candidate.len() - cap;
-            if candidate[start] & 0xC0 == 0x80 {
+        for head_pad in 0..19usize {
+            let candidate = [&vec![b' '; head_pad], flood.as_slice(), payload.as_bytes()].concat();
+            // Window head for a target-1 stop: the scan consumed one block
+            // (payload found) — head = len - SCAN_BLOCK_BYTES (approx; any
+            // in-flood offset proves the point, steer for continuation).
+            let head = candidate.len().saturating_sub(SCAN_BLOCK_BYTES as usize);
+            if head > 0 && candidate[head] & 0xC0 == 0x80 {
                 file_bytes = candidate;
                 break;
             }
         }
         assert!(
             !file_bytes.is_empty(),
-            "a tail pad must force a mid-char cut"
-        );
-        let start = file_bytes.len() - cap;
-        assert_eq!(
-            file_bytes[start] & 0xC0,
-            0x80,
-            "cut must land on a continuation byte"
+            "a head pad must force a mid-char cut"
         );
         std::fs::write(&e.log_path, &file_bytes).unwrap();
 
