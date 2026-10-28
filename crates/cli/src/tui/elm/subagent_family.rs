@@ -36,6 +36,10 @@ pub(crate) struct SubagentEntry {
 struct SessionFacts {
     id: String,
     parent_session_id: Option<String>,
+    /// Session this one was derived from via `/new`
+    /// ([`nca_common::session::SessionMeta::derived_from`]). `None` for
+    /// fresh sessions and pre-`derived_from` sessions.
+    derived_from: Option<String>,
     status: SessionStatus,
     spawn_reason: Option<String>,
     cost_usd: f64,
@@ -63,6 +67,7 @@ fn parse_session_facts(raw: &str) -> Option<SessionFacts> {
     Some(SessionFacts {
         id: state.meta.id,
         parent_session_id: state.meta.parent_session_id,
+        derived_from: state.meta.derived_from,
         status: state.meta.status,
         spawn_reason: state.meta.spawn_reason,
         cost_usd: state.estimated_cost_usd,
@@ -142,6 +147,12 @@ struct CacheEntry {
 }
 
 impl FamilyCache {
+    /// Number of cached session files (0 = empty cache).
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
     /// Drop cache rows whose files vanished from the listing (keeps the map
     /// bounded to the live dir contents across a long-lived view).
     fn prune(&mut self, live: &HashMap<PathBuf, SystemTime>) {
@@ -244,6 +255,12 @@ pub(crate) fn build_family_index_cached(
 ///
 /// Split out so tests can drive lineage/ordering/filtering without touching
 /// the filesystem.
+///
+/// D2 derivation semantics: the family of `root_session_id` is its own
+/// descendant tree PLUS the direct children of every `derived_from` ancestor
+/// (a `/new` session inherits the ancestor family's children for display,
+/// seeded at depth 0). See the seed-expansion block inside for the
+/// cycle-guarded chain walk.
 fn facts_to_family(
     sessions_dir: &Path,
     root_session_id: &str,
@@ -260,16 +277,40 @@ fn facts_to_family(
         }
         map
     };
+    // id → facts index (drives the derived_from ancestor-chain walk below).
+    let by_id: HashMap<&str, &SessionFacts> = facts.iter().map(|f| (f.id.as_str(), f)).collect();
 
-    // BFS from the root, collecting descendants with depth.
-    let mut out: Vec<SubagentEntry> = Vec::new();
-    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut queue: Vec<(&SessionFacts, usize)> = Vec::new();
-    if let Some(children) = by_parent.get(root_session_id) {
-        for c in children {
-            queue.push((c, 0));
+    // BFS seeds: the root's OWN children plus, per the `derived_from` chain
+    // (D2: `/new` derivation semantics), the direct children of every
+    // derivation ANCESTOR. A `/new` session inherits the ancestor family's
+    // children for display (they are displayed at depth 0, same level as
+    // the root's own children — the derivation is lateral, not parental).
+    // Ancestor-chain children are SEEDS ONLY: the BFS below still expands
+    // only along parent edges, so an unrelated root's subtree can never
+    // leak in through a shared ancestor.
+    let mut seeds: Vec<&SessionFacts> = by_parent.get(root_session_id).cloned().unwrap_or_default();
+    {
+        let mut chain_seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        // Guard the root itself too: a corrupt A→…→A cycle must not loop.
+        chain_seen.insert(root_session_id);
+        let mut cursor = by_id
+            .get(root_session_id)
+            .and_then(|f| f.derived_from.as_deref());
+        while let Some(ancestor) = cursor {
+            if !chain_seen.insert(ancestor) {
+                break; // derivation cycle: stop, each node emits once anyway
+            }
+            if let Some(children) = by_parent.get(ancestor) {
+                seeds.extend(children.iter().copied());
+            }
+            cursor = by_id.get(ancestor).and_then(|f| f.derived_from.as_deref());
         }
     }
+
+    // BFS from the seeds, collecting descendants with depth.
+    let mut out: Vec<SubagentEntry> = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut queue: Vec<(&SessionFacts, usize)> = seeds.into_iter().map(|c| (c, 0)).collect();
     while let Some((f, depth)) = queue.pop() {
         if !seen.insert(f.id.as_str()) {
             continue; // corrupt lineage cycle: emit each node once
@@ -377,6 +418,26 @@ mod tests {
              \"model\": \"deepseek-chat\", {parent_field} {task_field} \"status\": \"{status}\", \
              \"pid\": null, \"socket_path\": null}}, \"messages\": [], \
              \"total_input_tokens\": 10, \"total_output_tokens\": 5, \"estimated_cost_usd\": 0.01}}"
+        )
+    }
+
+    /// `session_json` + a `derived_from` stamp (D2: `/new` derivation).
+    fn derived_session_json(
+        id: &str,
+        parent: Option<&str>,
+        status: &str,
+        task: Option<&str>,
+        derived_from: Option<&str>,
+    ) -> String {
+        let base = session_json(id, parent, status, task);
+        let Some(from) = derived_from else {
+            return base;
+        };
+        // Insert before the closing `}}` of the meta object (last-but-one
+        // brace): `... "socket_path": null}` → `..., "derived_from": "..."}`
+        base.replace(
+            "\"socket_path\": null}",
+            &format!("\"socket_path\": null, \"derived_from\": \"{from}\"}}"),
         )
     }
 
@@ -829,6 +890,214 @@ mod tests {
             uncached.len(),
             2,
             "grandchild included, torn/foreign excluded"
+        );
+    }
+
+    // ── D2: derived_from family seeding (/new derivation) ────────
+
+    #[test]
+    fn derived_from_family_bfs_seeds_ancestor_children() {
+        // Family: root A with child c1; B derived from A (via /new) with
+        // child c2; unrelated root D with child x. Viewing from A (an
+        // ancestor) must show A's own descendants [c1] — NOT B's child c2
+        // (A is B's derivation ancestor, not B's parent).
+        let dir = tmpdir();
+        write_session(
+            dir.path(),
+            "session-A",
+            &derived_session_json("session-A", None, "completed", None, None),
+        );
+        write_session(
+            dir.path(),
+            "session-c1",
+            &session_json("session-c1", Some("session-A"), "completed", None),
+        );
+        write_session(
+            dir.path(),
+            "session-B",
+            &derived_session_json("session-B", None, "running", None, Some("session-A")),
+        );
+        write_session(
+            dir.path(),
+            "session-c2",
+            &session_json("session-c2", Some("session-B"), "running", None),
+        );
+        write_session(
+            dir.path(),
+            "session-D",
+            &derived_session_json("session-D", None, "completed", None, None),
+        );
+        write_session(
+            dir.path(),
+            "session-x",
+            &session_json("session-x", Some("session-D"), "completed", None),
+        );
+
+        // From the DERIVED session B: own child c2 + ancestor A's child c1
+        // (both depth 0). Unrelated D's child x must NOT appear.
+        let family = build_family_index(dir.path(), "session-B", &HashMap::new());
+        let mut ids: Vec<&str> = family.iter().map(|e| e.session_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec!["session-c1", "session-c2"],
+            "B's family: own child + ancestor's child"
+        );
+        assert!(
+            family.iter().all(|e| e.depth == 0),
+            "derivation-inherited children display at depth 0"
+        );
+
+        // From the ancestor A: only its own subtree [c1] — B's child c2 is
+        // NOT A's descendant (derivation is lateral, not parental).
+        let family_a = build_family_index(dir.path(), "session-A", &HashMap::new());
+        let ids_a: Vec<&str> = family_a.iter().map(|e| e.session_id.as_str()).collect();
+        assert_eq!(ids_a, vec!["session-c1"]);
+    }
+
+    #[test]
+    fn derived_from_chain_walks_multiple_ancestors() {
+        // /new chains: A → B → C (each /new derives from the previous).
+        // Viewing from C must inherit children from BOTH ancestors.
+        let dir = tmpdir();
+        write_session(
+            dir.path(),
+            "session-A",
+            &derived_session_json("session-A", None, "completed", None, None),
+        );
+        write_session(
+            dir.path(),
+            "session-a1",
+            &session_json("session-a1", Some("session-A"), "completed", None),
+        );
+        write_session(
+            dir.path(),
+            "session-B",
+            &derived_session_json("session-B", None, "completed", None, Some("session-A")),
+        );
+        write_session(
+            dir.path(),
+            "session-b1",
+            &session_json("session-b1", Some("session-B"), "completed", None),
+        );
+        write_session(
+            dir.path(),
+            "session-C",
+            &derived_session_json("session-C", None, "running", None, Some("session-B")),
+        );
+
+        let family = build_family_index(dir.path(), "session-C", &HashMap::new());
+        let mut ids: Vec<&str> = family.iter().map(|e| e.session_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec!["session-a1", "session-b1"],
+            "C's family walks the full derivation chain: B's and A's children"
+        );
+    }
+
+    #[test]
+    fn derived_from_cycle_guard_terminates() {
+        // Corrupt derivation cycle A→B→A (and a self-loop root): the chain
+        // walk must terminate, not hang, and still emit each node once.
+        let dir = tmpdir();
+        write_session(
+            dir.path(),
+            "session-A",
+            &derived_session_json("session-A", None, "completed", None, Some("session-B")),
+        );
+        write_session(
+            dir.path(),
+            "session-B",
+            &derived_session_json("session-B", None, "running", None, Some("session-A")),
+        );
+        write_session(
+            dir.path(),
+            "session-a1",
+            &session_json("session-a1", Some("session-A"), "completed", None),
+        );
+        write_session(
+            dir.path(),
+            "session-b1",
+            &session_json("session-b1", Some("session-B"), "completed", None),
+        );
+        // Self-deriving session (corrupt): must not loop either.
+        write_session(
+            dir.path(),
+            "session-S",
+            &derived_session_json("session-S", None, "completed", None, Some("session-S")),
+        );
+
+        let family = build_family_index(dir.path(), "session-B", &HashMap::new());
+        let mut ids: Vec<&str> = family.iter().map(|e| e.session_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec!["session-a1", "session-b1"],
+            "cycle walks emit each child once"
+        );
+    }
+
+    #[test]
+    fn derived_from_missing_ancestor_json_is_tolerated() {
+        // derived_from points at a session whose json is gone: the chain
+        // stops (no facts for the ancestor), no panic, no children lost.
+        let dir = tmpdir();
+        write_session(
+            dir.path(),
+            "session-B",
+            &derived_session_json("session-B", None, "running", None, Some("session-gone")),
+        );
+        write_session(
+            dir.path(),
+            "session-b1",
+            &session_json("session-b1", Some("session-B"), "running", None),
+        );
+        let family = build_family_index(dir.path(), "session-B", &HashMap::new());
+        let ids: Vec<&str> = family.iter().map(|e| e.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["session-b1"], "own children unaffected");
+    }
+
+    #[test]
+    fn derived_from_ancestor_child_subtree_expands() {
+        // An inherited child is a SEED: its own descendants (grandchildren
+        // of the derivation ancestor) still expand along parent edges.
+        let dir = tmpdir();
+        write_session(
+            dir.path(),
+            "session-A",
+            &derived_session_json("session-A", None, "completed", None, None),
+        );
+        write_session(
+            dir.path(),
+            "session-c1",
+            &session_json("session-c1", Some("session-A"), "completed", None),
+        );
+        write_session(
+            dir.path(),
+            "session-g1",
+            &session_json("session-g1", Some("session-c1"), "completed", None),
+        );
+        write_session(
+            dir.path(),
+            "session-B",
+            &derived_session_json("session-B", None, "running", None, Some("session-A")),
+        );
+
+        let family = build_family_index(dir.path(), "session-B", &HashMap::new());
+        let by_id: HashMap<&str, usize> = family
+            .iter()
+            .map(|e| (e.session_id.as_str(), e.depth))
+            .collect();
+        assert_eq!(
+            by_id.get("session-c1"),
+            Some(&0),
+            "inherited child seeds at 0"
+        );
+        assert_eq!(
+            by_id.get("session-g1"),
+            Some(&1),
+            "its child nests at depth 1"
         );
     }
 }

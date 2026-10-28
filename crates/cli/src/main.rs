@@ -10,6 +10,8 @@ mod repl;
 mod runner;
 mod slash_commands;
 mod stream;
+#[cfg(test)]
+mod test_env;
 mod tui;
 
 use crate::approval_prompts::InteractiveIpcApprovalHandler;
@@ -716,7 +718,7 @@ async fn try_main() -> anyhow::Result<()> {
                     if let Some(rx) = runtime.take_event_rx() {
                         let ipc_handle = runtime.take_ipc_handle();
                         let approval_pending = runtime.take_ipc_approval_pending();
-                        let _stream_task = spawn_stream_task(
+                        let stream_task = spawn_stream_task(
                             rx,
                             cli.stream,
                             runtime.event_log_path(),
@@ -728,7 +730,18 @@ async fn try_main() -> anyhow::Result<()> {
                             std::time::Duration::from_secs(config.session.step_stall_alarm_secs),
                         );
                         let _ = runtime.run_turn(prompt).await;
-                        let mut repl = Repl::new(runtime, cli.safe, true);
+                        // D3: hand the stream task to the REPL so a later
+                        // `/new` can rewire it (initial spawn consumer is
+                        // owned by `Repl::run`).
+                        let mut repl = Repl::new(runtime, cli.safe, true).with_stdio_rewire(
+                            crate::repl::StdioRewire::new(
+                                cli.stream,
+                                std::time::Duration::from_secs(
+                                    config.session.step_stall_alarm_secs,
+                                ),
+                                stream_task,
+                            ),
+                        );
                         repl.run().await?;
                     }
                 } else {
@@ -801,22 +814,46 @@ async fn try_main() -> anyhow::Result<()> {
                     )
                     .await
                     .map_err(anyhow::Error::msg)?;
-                    if !use_tui && let Some(rx) = runtime.take_event_rx() {
-                        let ipc_handle = runtime.take_ipc_handle();
-                        let approval_pending = runtime.take_ipc_approval_pending();
-                        let _stream_task = spawn_stream_task(
-                            rx,
-                            cli.stream,
-                            runtime.event_log_path(),
-                            ipc_handle,
-                            approval_pending,
-                            runtime.question_pending(),
-                            None,
-                            runtime.take_turn_commit_tx().map(|(tx, _flag)| tx),
-                            std::time::Duration::from_secs(config.session.step_stall_alarm_secs),
-                        );
-                    }
-                    let mut repl = Repl::new(runtime, cli.safe, cli.run);
+                    let mut repl = {
+                        // D3 stdio rewire: hand the stream task (and the
+                        // spawn consumer below) to the REPL so `/new` can
+                        // rewire them after the supervisor swap.
+                        let stdio_rewire = if !use_tui && let Some(rx) = runtime.take_event_rx() {
+                            let ipc_handle = runtime.take_ipc_handle();
+                            let approval_pending = runtime.take_ipc_approval_pending();
+                            let stream_task = spawn_stream_task(
+                                rx,
+                                cli.stream,
+                                runtime.event_log_path(),
+                                ipc_handle,
+                                approval_pending,
+                                runtime.question_pending(),
+                                None,
+                                runtime.take_turn_commit_tx().map(|(tx, _flag)| tx),
+                                std::time::Duration::from_secs(
+                                    config.session.step_stall_alarm_secs,
+                                ),
+                            );
+                            // The initial stdio spawn consumer stays owned by
+                            // `Repl::run` (it self-exits when the swapped-out
+                            // supervisor's spawn channel closes); rewires
+                            // spawn fresh consumers.
+                            Some(crate::repl::StdioRewire::new(
+                                cli.stream,
+                                std::time::Duration::from_secs(
+                                    config.session.step_stall_alarm_secs,
+                                ),
+                                stream_task,
+                            ))
+                        } else {
+                            None
+                        };
+                        let repl = Repl::new(runtime, cli.safe, cli.run);
+                        match stdio_rewire {
+                            Some(r) => repl.with_stdio_rewire(r),
+                            None => repl,
+                        }
+                    };
                     if use_tui {
                         repl.run_with_tui().await?;
                     } else {
@@ -871,24 +908,44 @@ async fn try_main() -> anyhow::Result<()> {
                         )
                         .await
                         .map_err(anyhow::Error::msg)?;
-                        if !use_tui && let Some(rx) = runtime.take_event_rx() {
-                            let ipc_handle = runtime.take_ipc_handle();
-                            let approval_pending = runtime.take_ipc_approval_pending();
-                            let _stream_task = spawn_stream_task(
-                                rx,
-                                cli.stream,
-                                runtime.event_log_path(),
-                                ipc_handle,
-                                approval_pending,
-                                runtime.question_pending(),
-                                None,
-                                runtime.take_turn_commit_tx().map(|(tx, _flag)| tx),
-                                std::time::Duration::from_secs(
-                                    config.session.step_stall_alarm_secs,
-                                ),
-                            );
-                        }
-                        let mut repl = Repl::new(runtime, cli.safe, cli.run);
+                        let mut repl = {
+                            // D3 stdio rewire (same handover as the sibling
+                            // branch above).
+                            let stdio_rewire = if !use_tui && let Some(rx) = runtime.take_event_rx()
+                            {
+                                let ipc_handle = runtime.take_ipc_handle();
+                                let approval_pending = runtime.take_ipc_approval_pending();
+                                let stream_task = spawn_stream_task(
+                                    rx,
+                                    cli.stream,
+                                    runtime.event_log_path(),
+                                    ipc_handle,
+                                    approval_pending,
+                                    runtime.question_pending(),
+                                    None,
+                                    runtime.take_turn_commit_tx().map(|(tx, _flag)| tx),
+                                    std::time::Duration::from_secs(
+                                        config.session.step_stall_alarm_secs,
+                                    ),
+                                );
+                                // Initial stdio spawn consumer owned by
+                                // `Repl::run` (see sibling branch).
+                                Some(crate::repl::StdioRewire::new(
+                                    cli.stream,
+                                    std::time::Duration::from_secs(
+                                        config.session.step_stall_alarm_secs,
+                                    ),
+                                    stream_task,
+                                ))
+                            } else {
+                                None
+                            };
+                            let repl = Repl::new(runtime, cli.safe, cli.run);
+                            match stdio_rewire {
+                                Some(r) => repl.with_stdio_rewire(r),
+                                None => repl,
+                            }
+                        };
                         if use_tui {
                             repl.run_with_tui().await?;
                         } else {
@@ -974,7 +1031,7 @@ async fn run_one_shot(
             nca_runtime::supervisor::spawn_subagent_consumer(
                 spawn_rx,
                 runtime.session_id().to_string(),
-                runtime.workspace_root().to_path_buf(),
+                runtime.workspace_root_handle(),
                 runtime.live_config(),
                 runtime.spawn_history(),
                 event_tx,
@@ -1276,22 +1333,38 @@ async fn resume_session(
         return Ok(());
     }
 
-    if !use_tui && let Some(rx) = runtime.take_event_rx() {
-        let ipc_handle = runtime.take_ipc_handle();
-        let approval_pending = runtime.take_ipc_approval_pending();
-        let _stream_task = spawn_stream_task(
-            rx,
-            stream,
-            runtime.event_log_path(),
-            ipc_handle,
-            approval_pending,
-            runtime.question_pending(),
-            None,
-            runtime.take_turn_commit_tx().map(|(tx, _flag)| tx),
-            step_stall_alarm,
-        );
-    }
-    let mut repl = Repl::new(runtime, safe, true);
+    let mut repl = {
+        // D3 stdio rewire (resume path): hand the stream task + spawn
+        // consumer to the REPL so `/new` can rewire them.
+        let stdio_rewire = if !use_tui && let Some(rx) = runtime.take_event_rx() {
+            let ipc_handle = runtime.take_ipc_handle();
+            let approval_pending = runtime.take_ipc_approval_pending();
+            let stream_task = spawn_stream_task(
+                rx,
+                stream,
+                runtime.event_log_path(),
+                ipc_handle,
+                approval_pending,
+                runtime.question_pending(),
+                None,
+                runtime.take_turn_commit_tx().map(|(tx, _flag)| tx),
+                step_stall_alarm,
+            );
+            // Initial stdio spawn consumer owned by `Repl::run`.
+            Some(crate::repl::StdioRewire::new(
+                stream,
+                step_stall_alarm,
+                stream_task,
+            ))
+        } else {
+            None
+        };
+        let repl = Repl::new(runtime, safe, true);
+        match stdio_rewire {
+            Some(r) => repl.with_stdio_rewire(r),
+            None => repl,
+        }
+    };
     if use_tui {
         repl.run_with_tui().await?;
     } else {

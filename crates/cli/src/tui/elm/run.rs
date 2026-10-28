@@ -74,12 +74,15 @@ pub(crate) fn run_nca_model(
         tokio::sync::mpsc::UnboundedSender<(String, nca_common::event::QuestionSelection)>,
     >,
     approval_answer_tx: Option<tokio::sync::mpsc::UnboundedSender<ApprovalAnswer>>,
-    cancel_flag: Option<Arc<AtomicBool>>,
+    // B3: refreshable slots (not plain handles) — the session wiring rewrites
+    // them after every supervisor swap (`/new`, session switch), so cancels,
+    // steering and kill-all always target the CURRENT session.
+    cancel_flag: Arc<StdMutex<Option<Arc<AtomicBool>>>>,
     active_question_id: Arc<StdMutex<Option<String>>>,
     active_question_payload: Arc<StdMutex<Option<InteractiveQuestionPayload>>>,
     active_approval_payload: Arc<StdMutex<Option<crate::tui::state::ApprovalRequest>>>,
     staged_images: Arc<StdMutex<Vec<nca_common::message::ImageAttachment>>>,
-    inbox_tx: Option<tokio::sync::mpsc::Sender<nca_core::agent_driver::InboxItem>>,
+    inbox_tx: Arc<StdMutex<Option<tokio::sync::mpsc::Sender<nca_core::agent_driver::InboxItem>>>>,
     busy_flag: Arc<AtomicBool>,
     kill_all_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
     params: NcaModelParams,
@@ -112,6 +115,7 @@ pub(crate) fn run_nca_model(
             kill_all_tx,
         },
         params.sessions_dir,
+        params.workspace_root.clone(),
         params.session_id.clone(),
     );
 

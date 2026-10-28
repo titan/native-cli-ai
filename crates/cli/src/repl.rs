@@ -26,6 +26,7 @@ use reedline::{
 use std::io::Write;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use tokio::process::Command;
 
@@ -33,6 +34,256 @@ use tokio::process::Command;
 pub(crate) enum ReplOutput<'a> {
     Stdio,
     Tui(&'a dyn TuiFeedback),
+}
+
+/// Refreshable slot for the CURRENT supervisor's cancel flag (B3).
+///
+/// The Elm model's instantaneous cancels (`Esc`, `Ctrl+C`, quit) bypass the
+/// cmd queue because the queue is blocked inside `run_turn` exactly when a
+/// cancel is needed. A wiring-time `Arc<AtomicBool>` would keep pointing at
+/// the PREVIOUS supervisor's flag after a `/new` swap, so the store landed on
+/// a dead flag and the running turn became uninterruptible. Slots (same
+/// pattern as `question_slot`/`approval_slot`) let the rewire protocol push
+/// the live handle without restarting the UI task.
+type CancelFlagSlot = Arc<std::sync::Mutex<Option<Arc<AtomicBool>>>>;
+/// Refreshable slot for the CURRENT supervisor's agent inbox (mid-turn
+/// steering target; same rationale as [`CancelFlagSlot`]).
+type InboxSlot =
+    Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<nca_core::agent_driver::InboxItem>>>>;
+/// Refreshable slot for the CURRENT supervisor's subagent registry (kill-all
+/// target; same rationale as [`CancelFlagSlot`]).
+type RegistrySlot =
+    Arc<std::sync::Mutex<Option<Arc<nca_runtime::subagent_registry::SubagentRegistry>>>>;
+
+/// Re-entrant TUI session wiring (D3: `/new` + session-switch rewire
+/// protocol).
+///
+/// The event bridge (fanout → event log/IPC/Elm feedback) and the subagent
+/// spawn consumer are wired once per supervisor at TUI startup. Both freeze
+/// wiring-time state (log path, event/spawn channel receivers, parent
+/// session id), so after [`SessionRuntime::new_session`] or
+/// [`SessionRuntime::switch_to`] both swap the supervisor — the OLD tasks
+/// would keep writing the OLD session's log while the new supervisor's
+/// event channel sits un-drained, until must-deliver events wedge the
+/// bounded channel and hang the turn.
+///
+/// Rewire protocol (design §2 D3):
+/// 1. Drop the old task handles. The old supervisor is already gone
+///    (replaced in the runtime), so its event-channel senders dropped with
+///    it; the old bridge fanout therefore drains + commits on channel close
+///    (the runtime fanout's built-in drain-on-close) and the OLD event log
+///    ends cleanly. The old spawn consumer's `spawn_rx` likewise returns
+///    `None` and its task exits.
+/// 2. Take the NEW supervisor's `event_rx` / `turn_commit_tx` / `spawn_rx`
+///    and spawn a fresh bridge on the new `event_log_path()` (new
+///    `EventLogWriter` → new file, ids seeded from the new log) plus a
+///    fresh spawn consumer reading the live root handle.
+/// 3. The Elm side is NOT rebuilt: the same `feedback_tx` feeds the running
+///    model; `ResetSessionState` handles the transcript/session-id swap.
+///
+/// Not rewired (known follow-up, design §5): the IPC server. Each swapped
+/// supervisor's `ipc_handle` stays untaken after the first wiring, so
+/// rewired bridges ride the ORIGINAL session's IPC socket and its command
+/// consumer. Live pending-question/approval maps are re-read from the
+/// runtime instead (the dispatch tasks own shared slots this struct
+/// refreshes — see [`TuiRewire::rewire`]). The untaken handles themselves
+/// are now cleaned up by [`nca_runtime::ipc::IpcHandle`]'s `Drop` (accept
+/// loop aborted, socket file unlinked), so swapping sessions no longer leaks
+/// one socket per `/new`.
+struct TuiRewire {
+    feedback_tx: tokio::sync::mpsc::UnboundedSender<TuiFeedbackMsg>,
+    wake_scheduler: Option<WakeScheduler>,
+    /// Shared slot the answer dispatcher reads (refreshed on every rewire).
+    question_slot: Arc<std::sync::RwLock<Option<crate::ipc_pending::QuestionPendingMap>>>,
+    /// Shared slot the approval dispatcher reads (refreshed on every rewire).
+    approval_slot: Arc<std::sync::RwLock<Option<crate::ipc_pending::ApprovalPendingMap>>>,
+    /// Shared slot the Elm model reads for instantaneous cancels (B3).
+    cancel_slot: CancelFlagSlot,
+    /// Shared slot the Elm model reads for mid-turn steering (B3).
+    inbox_slot: InboxSlot,
+    /// Shared slot the kill-all task reads (m5: same staleness as the cancel
+    /// flag — the captured registry died with the swapped-out supervisor).
+    registry_slot: RegistrySlot,
+    /// Current bridge task handle; replaced on each rewire. Dropping the
+    /// old handle detaches the task (it exits on its own once drained).
+    bridge_task: Option<tokio::task::JoinHandle<()>>,
+    /// Current spawn-consumer task handle; replaced on each rewire.
+    spawn_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl TuiRewire {
+    /// Wire (first call) or rewire (after a supervisor swap) the bridge +
+    /// spawn consumer against the runtime's CURRENT supervisor. Returns an
+    /// error string when the runtime has no event channel (should be
+    /// impossible — every supervisor owns one until taken here).
+    fn rewire(&mut self, runtime: &mut SessionRuntime) -> Result<(), String> {
+        let Some(rx) = runtime.take_event_rx() else {
+            return Err("internal: event channel already taken".to_string());
+        };
+        drop(self.bridge_task.take());
+        drop(self.spawn_task.take());
+
+        // New turn-commit watch sender: the old supervisor's watch pair died
+        // with it; the new one must be wired so `run_turn`'s durability
+        // barrier tracks the NEW fanout's commits.
+        let commit_tx = runtime.take_turn_commit_tx().map(|(tx, _flag)| tx);
+        let step_stall_alarm = Duration::from_secs(runtime.config().session.step_stall_alarm_secs);
+        // The swapped supervisor's approval map: one `Arc` goes to the
+        // bridge (whose command consumer is the real consumer for
+        // approve/deny commands); the other goes to the Elm-side slot so the
+        // TUI's fast path can resolve without a round trip.
+        let approval_pending = runtime.take_ipc_approval_pending();
+        self.bridge_task = Some(spawn_tui_bridge(
+            rx,
+            runtime.event_log_path(),
+            // IPC: take the SWAPPED supervisor's handle so `nca attach
+            // <new-id>` sees the new session's event stream and its
+            // AgentCommands (approve/deny/cancel) get a consumer. Passing
+            // `None` here leaves the new socket accepted-but-unserved: attach
+            // connects, receives nothing, and waits forever.
+            runtime.take_ipc_handle(),
+            approval_pending.clone(),
+            runtime.question_pending(),
+            self.feedback_tx.clone(),
+            commit_tx,
+            step_stall_alarm,
+        ));
+
+        // P4 `wait_for_user` is registered on the runtime's tool registry,
+        // which the supervisor swap replaced — re-register with the same
+        // pause hook so the fresh session keeps the tool.
+        let pause_hook = self.wake_scheduler.as_ref().map(|sched| {
+            let sched = sched.clone();
+            Arc::new(move || sched.pause()) as PauseHook
+        });
+        runtime.register_tool(Box::new(WaitForUserTool::new(pause_hook)));
+
+        // Spawn consumer: rebuilt with the CURRENT session id and the live
+        // root/config handles (reads see post-`/new`/switch values, D1b).
+        let spawn_rx = runtime.take_spawn_rx();
+        let event_tx = runtime.event_tx();
+        self.spawn_task = spawn_rx.map(|srx| {
+            nca_runtime::supervisor::spawn_subagent_consumer(
+                srx,
+                runtime.session_id().to_string(),
+                runtime.workspace_root_handle(),
+                runtime.live_config(),
+                runtime.spawn_history(),
+                event_tx,
+                runtime.subagent_registry(),
+                runtime.fs(),
+                None,
+                runtime.config().subagent.background,
+                self.wake_scheduler.clone(),
+                runtime.plugin_registry(),
+                runtime.fallback_escaped_handle(),
+            )
+        });
+
+        // Refresh the dispatch slots so answers/approvals resolve against
+        // the CURRENT session's pending maps (the swap replaced them).
+        *self
+            .question_slot
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = runtime.question_pending();
+        *self
+            .approval_slot
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = approval_pending;
+
+        // B3/m5: refresh the instantaneous-action handles. The cancel flag,
+        // agent inbox and subagent registry all belonged to the supervisor
+        // that was just swapped away: without this, `Esc`/`Ctrl+C` store into
+        // a dead flag (a running turn becomes uninterruptible), mid-turn
+        // steering lands in a dropped inbox, and kill-all targets a registry
+        // that no longer tracks anything.
+        *self.cancel_slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(runtime.cancel_handle());
+        *self.inbox_slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(runtime.inbox_sender());
+        *self.registry_slot.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(runtime.subagent_registry());
+        Ok(())
+    }
+}
+
+/// Re-entrant stdio session wiring (D3, non-TUI REPL path): mirrors
+/// [`TuiRewire`] over the stream fanout (`--stream` renderer + event log)
+/// and the spawn consumer. The stream task is born in `main.rs` (mode/IPC
+/// args live there); this struct takes ownership of its handle and performs
+/// the rewires on `/new`.
+pub(crate) struct StdioRewire {
+    stream_mode: crate::stream::StreamMode,
+    step_stall_alarm: Duration,
+    stream_task: Option<tokio::task::JoinHandle<()>>,
+    spawn_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl StdioRewire {
+    /// Adopt the initial stream task from `main.rs`'s wiring. The initial
+    /// stdio spawn consumer is owned by `Repl::run` (it self-exits when a
+    /// swapped-out supervisor's spawn channel closes), so no spawn handle
+    /// is adopted; rewires spawn fresh consumers.
+    pub(crate) fn new(
+        stream_mode: crate::stream::StreamMode,
+        step_stall_alarm: Duration,
+        stream_task: tokio::task::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            stream_mode,
+            step_stall_alarm,
+            stream_task: Some(stream_task),
+            spawn_task: None,
+        }
+    }
+
+    /// Rewire the stream fanout + spawn consumer after a supervisor swap
+    /// (`/new`). Same protocol as [`TuiRewire::rewire`].
+    fn rewire(&mut self, runtime: &mut SessionRuntime) -> Result<(), String> {
+        let Some(rx) = runtime.take_event_rx() else {
+            return Err("internal: event channel already taken".to_string());
+        };
+        drop(self.stream_task.take());
+        drop(self.spawn_task.take());
+        let commit_tx = runtime.take_turn_commit_tx().map(|(tx, _flag)| tx);
+        // B1: the IPC command consumer is the only real consumer of the
+        // approval map, so the handle and the map travel together. With both,
+        // `nca attach` on the new session and approve/deny over IPC work
+        // after `/new` (the previous wiring's socket stays live on its own
+        // split, disarmed handle).
+        let approval_pending = runtime.take_ipc_approval_pending();
+        self.stream_task = Some(crate::stream::spawn_stream_task(
+            rx,
+            self.stream_mode,
+            runtime.event_log_path(),
+            runtime.take_ipc_handle(),
+            approval_pending,
+            runtime.question_pending(),
+            None,
+            commit_tx,
+            self.step_stall_alarm,
+        ));
+        let spawn_rx = runtime.take_spawn_rx();
+        let event_tx = runtime.event_tx();
+        self.spawn_task = spawn_rx.map(|srx| {
+            nca_runtime::supervisor::spawn_subagent_consumer(
+                srx,
+                runtime.session_id().to_string(),
+                runtime.workspace_root_handle(),
+                runtime.live_config(),
+                runtime.spawn_history(),
+                event_tx,
+                runtime.subagent_registry(),
+                runtime.fs(),
+                None,
+                // stdio REPL parks on read_line — no cmd queue, so there is
+                // no wake delivery path (same as the initial wiring).
+                false,
+                None,
+                runtime.plugin_registry(),
+                runtime.fallback_escaped_handle(),
+            )
+        });
+        Ok(())
+    }
 }
 
 impl ReplOutput<'_> {
@@ -129,6 +380,12 @@ pub struct Repl {
     /// Index into the agent entry list (0 = "orchestrator" default, 1+ = OMO specialists).
     agent_index: usize,
     current_agent_label: String,
+    /// TUI rewire state (D3): set by `run_with_tui`; `/new` and session
+    /// switches rewire the bridge + spawn consumer through it.
+    tui_rewire: Option<TuiRewire>,
+    /// stdio rewire state (D3): adopted from `main.rs`'s initial stream
+    /// wiring; `/new` rewires the stream fanout + spawn consumer through it.
+    stdio_rewire: Option<StdioRewire>,
 }
 
 impl Repl {
@@ -142,6 +399,34 @@ impl Repl {
             history_path,
             agent_index: 0,
             current_agent_label,
+            tui_rewire: None,
+            stdio_rewire: None,
+        }
+    }
+
+    /// Adopt `main.rs`'s initial stdio stream wiring so `/new` can rewire
+    /// it later (D3). Called after the stream task + spawn consumer are
+    /// spawned in non-TUI mode.
+    pub fn with_stdio_rewire(mut self, rewire: StdioRewire) -> Self {
+        self.stdio_rewire = Some(rewire);
+        self
+    }
+
+    /// Rewire the event bridge / stream fanout + spawn consumer after a
+    /// supervisor swap (D3). Dispatches on the active mode; a rewire failure
+    /// is surfaced through `out` (the session itself already swapped — the
+    /// next turn still works, only event persistence would be broken).
+    fn rewire_after_session_change(&mut self, out: &ReplOutput<'_>) {
+        let result = match (&mut self.tui_rewire, &mut self.stdio_rewire) {
+            (Some(tui), _) => tui.rewire(&mut self.runtime),
+            (None, Some(stdio)) => stdio.rewire(&mut self.runtime),
+            (None, None) => Ok(()),
+        };
+        if let Err(e) = result {
+            match out {
+                ReplOutput::Stdio => eprintln!("[session] event rewire failed: {e}"),
+                ReplOutput::Tui(fb) => fb.push_error(format!("event rewire failed: {e}")),
+            }
         }
     }
 
@@ -184,21 +469,8 @@ impl Repl {
 
         // MCP load report (per-server outcomes from session create): one
         // stderr line each — non-TTY mode has no transcript to push into.
-        for report in self.runtime.take_mcp_report() {
-            match (&report.tool_count, &report.error) {
-                (Some(count), _) => eprintln!(
-                    "[mcp] loaded {} ({} tool{})",
-                    report.name,
-                    count,
-                    if *count == 1 { "" } else { "s" }
-                ),
-                (None, Some(error)) => {
-                    eprintln!("[mcp] FAILED {}: {} (skipped)", report.name, error)
-                }
-                (None, None) => {
-                    eprintln!("[mcp] FAILED {}: unknown reason (skipped)", report.name)
-                }
-            }
+        for line in crate::runner::mcp_report_lines(&self.runtime.take_mcp_report()) {
+            eprintln!("{line}");
         }
 
         let _spawn_task = {
@@ -208,7 +480,7 @@ impl Repl {
                 Some(nca_runtime::supervisor::spawn_subagent_consumer(
                     srx,
                     self.runtime.session_id().to_string(),
-                    self.runtime.workspace_root().to_path_buf(),
+                    self.runtime.workspace_root_handle(),
                     self.runtime.live_config(),
                     self.runtime.spawn_history(),
                     event_tx,
@@ -1640,11 +1912,36 @@ impl Repl {
                     .await
                     .map_err(anyhow::Error::msg)?;
                 self.runtime.new_session().await.map_err(anyhow::Error::msg)?;
+                // D3: the supervisor swap left fresh event/spawn channels
+                // untaken and the old bridge writing the old id's log —
+                // rewire before anything else touches the runtime.
+                self.rewire_after_session_change(&out);
+                // The fresh supervisor re-ran the MCP handshake; its per-server
+                // report would otherwise be dropped (the startup report was
+                // already consumed at wiring). stderr, matching the startup
+                // report — stdout must stay clean for `--stream ndjson`.
+                for line in crate::runner::mcp_report_lines(&self.runtime.take_mcp_report()) {
+                    eprintln!("{line}");
+                }
                 let new_id = self.runtime.session_id().to_string();
                 if let ReplOutput::Tui(st) = &out {
+                    // B2: the new session's store/root follow the swap — the
+                    // Elm model must scan the CURRENT sessions dir for `/jobs`
+                    // (a worktree-grounded session used to keep scanning the
+                    // worktree's dir, yielding an empty family).
+                    let sessions_dir = self
+                        .runtime
+                        .workspace_root()
+                        .join(&self.runtime.config().session.history_dir);
+                    let workspace_root = self.runtime.workspace_root().to_path_buf();
                     st.clear_transcript();
                     st.set_streaming_assistant(None);
-                    st.reset_session_state(new_id.clone(), self.runtime.model().to_string());
+                    st.reset_session_state(
+                        new_id.clone(),
+                        self.runtime.model().to_string(),
+                        sessions_dir,
+                        workspace_root,
+                    );
                 }
                 out.println(&format!("new session started: {new_id}"));
             }
@@ -1879,21 +2176,8 @@ impl Repl {
         // MCP load report (per-server outcomes from session create): surface
         // one transcript line each so a skipped/timed-out server is visible
         // instead of silently missing from the tool list.
-        for report in self.runtime.take_mcp_report() {
-            match (&report.tool_count, &report.error) {
-                (Some(count), _) => tui_feedback.push_system(format!(
-                    "[mcp] loaded {} ({} tool{})",
-                    report.name,
-                    count,
-                    if *count == 1 { "" } else { "s" }
-                )),
-                (None, Some(error)) => tui_feedback
-                    .push_system(format!("[mcp] FAILED {}: {} (skipped)", report.name, error)),
-                (None, None) => tui_feedback.push_system(format!(
-                    "[mcp] FAILED {}: unknown reason (skipped)",
-                    report.name
-                )),
-            }
+        for line in crate::runner::mcp_report_lines(&self.runtime.take_mcp_report()) {
+            tui_feedback.push_system(line);
         }
 
         // Populate the git branch name immediately so it appears on first render.
@@ -1919,7 +2203,18 @@ impl Repl {
         let staged_images = tui_feedback.staged_images_handle();
         // Authoritative busy flag + agent inbox for mid-turn steering (P1 TUI wiring).
         let busy_flag = tui_feedback.busy_flag_handle();
-        let inbox_tx = self.runtime.inbox_sender();
+        // B3: refreshable slots for the instantaneous-action handles. The Elm
+        // model cancels (Esc/Ctrl+C/quit), steers and kills directly against
+        // these because the cmd queue is blocked inside `run_turn` exactly
+        // when they are needed — and a `/new` swap replaces the supervisor
+        // they belong to. `TuiRewire::rewire` re-writes all three.
+        let cancel_slot: CancelFlagSlot =
+            Arc::new(std::sync::Mutex::new(Some(self.runtime.cancel_handle())));
+        let inbox_slot: InboxSlot =
+            Arc::new(std::sync::Mutex::new(Some(self.runtime.inbox_sender())));
+        let registry_slot: RegistrySlot = Arc::new(std::sync::Mutex::new(Some(
+            self.runtime.subagent_registry(),
+        )));
 
         // Cmd queue: every parent-turn entry point (user Submits, wake
         // Submits, TUI commands) funnels through this one channel; the
@@ -1972,7 +2267,7 @@ impl Repl {
         // Step-liveness watch interval from the live session config (0 disables).
         let step_stall_alarm =
             Duration::from_secs(self.runtime.config().session.step_stall_alarm_secs);
-        let _bridge = spawn_tui_bridge(
+        let bridge = spawn_tui_bridge(
             rx,
             log_path,
             ipc,
@@ -1983,14 +2278,14 @@ impl Repl {
             step_stall_alarm,
         );
 
-        let _spawn_task = {
+        let spawn_task = {
             let spawn_rx = self.runtime.take_spawn_rx();
             let event_tx = self.runtime.event_tx();
             if let Some(srx) = spawn_rx {
                 Some(nca_runtime::supervisor::spawn_subagent_consumer(
                     srx,
                     self.runtime.session_id().to_string(),
-                    self.runtime.workspace_root().to_path_buf(),
+                    self.runtime.workspace_root_handle(),
                     self.runtime.live_config(),
                     self.runtime.spawn_history(),
                     event_tx,
@@ -2012,14 +2307,38 @@ impl Repl {
             }
         };
 
+        // D3 rewire state: the answer/approval dispatch tasks read shared
+        // slots (not the wiring-time map clones) so a supervisor swap
+        // (`/new`, session switch) refreshes them without restarting the
+        // dispatch tasks.
+        let question_slot: Arc<std::sync::RwLock<Option<crate::ipc_pending::QuestionPendingMap>>> =
+            Arc::new(std::sync::RwLock::new(question.clone()));
+        let approval_slot: Arc<std::sync::RwLock<Option<crate::ipc_pending::ApprovalPendingMap>>> =
+            Arc::new(std::sync::RwLock::new(approval.clone()));
+        self.tui_rewire = Some(TuiRewire {
+            feedback_tx: feedback_tx.clone(),
+            wake_scheduler: wake_scheduler.clone(),
+            question_slot: Arc::clone(&question_slot),
+            approval_slot: Arc::clone(&approval_slot),
+            cancel_slot: Arc::clone(&cancel_slot),
+            inbox_slot: Arc::clone(&inbox_slot),
+            registry_slot: Arc::clone(&registry_slot),
+            bridge_task: Some(bridge),
+            spawn_task,
+        });
+
         // Answers must bypass the main `cmd_rx` loop: while `run_turn` is blocked inside
         // `ask_question`, that task never receives `TuiCmd::Submit` or `QuestionAnswer`.
         let (answer_tx, mut answer_rx) =
             tokio::sync::mpsc::unbounded_channel::<(String, QuestionSelection)>();
-        let qp_dispatch = question.clone();
+        let qp_slot = Arc::clone(&question_slot);
         tokio::spawn(async move {
             while let Some((qid, sel)) = answer_rx.recv().await {
-                let _ = dispatch_question_answer(&qp_dispatch, &qid, sel);
+                let current = qp_slot
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                let _ = dispatch_question_answer(&current, &qid, sel);
             }
         });
         let answer_for_tui = answer_tx.clone();
@@ -2035,10 +2354,21 @@ impl Repl {
         // second abort mechanism.
         let (kill_all_tx, mut kill_all_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         {
-            let registry = self.runtime.subagent_registry();
+            // m5: read the registry from the refreshable slot on EVERY
+            // request — a captured handle would keep pointing at the
+            // supervisor that `/new` already swapped away.
+            let registry_slot = Arc::clone(&registry_slot);
             let kill_fb = Arc::clone(&tui_feedback);
             tokio::spawn(async move {
                 while kill_all_rx.recv().await.is_some() {
+                    let Some(registry) = registry_slot
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone()
+                    else {
+                        kill_fb.push_error("kill-all unavailable in this mode".into());
+                        continue;
+                    };
                     let outcomes = nca_runtime::subagent_registry::cancel_all_running(
                         &registry,
                         "kill-all (Ctrl+X K)",
@@ -2080,7 +2410,7 @@ impl Repl {
 
         let (approval_tx, mut approval_rx) =
             tokio::sync::mpsc::unbounded_channel::<ApprovalAnswer>();
-        let approval_dispatch = approval.clone();
+        let ap_slot = Arc::clone(&approval_slot);
         let tui_fb = Arc::clone(&tui_feedback);
         tokio::spawn(async move {
             while let Some(answer) = approval_rx.recv().await {
@@ -2098,7 +2428,11 @@ impl Repl {
                         nca_core::approval::ApprovalVerdict::AllowPattern(pattern),
                     ),
                 };
-                if !dispatch_tool_approval(&approval_dispatch, &call_id, verdict) {
+                let current = ap_slot
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                if !dispatch_tool_approval(&current, &call_id, verdict) {
                     tui_fb.push_error(
                         "approval was no longer pending; cleared stale approval state".into(),
                     );
@@ -2107,8 +2441,6 @@ impl Repl {
         });
         let approval_for_tui = approval_tx.clone();
         drop(approval_tx);
-
-        let cancel_flag = self.runtime.cancel_handle();
 
         // Elm NcaModel params
         let skill_dirs = self.runtime.config().harness.skill_directories.clone();
@@ -2132,12 +2464,12 @@ impl Repl {
                 cmd_tx,
                 Some(answer_for_tui),
                 Some(approval_for_tui),
-                Some(cancel_flag),
+                Arc::clone(&cancel_slot),
                 Arc::clone(&active_question_id),
                 Arc::clone(&active_question_payload),
                 Arc::clone(&active_approval_payload),
                 Arc::clone(&staged_images),
-                Some(inbox_tx),
+                Arc::clone(&inbox_slot),
                 Arc::clone(&busy_flag),
                 Some(kill_all_tx),
                 params,
@@ -2344,9 +2676,28 @@ impl Repl {
                         } else {
                             match self.runtime.switch_to(&session_id).await {
                                 Ok(()) => {
+                                    // D3: `switch_to` swapped the supervisor;
+                                    // rewire the bridge + spawn consumer onto
+                                    // the new event/spawn channels before the
+                                    // replay so live and replayed events both
+                                    // land after the reset.
+                                    self.rewire_after_session_change(&ReplOutput::Tui(
+                                        tui_feedback.as_ref(),
+                                    ));
                                     let sid = self.runtime.session_id().to_string();
                                     let model = self.runtime.model().to_string();
-                                    tui_feedback.reset_session_state(sid, model);
+                                    let sessions_dir = self
+                                        .runtime
+                                        .workspace_root()
+                                        .join(&self.runtime.config().session.history_dir);
+                                    let workspace_root =
+                                        self.runtime.workspace_root().to_path_buf();
+                                    tui_feedback.reset_session_state(
+                                        sid,
+                                        model,
+                                        sessions_dir,
+                                        workspace_root,
+                                    );
                                     let log_path = self.runtime.event_log_path();
                                     replay_events_to_feedback(&log_path, &feedback_tx_clone).await;
                                     tui_feedback
@@ -2789,6 +3140,38 @@ fn build_model_picker_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runner::build_session_runtime;
+    // Crate-wide env guard (shared with `runner.rs`'s tests): two module-local
+    // mutexes do not serialize against each other, which let one module's
+    // guard drop restore `DEEPSEEK_API_KEY` to "unset" mid-session-create in
+    // the other.
+    use crate::test_env::TestEnvGuard;
+    use crate::tui::elm::feedback::TuiFeedbackMsg;
+    use nca_common::config::PermissionMode;
+
+    fn offline_rewire_config() -> nca_common::config::NcaConfig {
+        let mut config = nca_common::config::NcaConfig::default();
+        config.permissions.mode = PermissionMode::BypassPermissions;
+        config.memory.context.auto_detect_context_window = false;
+        config.memory.context.query_provider_models_api = false;
+        config.memory.context.enable_auto_summarize = false;
+        config
+    }
+
+    /// Bounded wall-clock wait until `probe` returns Some (fs visibility of
+    /// the fanout's blocking-pool appends can lag the await points).
+    async fn wait_for<T>(mut probe: impl FnMut() -> Option<T>) -> Option<T> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(v) = probe() {
+                return Some(v);
+            }
+            if std::time::Instant::now() > deadline {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
 
     /// P3 wake trigger: delivers the EXACT wake text as an ordinary
     /// Submit through the cmd queue, and tolerates a gone receiver
@@ -2809,6 +3192,404 @@ mod tests {
         // and enqueue nothing further.
         drop(cmd_rx);
         trigger(wake_text);
+    }
+
+    /// D3 acceptance: after `/new` (supervisor swap + rewire), a turn's
+    /// events land in `<sessions-dir>/<new-id>.events.jsonl` — same dir as
+    /// the session store — and the OLD log is closed out with the old
+    /// session's `SessionEnded`.
+    ///
+    /// Drives the real protocol pieces: `SessionRuntime::new_session` (the
+    /// supervisor swap) + `spawn_tui_bridge` (old + new), with the new
+    /// session's `SessionStarted` (buffered in the fresh channel at create)
+    /// standing in for turn events — the fanout path is identical.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn new_session_writes_new_log_and_closes_old() {
+        let home = tempfile::tempdir().expect("home tempdir");
+        let xdg = tempfile::tempdir().expect("xdg tempdir");
+        let _env = TestEnvGuard::set(&[
+            ("HOME", home.path().to_str().unwrap()),
+            ("XDG_CONFIG_HOME", xdg.path().to_str().unwrap()),
+            ("DEEPSEEK_API_KEY", "dummy"),
+        ]);
+        let ws = tempfile::tempdir().expect("workspace tempdir");
+
+        let mut runtime = build_session_runtime(
+            offline_rewire_config(),
+            ws.path(),
+            true,
+            false,
+            Some("rewire-new-src".into()),
+            None,
+            None,
+        )
+        .await
+        .expect("runtime builds (dummy key injected via env guard)");
+        let old_id = runtime.session_id().to_string();
+        let old_log = runtime.event_log_path();
+        assert_eq!(
+            old_log,
+            ws.path().join(".nca/sessions/rewire-new-src.events.jsonl")
+        );
+
+        // Initial wiring: bridge on the runtime's event channel.
+        let (feedback_tx, mut feedback_rx) =
+            tokio::sync::mpsc::unbounded_channel::<TuiFeedbackMsg>();
+        let rx = runtime.take_event_rx().expect("event rx");
+        let _old_bridge = spawn_tui_bridge(
+            rx,
+            old_log.clone(),
+            None,
+            None,
+            runtime.question_pending(),
+            feedback_tx.clone(),
+            runtime.take_turn_commit_tx().map(|(tx, _flag)| tx),
+            Duration::from_secs(0), // no stall watch in this test
+        );
+
+        // `/new`: supervisor swap, then the rewire protocol.
+        runtime.new_session().await.expect("new session");
+        let new_id = runtime.session_id().to_string();
+        assert_ne!(new_id, old_id, "the swap rolled the session id");
+        let new_log = runtime.event_log_path();
+        assert_eq!(
+            new_log.parent(),
+            old_log.parent(),
+            "new log lives in the same sessions dir as the store"
+        );
+
+        // Rewire: drop the old bridge handle (senders already died with the
+        // old supervisor inside `new_session`), take the fresh channels,
+        // spawn the new bridge.
+        drop(_old_bridge);
+        let new_rx = runtime.take_event_rx().expect("fresh event rx after swap");
+        let _new_bridge = spawn_tui_bridge(
+            new_rx,
+            new_log.clone(),
+            None,
+            None,
+            runtime.question_pending(),
+            feedback_tx.clone(),
+            runtime.take_turn_commit_tx().map(|(tx, _flag)| tx),
+            Duration::from_secs(0),
+        );
+
+        // New log: the fresh supervisor's SessionStarted (buffered in the
+        // channel at create time) must be drained into the NEW log by the
+        // rewired bridge.
+        let saw_new_start = wait_for(|| {
+            std::fs::read_to_string(&new_log).ok().and_then(|raw| {
+                raw.lines()
+                    .any(|l| l.contains("SessionStarted"))
+                    .then_some(())
+            })
+        })
+        .await;
+        assert!(
+            saw_new_start.is_some(),
+            "rewired bridge must write the new session's SessionStarted to {}",
+            new_log.display()
+        );
+        let raw = std::fs::read_to_string(&new_log).unwrap_or_default();
+        assert!(raw.contains(&new_id), "new log carries the new session id");
+
+        // Old log: closed out with the old session's SessionEnded (emitted
+        // by `finish` on the OLD channel before the swap; the old bridge
+        // drains it on channel close).
+        let old_ended = wait_for(|| {
+            std::fs::read_to_string(&old_log).ok().and_then(|raw| {
+                raw.lines()
+                    .any(|l| l.contains("SessionEnded"))
+                    .then_some(())
+            })
+        })
+        .await;
+        assert!(
+            old_ended.is_some(),
+            "old log must be closed out with SessionEnded: {}",
+            std::fs::read_to_string(&old_log).unwrap_or_default()
+        );
+
+        // Live continuity: events from the new supervisor reach the SAME
+        // feedback channel (the Elm side is not rebuilt).
+        if let Some(event_tx) = runtime.event_tx() {
+            event_tx
+                .send(nca_common::event::AgentEvent::TokensStreamed { delta: "x".into() })
+                .await
+                .expect("send on live channel");
+        }
+        let saw_live = wait_for(|| {
+            while let Ok(msg) = feedback_rx.try_recv() {
+                if let TuiFeedbackMsg::Agent(nca_common::event::AgentEvent::TokensStreamed {
+                    ..
+                }) = msg
+                {
+                    return Some(());
+                }
+            }
+            None
+        })
+        .await;
+        assert!(
+            saw_live.is_some(),
+            "live events flow through the rewired bridge"
+        );
+
+        runtime.finish(nca_common::event::EndReason::UserExit).await;
+    }
+
+    /// B3 / m5: the Elm model's instantaneous actions (Esc/Ctrl+C cancel,
+    /// mid-turn steering, kill-all) read refreshable SLOTS, and the rewire
+    /// protocol must repoint all three at the CURRENT supervisor after a
+    /// `/new` swap. With the old wiring-time handles, a cancel landed on the
+    /// swapped-away agent loop's flag — a long turn became uninterruptible —
+    /// steering went to a dropped inbox and kill-all to a dead registry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rewire_refreshes_cancel_inbox_and_registry_slots() {
+        let home = tempfile::tempdir().expect("home tempdir");
+        let xdg = tempfile::tempdir().expect("xdg tempdir");
+        let _env = TestEnvGuard::set(&[
+            ("HOME", home.path().to_str().unwrap()),
+            ("XDG_CONFIG_HOME", xdg.path().to_str().unwrap()),
+            ("DEEPSEEK_API_KEY", "dummy"),
+        ]);
+        let ws = tempfile::tempdir().expect("workspace tempdir");
+
+        let mut runtime = build_session_runtime(
+            offline_rewire_config(),
+            ws.path(),
+            true,
+            false,
+            Some("rewire-slots-a".into()),
+            None,
+            None,
+        )
+        .await
+        .expect("runtime builds (dummy key injected via env guard)");
+
+        let old_cancel = runtime.cancel_handle();
+        let cancel_slot: CancelFlagSlot = Arc::new(std::sync::Mutex::new(Some(old_cancel.clone())));
+        let inbox_slot: InboxSlot = Arc::new(std::sync::Mutex::new(Some(runtime.inbox_sender())));
+        let registry_slot: RegistrySlot =
+            Arc::new(std::sync::Mutex::new(Some(runtime.subagent_registry())));
+
+        let (feedback_tx, _feedback_rx) = tokio::sync::mpsc::unbounded_channel::<TuiFeedbackMsg>();
+        let mut rewire = TuiRewire {
+            feedback_tx,
+            wake_scheduler: None,
+            question_slot: Arc::new(std::sync::RwLock::new(None)),
+            approval_slot: Arc::new(std::sync::RwLock::new(None)),
+            cancel_slot: Arc::clone(&cancel_slot),
+            inbox_slot: Arc::clone(&inbox_slot),
+            registry_slot: Arc::clone(&registry_slot),
+            bridge_task: None,
+            spawn_task: None,
+        };
+        rewire.rewire(&mut runtime).expect("initial wiring");
+        {
+            let slot = cancel_slot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+                .expect("cancel slot populated by the wiring");
+            assert!(
+                Arc::ptr_eq(&slot, &old_cancel),
+                "initial wiring points the slot at the live flag"
+            );
+        }
+
+        runtime.new_session().await.expect("/new supervisor swap");
+        let new_cancel = runtime.cancel_handle();
+        assert!(
+            !Arc::ptr_eq(&old_cancel, &new_cancel),
+            "precondition: the swap replaced the agent loop's cancel flag"
+        );
+
+        rewire.rewire(&mut runtime).expect("rewire after swap");
+
+        let slot_flag = cancel_slot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .expect("cancel slot refreshed");
+        assert!(
+            Arc::ptr_eq(&slot_flag, &new_cancel),
+            "REGRESSION (B3): the cancel slot must point at the NEW supervisor's \
+             flag, or Esc/Ctrl+C cannot stop a running turn"
+        );
+        // The refreshed flag reaches the live agent loop: setting it is what
+        // the Elm model does on Esc, and the supervisor must observe it.
+        assert!(
+            !runtime
+                .cancel_handle()
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        slot_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            runtime
+                .cancel_handle()
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the slot's flag IS the running supervisor's flag"
+        );
+
+        assert!(
+            inbox_slot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_some(),
+            "steering inbox refreshed for the new supervisor"
+        );
+        assert!(
+            registry_slot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_some(),
+            "kill-all registry refreshed for the new supervisor"
+        );
+
+        // REGRESSION (M-A): the reconfigured bridge must own the SWAPPED
+        // supervisor's IPC handle. Passing `None` leaves the new socket
+        // accepted-but-unserved — `nca attach <new-id>` connects, receives
+        // no events and waits forever, and approve/deny commands queue with
+        // no consumer.
+        assert!(
+            runtime.take_ipc_handle().is_none(),
+            "M-A: the rewire must take the new IPC handle, not leave it \
+             untaken on the runtime"
+        );
+
+        runtime.finish(nca_common::event::EndReason::UserExit).await;
+    }
+
+    /// D3 acceptance: `switch_to` swaps the supervisor; the rewire protocol
+    /// keeps events flowing to the feedback channel (no undrained channel,
+    /// no stall) and the resumed session's log receives its SessionStarted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn switch_to_rewires_bridge() {
+        let home = tempfile::tempdir().expect("home tempdir");
+        let xdg = tempfile::tempdir().expect("xdg tempdir");
+        let _env = TestEnvGuard::set(&[
+            ("HOME", home.path().to_str().unwrap()),
+            ("XDG_CONFIG_HOME", xdg.path().to_str().unwrap()),
+            ("DEEPSEEK_API_KEY", "dummy"),
+        ]);
+        let ws = tempfile::tempdir().expect("workspace tempdir");
+
+        // Session A first: create + finish so its json exists on disk.
+        {
+            let mut a = build_session_runtime(
+                offline_rewire_config(),
+                ws.path(),
+                true,
+                false,
+                Some("rewire-target-a".into()),
+                None,
+                None,
+            )
+            .await
+            .expect("session A builds");
+            // Bridge A's channel so its SessionStarted/Ended are logged
+            // (otherwise the bounded channel just holds them; harmless, but
+            // log them for realism).
+            if let Some(rx) = a.take_event_rx() {
+                let _bridge = spawn_tui_bridge(
+                    rx,
+                    a.event_log_path(),
+                    None,
+                    None,
+                    None,
+                    tokio::sync::mpsc::unbounded_channel::<TuiFeedbackMsg>().0,
+                    a.take_turn_commit_tx().map(|(tx, _flag)| tx),
+                    Duration::from_secs(0),
+                );
+            }
+            a.finish(nca_common::event::EndReason::UserExit).await;
+        }
+
+        // Session B: the live one.
+        let mut runtime = build_session_runtime(
+            offline_rewire_config(),
+            ws.path(),
+            true,
+            false,
+            Some("rewire-src-b".into()),
+            None,
+            None,
+        )
+        .await
+        .expect("session B builds");
+        let (feedback_tx, mut feedback_rx) =
+            tokio::sync::mpsc::unbounded_channel::<TuiFeedbackMsg>();
+        let rx = runtime.take_event_rx().expect("event rx");
+        let _old_bridge = spawn_tui_bridge(
+            rx,
+            runtime.event_log_path(),
+            None,
+            None,
+            runtime.question_pending(),
+            feedback_tx.clone(),
+            runtime.take_turn_commit_tx().map(|(tx, _flag)| tx),
+            Duration::from_secs(0),
+        );
+
+        // switch_to: supervisor swap, then rewire.
+        runtime
+            .switch_to("rewire-target-a")
+            .await
+            .expect("switch to A");
+        assert_eq!(runtime.session_id(), "rewire-target-a");
+        drop(_old_bridge);
+        let new_rx = runtime
+            .take_event_rx()
+            .expect("fresh event rx after switch");
+        let resumed_log = runtime.event_log_path();
+        let _new_bridge = spawn_tui_bridge(
+            new_rx,
+            resumed_log.clone(),
+            None,
+            None,
+            runtime.question_pending(),
+            feedback_tx.clone(),
+            runtime.take_turn_commit_tx().map(|(tx, _flag)| tx),
+            Duration::from_secs(0),
+        );
+
+        // The resumed supervisor's SessionStarted (buffered at resume)
+        // must reach BOTH the feedback channel (live rendering) and the
+        // resumed session's log.
+        let saw_live = wait_for(|| {
+            while let Ok(msg) = feedback_rx.try_recv() {
+                if let TuiFeedbackMsg::Agent(nca_common::event::AgentEvent::SessionStarted {
+                    session_id,
+                    ..
+                }) = msg
+                    && session_id == "rewire-target-a"
+                {
+                    return Some(());
+                }
+            }
+            None
+        })
+        .await;
+        assert!(
+            saw_live.is_some(),
+            "resumed session's SessionStarted must reach the feedback channel"
+        );
+        let saw_log = wait_for(|| {
+            std::fs::read_to_string(&resumed_log).ok().and_then(|raw| {
+                raw.lines()
+                    .any(|l| l.contains("SessionStarted") && l.contains("rewire-target-a"))
+                    .then_some(())
+            })
+        })
+        .await;
+        assert!(
+            saw_log.is_some(),
+            "resumed session's log must record its SessionStarted: {}",
+            resumed_log.display()
+        );
+
+        runtime.finish(nca_common::event::EndReason::UserExit).await;
     }
 
     #[test]

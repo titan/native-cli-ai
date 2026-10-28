@@ -85,7 +85,11 @@ const BRIDGE_DRAIN_TIME_SLICE: Duration = Duration::from_millis(25);
 pub(crate) struct SideEffectChannels {
     pub question_answer_tx: Option<UnboundedSender<(String, QuestionSelection)>>,
     pub approval_answer_tx: Option<UnboundedSender<crate::tui::app::ApprovalAnswer>>,
-    pub cancel_flag: Option<Arc<AtomicBool>>,
+    /// CURRENT supervisor's cancel flag (B3). A slot, not a plain `Arc`:
+    /// the instantaneous cancels (`Esc`/`Ctrl+C`/quit) must reach the live
+    /// agent loop, and a `/new` supervisor swap replaces that flag. Written
+    /// by `TuiRewire::rewire` after every swap.
+    pub cancel_flag: Arc<StdMutex<Option<Arc<AtomicBool>>>>,
     /// Shared active question ID for synchronous reads by the runtime.
     pub active_question_id: Arc<StdMutex<Option<String>>>,
     /// Shared active question payload for answer parsing.
@@ -94,8 +98,10 @@ pub(crate) struct SideEffectChannels {
     pub active_approval_payload: Arc<StdMutex<Option<crate::tui::state::ApprovalRequest>>>,
     /// Shared staged images for synchronous reads by the runtime.
     pub staged_images: Arc<StdMutex<Vec<ImageAttachment>>>,
-    /// Agent inbox sender for mid-turn steering (clone of the runtime sender).
-    pub inbox_tx: Option<tokio::sync::mpsc::Sender<nca_core::agent_driver::InboxItem>>,
+    /// Agent inbox sender for mid-turn steering (slot: same swap-staleness
+    /// rationale as [`Self::cancel_flag`]).
+    pub inbox_tx:
+        Arc<StdMutex<Option<tokio::sync::mpsc::Sender<nca_core::agent_driver::InboxItem>>>>,
     /// Authoritative busy flag shared with the cmd_rx loop (see feedback.rs).
     pub busy_flag: Arc<AtomicBool>,
     /// Emergency kill-all trigger (T2-1, Ctrl+X K): `()` per request. The
@@ -104,6 +110,26 @@ pub(crate) struct SideEffectChannels {
     /// deliberately NOT the cmd queue, which may be blocked inside
     /// `run_turn` while runaway children need killing.
     pub kill_all_tx: Option<UnboundedSender<()>>,
+}
+
+impl SideEffectChannels {
+    /// Snapshot of the CURRENT cancel flag (`None` before the first rewire).
+    pub(crate) fn cancel_flag(&self) -> Option<Arc<AtomicBool>> {
+        self.cancel_flag
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Snapshot of the CURRENT agent-inbox sender.
+    pub(crate) fn inbox(
+        &self,
+    ) -> Option<tokio::sync::mpsc::Sender<nca_core::agent_driver::InboxItem>> {
+        self.inbox_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
 }
 
 // ── NcaModel ─────────────────────────────────────────────────────
@@ -139,8 +165,15 @@ pub(crate) struct NcaModel {
     pub(crate) queued_count: u32,
     /// Sessions dir (`<workspace>/.nca/sessions`) for the subagent view's
     /// disk-side family scan + child log reads (P2). Empty in tests that
-    /// don't care.
+    /// don't care. Refreshed by `ResetSessionState` (B2) — a supervisor swap
+    /// can move the store to a different root.
     pub(crate) sessions_dir: std::path::PathBuf,
+    /// Workspace root backing the `@`-file completion index and the status
+    /// bar's directory label. Refreshed by `ResetSessionState` alongside
+    /// `sessions_dir` (B2): after a `/new` from a worktree-grounded session
+    /// the index would otherwise keep offering files from the stale
+    /// worktree.
+    pub(crate) workspace_root: std::path::PathBuf,
     /// Current session id (family root for the subagent view).
     pub(crate) session_id: String,
     /// mtime-keyed cache of per-file family facts (Fix A): lifecycle-event
@@ -169,17 +202,19 @@ impl NcaModel {
             cmd_tx,
             side_effects,
             PathBuf::new(),
+            PathBuf::new(),
             String::new(),
         )
     }
 
-    /// Real constructor: carries the sessions dir + current session id the
-    /// subagent view needs for its disk-side family scan.
+    /// Real constructor: carries the sessions dir + workspace root + current
+    /// session id the subagent view needs for its disk-side family scan.
     pub(crate) fn new_with_session(
         bridge_rx: tokio::sync::mpsc::UnboundedReceiver<TuiFeedbackMsg>,
         cmd_tx: tokio::sync::mpsc::UnboundedSender<Msg>,
         side_effects: SideEffectChannels,
         sessions_dir: std::path::PathBuf,
+        workspace_root: std::path::PathBuf,
         session_id: String,
     ) -> Self {
         Self {
@@ -195,6 +230,7 @@ impl NcaModel {
             last_animation_draw: Instant::now(),
             queued_count: 0,
             sessions_dir,
+            workspace_root,
             session_id,
             family_cache: FamilyCache::default(),
             live_children: HashMap::new(),
@@ -891,8 +927,38 @@ impl NcaModel {
                 };
                 self.components.status_bar.set_busy(state);
             }
-            TuiFeedbackMsg::ResetSessionState { session_id, model } => {
+            TuiFeedbackMsg::ResetSessionState {
+                session_id,
+                model,
+                sessions_dir,
+                workspace_root,
+            } => {
                 self.session_id = session_id.clone();
+                // B2: the swap can move the store AND the workspace root
+                // (worktree-grounded session returning to the main repo).
+                let root_moved = workspace_root != self.workspace_root;
+                self.sessions_dir = sessions_dir;
+                self.workspace_root = workspace_root;
+                // The family cache is keyed by per-file mtime under the OLD
+                // sessions dir: entries for the old root would never be
+                // re-validated away (and the new root's files would all
+                // miss), so drop it wholesale.
+                self.family_cache = FamilyCache::default();
+                if root_moved {
+                    // `@`-file completion index is root-scoped and frozen at
+                    // wiring time; re-discover it for the new root so
+                    // mentions do not keep resolving against the old one.
+                    self.components
+                        .composer
+                        .state_mut()
+                        .load_workspace_files(&self.workspace_root);
+                    let dir_name = self
+                        .workspace_root
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| self.workspace_root.display().to_string());
+                    self.components.status_bar.update_workspace_dir(&dir_name);
+                }
                 // Session switch: drop the old session's live observations —
                 // a stale id synthesizes a bogus depth-0 row under the new
                 // family root (`merge_live_entries` keeps live ids not on
@@ -1042,7 +1108,7 @@ impl NcaModel {
         match msg {
             Msg::Quit => {
                 // Signal agent to stop so run_turn().await completes and cmd_rx can process the exit.
-                if let Some(ref flag) = self.side_effects.cancel_flag {
+                if let Some(flag) = self.side_effects.cancel_flag() {
                     flag.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
                 self.quit = true;
@@ -1050,7 +1116,7 @@ impl NcaModel {
             Msg::Cmd(cmd) => {
                 // Immediately signal the agent loop to cancel (bypasses blocked cmd_rx).
                 if matches!(cmd, TuiCmd::CancelTurn) {
-                    if let Some(ref flag) = self.side_effects.cancel_flag {
+                    if let Some(flag) = self.side_effects.cancel_flag() {
                         flag.store(true, std::sync::atomic::Ordering::SeqCst);
                     }
                 }
@@ -1118,7 +1184,7 @@ impl NcaModel {
                         .load(std::sync::atomic::Ordering::SeqCst)
                 {
                     let text = raw.clone();
-                    if let Some(ref tx) = self.side_effects.inbox_tx {
+                    if let Some(tx) = self.side_effects.inbox() {
                         match tx.try_send(nca_core::agent_driver::InboxItem::Steering { text }) {
                             Ok(()) => {
                                 self.queued_count = self.queued_count.saturating_add(1);
@@ -1389,12 +1455,12 @@ mod tests {
         let side_effects = SideEffectChannels {
             question_answer_tx: None,
             approval_answer_tx: None,
-            cancel_flag: None,
+            cancel_flag: Arc::new(StdMutex::new(None)),
             active_question_id: Arc::new(StdMutex::new(None)),
             active_question_payload: Arc::new(StdMutex::new(None)),
             active_approval_payload: Arc::new(StdMutex::new(None)),
             staged_images: Arc::new(StdMutex::new(Vec::new())),
-            inbox_tx: None,
+            inbox_tx: Arc::new(StdMutex::new(None)),
             busy_flag: Arc::new(AtomicBool::new(false)),
             kill_all_tx: None,
         };
@@ -1481,55 +1547,88 @@ mod tests {
         assert_eq!(model.components.transcript.blocks.len(), 200);
     }
 
+    // A pass is bounded by BOTH the count budget and the wall-clock slice
+    // (`BRIDGE_DRAIN_TIME_SLICE`), so on a loaded machine (parallel
+    // `cargo test --workspace`) a single pass may legitimately stop early.
+    // Pin the semantics that matter — bulk mode engages, no pass exceeds the
+    // bulk cap, and nothing is ever dropped — instead of pinning exact
+    // per-pass counts to a timing measurement.
     #[test]
     fn drain_bridge_respects_bulk_cap() {
         let (mut model, bridge_tx) = test_model();
-        for _ in 0..BRIDGE_BULK_DRAIN_BUDGET + 100 {
+        let total = BRIDGE_BULK_DRAIN_BUDGET + 100;
+        for _ in 0..total {
             bridge_tx.send(assistant_msg("m")).expect("bridge send");
         }
 
-        model.drain_bridge();
-        assert_eq!(
-            model.components.transcript.blocks.len(),
-            BRIDGE_BULK_DRAIN_BUDGET,
-            "bulk mode must stay bounded per tick"
-        );
+        let mut passes = 0usize;
+        let mut largest_pass = 0usize;
+        let mut seen = 0usize;
+        while !model.bridge_rx.is_empty() {
+            model.drain_bridge();
+            passes += 1;
+            let now = model.components.transcript.blocks.len();
+            let this_pass = now - seen;
+            assert!(
+                this_pass <= BRIDGE_BULK_DRAIN_BUDGET,
+                "bulk mode must stay bounded per tick: pass {passes} consumed {this_pass}"
+            );
+            assert!(this_pass > 0, "every pass must make progress");
+            largest_pass = largest_pass.max(this_pass);
+            seen = now;
+            assert!(passes < 10_000, "drain must terminate");
+        }
 
-        model.drain_bridge();
-        assert_eq!(
-            model.components.transcript.blocks.len(),
-            BRIDGE_BULK_DRAIN_BUDGET + 100,
-            "the remainder drains on the next tick"
+        // Bulk mode engaged: a live-slice pass can never exceed
+        // BRIDGE_DRAIN_BUDGET, so one pass above it proves the replay path.
+        assert!(
+            largest_pass > BRIDGE_DRAIN_BUDGET,
+            "a resume-replay backlog must drain in bulk mode (largest pass {largest_pass})"
         );
+        assert_eq!(seen, total, "no event may be dropped");
     }
 
     // ── Fix B: live observations survive until the view opens ─────────
 
     fn model_with_sessions_dir(dir: &std::path::Path, session_id: &str) -> NcaModel {
+        let (model, _bridge_tx) = model_with_roots(dir, dir.parent().unwrap_or(dir), session_id);
+        // The sender is dropped here: these tests drive events through the
+        // model's own APIs, not the feedback channel (a closed receiver just
+        // makes `drain_bridge` return immediately).
+        model
+    }
+
+    /// Model + live feedback sender rooted at explicit `sessions_dir` /
+    /// `workspace_root` — the shape `run_nca_model` builds, needed by tests
+    /// that push [`TuiFeedbackMsg`]s through the real drain path.
+    fn model_with_roots(
+        sessions_dir: &std::path::Path,
+        workspace_root: &std::path::Path,
+        session_id: &str,
+    ) -> (NcaModel, mpsc::UnboundedSender<TuiFeedbackMsg>) {
         let (bridge_tx, bridge_rx) = mpsc::unbounded_channel::<TuiFeedbackMsg>();
-        drop(bridge_tx); // no events sent on this bridge
         let (_cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<Msg>();
         let side_effects = SideEffectChannels {
             question_answer_tx: None,
             approval_answer_tx: None,
-            cancel_flag: None,
+            cancel_flag: Arc::new(StdMutex::new(None)),
             active_question_id: Arc::new(StdMutex::new(None)),
             active_question_payload: Arc::new(StdMutex::new(None)),
             active_approval_payload: Arc::new(StdMutex::new(None)),
             staged_images: Arc::new(StdMutex::new(Vec::new())),
-            inbox_tx: None,
+            inbox_tx: Arc::new(StdMutex::new(None)),
             busy_flag: Arc::new(AtomicBool::new(false)),
             kill_all_tx: None,
         };
-        // No events are ever sent on this bridge; dropping the sender just
-        // closes the (unused) receiver.
-        NcaModel::new_with_session(
+        let model = NcaModel::new_with_session(
             bridge_rx,
             _cmd_tx,
             side_effects,
-            dir.to_path_buf(),
+            sessions_dir.to_path_buf(),
+            workspace_root.to_path_buf(),
             session_id.to_string(),
-        )
+        );
+        (model, bridge_tx)
     }
 
     #[test]
@@ -1606,6 +1705,8 @@ mod tests {
             .send(TuiFeedbackMsg::ResetSessionState {
                 session_id: "other".into(),
                 model: "m".into(),
+                sessions_dir: std::path::PathBuf::from("/ws/.nca/sessions"),
+                workspace_root: std::path::PathBuf::from("/ws"),
             })
             .expect("send reset");
         model.drain_bridge();
@@ -1615,6 +1716,60 @@ mod tests {
             "session switch drops the old session's observations"
         );
         assert_eq!(model.session_id, "other");
+    }
+
+    // ── B2: the reset must retarget the disk scan, not just the ids ──
+
+    /// A `/new` from a worktree-grounded session moves the store AND the
+    /// workspace root back to the main repository. The Elm model is never
+    /// rebuilt, so `ResetSessionState` is the only thing that can retarget
+    /// `/jobs`' family scan, the `@`-file index and the status bar label.
+    #[test]
+    fn reset_session_state_retargets_sessions_dir_and_clears_family_cache() {
+        let old_wt = tempfile::tempdir().expect("worktree dir");
+        let new_main = tempfile::tempdir().expect("main dir");
+        let old_sessions = old_wt.path().join(".nca/sessions");
+        let new_sessions = new_main.path().join(".nca/sessions");
+        std::fs::create_dir_all(&old_sessions).expect("old sessions dir");
+        std::fs::create_dir_all(&new_sessions).expect("new sessions dir");
+        // One persisted session under the NEW root, so the post-reset scan has
+        // something to find (an empty dir would prove nothing).
+        std::fs::write(
+            new_sessions.join("child-2.json"),
+            r#"{"meta":{"id":"child-2","parent_session_id":"parent-2"}}"#,
+        )
+        .expect("seed session json");
+
+        let (mut model, bridge_tx) = model_with_roots(&old_sessions, old_wt.path(), "parent-1");
+        // Seed the mtime cache against the OLD dir so the clearing is visible.
+        let _ = build_family_index_cached(
+            &model.sessions_dir,
+            &model.session_id,
+            &HashMap::new(),
+            &mut model.family_cache,
+        );
+
+        bridge_tx
+            .send(TuiFeedbackMsg::ResetSessionState {
+                session_id: "parent-2".into(),
+                model: "m".into(),
+                sessions_dir: new_sessions.clone(),
+                workspace_root: new_main.path().to_path_buf(),
+            })
+            .expect("send reset");
+        model.drain_bridge();
+
+        assert_eq!(model.session_id, "parent-2");
+        assert_eq!(
+            model.sessions_dir, new_sessions,
+            "the family scan must read the NEW root's sessions dir"
+        );
+        assert_eq!(model.workspace_root, new_main.path());
+        assert_eq!(
+            model.family_cache.len(),
+            0,
+            "stale per-file mtime entries for the old root must be dropped"
+        );
     }
 
     // A mounted popup owns ALL keys — including the PgUp/PgDn/End keys the

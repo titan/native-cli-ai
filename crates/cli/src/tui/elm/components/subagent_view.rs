@@ -1796,7 +1796,7 @@ mod tests {
         assert!(v.partial.is_some());
 
         // Same tick: the final AND a next-stream delta land together.
-        append_line(&log, &ASSISTANT_LINE);
+        append_line(&log, ASSISTANT_LINE);
         append_line(&log, &TOKEN_DELTA("next"));
         v.on_tick_tail();
         assert!(v.partial.is_some(), "the next stream's delta re-arms");
@@ -1807,7 +1807,7 @@ mod tests {
         // Final alone (no trailing delta): the transient line disappears.
         append_line(&log, &TOKEN_DELTA("more"));
         v.on_tick_tail();
-        append_line(&log, &ASSISTANT_LINE);
+        append_line(&log, ASSISTANT_LINE);
         v.on_tick_tail();
         assert!(v.partial.is_none(), "a final with no next delta clears");
         assert!(lines_to_string(&v.reader_lines).matches("done").count() >= 2);

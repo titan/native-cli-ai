@@ -83,9 +83,18 @@ pub enum TuiFeedbackMsg {
     /// Set simple busy flag (true = show spinner in status bar).
     SetBusy(bool),
     /// Reset transcript, session id, model, and token counters (used by /new and session switch).
+    ///
+    /// `sessions_dir` / `workspace_root` carry the NEW session's roots: the
+    /// Elm model is NOT rebuilt on a supervisor swap, so a frozen
+    /// `NcaModelParams.sessions_dir` (captured at wiring, `Some`-session
+    /// worktree adoption included) would keep `/jobs` scanning the previous
+    /// root's dir — an empty family for a worktree-grounded session that just
+    /// returned to the main repository.
     ResetSessionState {
         session_id: String,
         model: String,
+        sessions_dir: std::path::PathBuf,
+        workspace_root: std::path::PathBuf,
     },
     /// Toggle onboarding mode on the TUI.
     SetOnboardingMode(bool),
@@ -150,7 +159,13 @@ pub trait TuiFeedback: Send + Sync {
     fn close_api_key_modal(&self);
     fn close_connect_modal(&self);
     fn set_busy(&self, busy: bool);
-    fn reset_session_state(&self, session_id: String, model: String);
+    fn reset_session_state(
+        &self,
+        session_id: String,
+        model: String,
+        sessions_dir: std::path::PathBuf,
+        workspace_root: std::path::PathBuf,
+    );
     fn set_onboarding_mode(&self, onboarding: bool);
     fn set_validation_status(&self, status: Option<OnboardingValidation>);
     fn set_pending_api_key_provider(&self, provider: Option<ProviderKind>);
@@ -366,10 +381,19 @@ impl TuiFeedback for TuiFeedbackChannel {
     fn set_busy(&self, busy: bool) {
         let _ = self.tx.send(TuiFeedbackMsg::SetBusy(busy));
     }
-    fn reset_session_state(&self, session_id: String, model: String) {
-        let _ = self
-            .tx
-            .send(TuiFeedbackMsg::ResetSessionState { session_id, model });
+    fn reset_session_state(
+        &self,
+        session_id: String,
+        model: String,
+        sessions_dir: std::path::PathBuf,
+        workspace_root: std::path::PathBuf,
+    ) {
+        let _ = self.tx.send(TuiFeedbackMsg::ResetSessionState {
+            session_id,
+            model,
+            sessions_dir,
+            workspace_root,
+        });
     }
     fn set_onboarding_mode(&self, onboarding: bool) {
         let _ = self.tx.send(TuiFeedbackMsg::SetOnboardingMode(onboarding));
