@@ -281,6 +281,7 @@ fn write_session_json(ws: &Path, session_id: &str, child_ids: Vec<String>) {
             session_title: None,
             orchestration: None,
             agent_name: None,
+            derived_from: None,
         },
         messages: vec![
             Message::user("persisted question"),
@@ -544,7 +545,7 @@ async fn t27_consumer_wiring_routes_child_spawn_into_parent_log() {
     let consumer = spawn_subagent_consumer(
         spawn_rx,
         "t27-parent".into(),
-        ws.path().to_path_buf(),
+        Arc::new(std::sync::RwLock::new(ws.path().to_path_buf())),
         Arc::new(std::sync::RwLock::new(config)),
         Arc::new(std::sync::Mutex::new(vec![Message::user("parent context")])),
         Some(parent_tx),

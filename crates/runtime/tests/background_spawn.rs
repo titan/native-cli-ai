@@ -182,7 +182,7 @@ fn wire_consumer(
     let _consumer = spawn_subagent_consumer(
         spawn_rx,
         "parent-1".into(),
-        ws.to_path_buf(),
+        Arc::new(std::sync::RwLock::new(ws.to_path_buf())),
         Arc::new(std::sync::RwLock::new(offline_config())),
         Arc::new(std::sync::Mutex::new(vec![Message::user("parent context")])),
         Some(event_tx),

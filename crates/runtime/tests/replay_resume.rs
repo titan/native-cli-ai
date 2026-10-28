@@ -122,6 +122,7 @@ fn write_good_json(ws: &Path, session_id: &str, messages: Vec<Message>) {
             session_title: None,
             orchestration: None,
             agent_name: None,
+            derived_from: None,
         },
         messages,
         total_input_tokens: 0,

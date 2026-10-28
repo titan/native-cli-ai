@@ -170,7 +170,7 @@ async fn s2_child_spawned_after_switch_uses_new_config() {
     let _consumer = spawn_subagent_consumer(
         spawn_rx,
         "s2-parent".into(),
-        ws.path().to_path_buf(),
+        Arc::new(std::sync::RwLock::new(ws.path().to_path_buf())),
         live,
         Arc::new(std::sync::Mutex::new(vec![Message::user("parent context")])),
         Some(event_tx),

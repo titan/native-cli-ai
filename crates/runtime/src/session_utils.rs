@@ -618,6 +618,7 @@ mod tests {
                 session_title: None,
                 orchestration: None,
                 agent_name: None,
+                derived_from: None,
             },
             messages: vec![Message::user("hello")],
             total_input_tokens: 0,

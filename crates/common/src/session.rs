@@ -52,6 +52,14 @@ pub struct SessionMeta {
     /// the current config, so profile edits take effect on resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
+    /// Session id this session was derived from via `/new`. A `/new` reset
+    /// stamps the previous session's id here so the family view (and other
+    /// lineage consumers) can walk the derivation chain: the derived
+    /// session inherits the ancestor family's children for display, even
+    /// though it records no `parent_session_id` of its own. `None` for
+    /// fresh sessions and pre-`derived_from` sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_from: Option<String>,
 }
 
 /// Full session state, including conversation history and cost tracking.
@@ -402,6 +410,7 @@ mod tests {
             spawn_reason: None,
             session_summary: None,
             session_title: None,
+            derived_from: None,
         };
         let state = super::SessionState {
             meta,
@@ -415,6 +424,71 @@ mod tests {
         assert_eq!(snapshot.agent_name.as_deref(), Some("oracle"));
         let orchestration = snapshot.orchestration.expect("orchestration mirrored");
         assert_eq!(orchestration.orchestrator.as_deref(), Some("wrapper"));
+    }
+
+    #[test]
+    fn session_meta_legacy_json_without_derived_from_deserializes() {
+        // Pre-derived_from session json: no `derived_from` field. Serde's
+        // field default must yield `None` so old sessions keep resuming
+        // (design §D2: /new derivation semantics).
+        let legacy = r#"{
+            "id": "s-legacy-df",
+            "created_at": "2026-10-27T00:00:00Z",
+            "updated_at": "2026-10-27T00:00:00Z",
+            "workspace": "/tmp/ws",
+            "model": "deepseek-chat",
+            "status": "completed",
+            "pid": null,
+            "socket_path": null
+        }"#;
+        let meta: SessionMeta = serde_json::from_str(legacy).expect("legacy meta parses");
+        assert_eq!(
+            meta.derived_from, None,
+            "missing derived_from must default to None"
+        );
+
+        // Round-trip: `None` is skipped on serialize, so new jsons written
+        // by this version still load in binaries that predate the field.
+        let serialized = serde_json::to_string(&meta).expect("serialize");
+        assert!(!serialized.contains("derived_from"));
+        let back: SessionMeta = serde_json::from_str(&serialized).expect("round-trip");
+        assert_eq!(back.derived_from, None);
+    }
+
+    #[test]
+    fn session_meta_derived_from_roundtrip_preserved() {
+        // New-format json: `derived_from` set by a `/new` reset survives a
+        // save/load cycle verbatim.
+        let now = chrono::Utc::now();
+        let meta = SessionMeta {
+            id: "s-derived".into(),
+            created_at: now,
+            updated_at: now,
+            workspace: "/tmp/ws".into(),
+            model: "deepseek-chat".into(),
+            status: crate::session::SessionStatus::Running,
+            pid: None,
+            socket_path: None,
+            agent_name: None,
+            orchestration: None,
+            worktree_path: None,
+            branch: None,
+            base_branch: None,
+            parent_session_id: None,
+            child_session_ids: Vec::new(),
+            inherited_summary: None,
+            spawn_reason: None,
+            session_summary: None,
+            session_title: None,
+            derived_from: Some("session-20261027-000001-5".into()),
+        };
+        let serialized = serde_json::to_string(&meta).expect("serialize");
+        assert!(serialized.contains("derived_from"));
+        let back: SessionMeta = serde_json::from_str(&serialized).expect("round-trip");
+        assert_eq!(
+            back.derived_from.as_deref(),
+            Some("session-20261027-000001-5")
+        );
     }
 
     #[test]
