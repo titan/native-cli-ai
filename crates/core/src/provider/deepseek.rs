@@ -71,6 +71,38 @@ mod tests {
         ]
     }
 
+    /// History with THREE assistant shapes for the presence-enforcement
+    /// matrix: (a) reasoning + tool call, (b) reasoning-less plain-text
+    /// turn, (c) reasoning-less turn WITH tool calls. Turns without
+    /// reasoning occur in real histories: the model skipped thinking that
+    /// turn, middleware synthesized the turn, or a pre-failover provider
+    /// produced it (and DeepSeek itself emits zero-reasoning turns —
+    /// bifrost#7213 class), so even a pure-DeepSeek session hits this.
+    fn mixed_reasoning_history() -> Vec<Message> {
+        let mut with_reasoning_and_call =
+            Message::assistant("response").with_reasoning("chain A".into());
+        with_reasoning_and_call.tool_calls = Some(vec![nca_common::message::MessageToolCall {
+            id: "call_1".into(),
+            name: "lookup".into(),
+            arguments: json!({}),
+        }]);
+        let mut call_without_reasoning = Message::assistant("");
+        call_without_reasoning.tool_calls = Some(vec![nca_common::message::MessageToolCall {
+            id: "call_2".into(),
+            name: "lookup".into(),
+            arguments: json!({}),
+        }]);
+        vec![
+            Message::user("hello"),
+            with_reasoning_and_call,
+            Message::tool("call_1", "result"),
+            Message::assistant("plain turn without reasoning"),
+            call_without_reasoning,
+            Message::tool("call_2", "result"),
+            Message::user("continue"),
+        ]
+    }
+
     fn build_provider(config: &NcaConfig) -> OpenAiCompatProvider {
         OpenAiCompatProvider::from_config(
             &config.provider.deepseek,
@@ -107,6 +139,46 @@ mod tests {
                 assert!(
                     assistant.get("reasoning_content").is_none(),
                     "no-tools request must omit reasoning_content (ignored server-side; stripped to save context): {assistant}"
+                );
+            }
+        }
+        parsed
+    }
+
+    /// Assert the three assistant shapes of [`mixed_reasoning_history`] on
+    /// the wire. With `expect_keep` (tools request): EVERY assistant carries
+    /// the `reasoning_content` key — verbatim where reasoning exists,
+    /// backfilled `""` where it does not (DeepSeek's enforcement keys on
+    /// field PRESENCE, not content; measured 2026-10: `""` → 200, omit →
+    /// 400 — bifrost#7910, codex-relay#71). Otherwise: no assistant carries
+    /// the field at all (unchanged strip-for-context behavior).
+    fn assert_wire_reasoning_presence(request_body: &str, expect_keep: bool) -> Value {
+        let parsed: Value = serde_json::from_str(request_body).expect("request body is JSON");
+        let assistants: Vec<&Value> = parsed["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .filter(|m| m["role"] == "assistant")
+            .collect();
+        assert_eq!(assistants.len(), 3, "body: {request_body}");
+        for (index, assistant) in assistants.iter().enumerate() {
+            let expected = match index {
+                0 => "chain A", // turn with real reasoning → verbatim
+                1 | 2 => "",    // reasoning-less turns → empty-string backfill
+                _ => unreachable!("asserted len 3 above"),
+            };
+            if expect_keep {
+                let text = assistant["reasoning_content"].as_str().unwrap_or_else(|| {
+                    panic!("reasoning_content key must exist on EVERY assistant turn (presence enforcement): {assistant}")
+                });
+                assert_eq!(
+                    text, expected,
+                    "assistant[{index}] reasoning must be verbatim-or-empty, never a placeholder: {assistant}"
+                );
+            } else {
+                assert!(
+                    assistant.get("reasoning_content").is_none(),
+                    "no-tools request must omit reasoning_content entirely (ignored server-side; stripped to save context): {assistant}"
                 );
             }
         }
@@ -240,6 +312,60 @@ mod tests {
         assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
     }
 
+    // ---- presence enforcement: reasoning-less turns are backfilled "" ----
+    //
+    // The 400 "The `reasoning_content` in the thinking mode must be passed
+    // back to the API" keys on the field being ABSENT, not on its content.
+    // Any history containing an assistant turn without reasoning (model
+    // skipped thinking, synthesized turn, pre-failover provider output)
+    // used to trigger it. The fix backfills `""` for those turns on the
+    // tools-gated keep branch — zero tokens, no chain-of-thought pollution.
+
+    #[tokio::test]
+    async fn tools_request_backfills_missing_reasoning_as_empty_string() {
+        let base_url = spawn_sse_server_with_body(sse_ok(), 200, |_request, request_body| {
+            let parsed = assert_wire_reasoning_presence(request_body, true);
+            assert!(
+                parsed["tools"].as_array().is_some_and(|t| !t.is_empty()),
+                "body: {request_body}"
+            );
+        });
+        let mut config = NcaConfig::default();
+        config.provider.deepseek.api_key = Some("deepseek-test-key".into());
+        config.provider.deepseek.base_url = base_url;
+        config.provider.deepseek.model = "deepseek-flash".into();
+
+        let provider = build_provider(&config);
+        let history = mixed_reasoning_history();
+        let stream = provider
+            .chat(&history, &[lookup_tool()], "", Path::new("."))
+            .await
+            .expect("chat stream");
+        let chunks = collect_chunks(stream).await;
+        assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
+    }
+
+    #[tokio::test]
+    async fn no_tools_request_omits_backfill_entirely() {
+        let base_url = spawn_sse_server_with_body(sse_ok(), 200, |_request, request_body| {
+            let parsed = assert_wire_reasoning_presence(request_body, false);
+            assert!(parsed.get("tools").is_none(), "body: {request_body}");
+        });
+        let mut config = NcaConfig::default();
+        config.provider.deepseek.api_key = Some("deepseek-test-key".into());
+        config.provider.deepseek.base_url = base_url;
+        config.provider.deepseek.model = "deepseek-flash".into();
+
+        let provider = build_provider(&config);
+        let history = mixed_reasoning_history();
+        let stream = provider
+            .chat(&history, &[], "", Path::new("."))
+            .await
+            .expect("chat stream");
+        let chunks = collect_chunks(stream).await;
+        assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
+    }
+
     // ---- streaming sanity (unchanged wire path) ---------------------------
 
     #[tokio::test]
@@ -348,6 +474,43 @@ mod tests {
         let provider = build_provider(&config);
         let snapshot = crate::cache_keepalive::KeepaliveSnapshot {
             messages: tool_loop_history(),
+            tools: vec![lookup_tool()],
+            model: "deepseek-flash".into(),
+            workspace_root: std::path::PathBuf::from("."),
+        };
+        let usage = provider
+            .keepalive_ping(&snapshot)
+            .await
+            .expect("keepalive ping");
+        assert_eq!(usage.input_tokens, 100);
+    }
+
+    // The presence-enforcement backfill must reach the keepalive path too:
+    // chat() and keepalive_ping() share `openai_request_body_with` +
+    // `resolve_wire_reasoning`, so a tools-bearing snapshot containing
+    // reasoning-less turns warms the exact prefix chat() would send —
+    // `""` backfills included. A drift here would silently degrade the
+    // cache hit rate (warmed prefix ≠ real request bytes).
+    #[tokio::test]
+    async fn deepseek_keepalive_backfills_empty_reasoning_like_chat() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":1}}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .to_string();
+        let base_url = spawn_sse_server_with_body(body, 200, |_request, request_body| {
+            assert_wire_reasoning_presence(request_body, true);
+        });
+
+        let mut config = NcaConfig::default();
+        config.provider.deepseek.api_key = Some("deepseek-test-key".into());
+        config.provider.deepseek.base_url = base_url;
+        config.provider.deepseek.model = "deepseek-flash".into();
+
+        let provider = build_provider(&config);
+        let snapshot = crate::cache_keepalive::KeepaliveSnapshot {
+            messages: mixed_reasoning_history(),
             tools: vec![lookup_tool()],
             model: "deepseek-flash".into(),
             workspace_root: std::path::PathBuf::from("."),

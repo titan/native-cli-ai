@@ -653,10 +653,24 @@ fn to_openai_messages_with(
                     },
                 });
 
-                if let Some(reasoning_text) = &message.reasoning_content
-                    && reasoning.keep()
+                // Wire contract for `reasoning_content` on the keep
+                // branch: `Some` turns are written verbatim. When the keep
+                // was resolved from a presence-enforcing policy (DeepSeek
+                // tools-mode — `keep_empty_as_present`), a turn with NO
+                // reasoning is backfilled as `""`: the enforcement checks
+                // the key's EXISTENCE, not its content (measured 2026-10:
+                // `""` → 200, omission → 400 — bifrost#7910,
+                // codex-relay#71), and `""` is token-free and neutral.
+                // Placeholder text is forbidden: the official docs state
+                // the value "will be concatenated into the context", so a
+                // placeholder would be spliced into the model's own
+                // chain-of-thought. Plain Keep keeps its historical
+                // omit-when-absent behavior (byte-identical to before).
+                if reasoning.keep()
+                    && (message.reasoning_content.is_some() || reasoning.keep_empty_as_present())
                 {
-                    value["reasoning_content"] = json!(reasoning_text);
+                    value["reasoning_content"] =
+                        json!(message.reasoning_content.as_deref().unwrap_or(""));
                 }
 
                 if let Some(calls) = &message.tool_calls {
@@ -712,6 +726,13 @@ pub enum ReasoningWirePolicy {
     /// the API." Without `tools`, the field is ignored server-side, so it
     /// is stripped to save context.
     ///
+    /// Presence enforcement (researched 2026-10-28): the 400 keys on the
+    /// field's ABSENCE, not its content. Assistant turns with NO reasoning
+    /// (the model did not think that turn, the turn was synthesized, or it
+    /// was produced by another provider before a failover switch — DeepSeek
+    /// itself also emits zero-reasoning turns) are backfilled with `""`
+    /// rather than omitted; see [`ReasoningOnWire::keep_empty_as_present`].
+    ///
     /// Deliberately independent of the model name and the `thinking` field:
     /// the legacy aliases `deepseek-chat`/`deepseek-reasoner` were
     /// decommissioned 2026-07-24 and the current models
@@ -738,7 +759,7 @@ impl ReasoningWirePolicy {
             ReasoningWirePolicy::Strip => ReasoningOnWire::Strip,
             ReasoningWirePolicy::ToolsGated => {
                 if tools_nonempty {
-                    ReasoningOnWire::Keep
+                    ReasoningOnWire::KeepRequired
                 } else {
                     ReasoningOnWire::Strip
                 }
@@ -760,10 +781,17 @@ impl ReasoningWirePolicy {
 /// [`ReasoningWirePolicy`]; see `OpenAiCompatProvider::resolve_wire_reasoning`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReasoningOnWire {
-    /// Serialize `reasoning_content` as-is. Some providers require the
-    /// pass-back (DeepSeek tools-mode, MiMo thinking-on); OpenAI-compat
-    /// default.
+    /// Serialize `reasoning_content` as-is, omitting the field for turns
+    /// that have none. OpenAI-compat default (OpenAI, OpenRouter, MiMo
+    /// thinking-on); the field is never REQUIRED to be present there.
     Keep,
+    /// Keep, with field-PRESENCE enforcement: every assistant message in
+    /// the body must carry the `reasoning_content` key, so a turn with no
+    /// reasoning is backfilled as `""` (see
+    /// [`ReasoningOnWire::keep_empty_as_present`]). Resolved only from
+    /// [`ReasoningWirePolicy::ToolsGated`] with `tools` present — DeepSeek
+    /// tools-mode, whose 400 keys on the field being absent.
+    KeepRequired,
     /// Omit the field on the wire. Output-only providers (ZhipuAI GLM)
     /// reject the echoed field with a 400; context savings elsewhere.
     Strip,
@@ -772,7 +800,29 @@ pub(crate) enum ReasoningOnWire {
 impl ReasoningOnWire {
     /// Whether the wire body should carry `reasoning_content`.
     pub(crate) fn keep(self) -> bool {
-        matches!(self, ReasoningOnWire::Keep)
+        matches!(self, ReasoningOnWire::Keep | ReasoningOnWire::KeepRequired)
+    }
+
+    /// Whether a missing `reasoning_content` must still be written as an
+    /// empty string — i.e. the contract enforces the field's PRESENCE, not
+    /// its content. True only for keeps resolved from
+    /// [`ReasoningWirePolicy::ToolsGated`] (DeepSeek tools-mode); plain
+    /// [`ReasoningOnWire::Keep`] keeps its historical behavior of omitting
+    /// the field for turns without reasoning.
+    ///
+    /// Evidence (researched 2026-10-28): DeepSeek's 400 — "The
+    /// `reasoning_content` in the thinking mode must be passed back to the
+    /// API" — is triggered by the key being ABSENT, not by an empty value.
+    /// Two independent field measurements sent otherwise identical bodies
+    /// and got `reasoning_content: ""` → 200 vs omission → 400
+    /// (bifrost#7910; codex-relay#71). `""` costs zero tokens and is
+    /// semantically neutral; placeholder text is actively harmful — the
+    /// official docs state that in tools mode the value "will be
+    /// concatenated into the context", so any placeholder would be spliced
+    /// into the model's own chain-of-thought. Placeholders are therefore
+    /// forbidden; the backfill value is exactly `""`.
+    pub(crate) fn keep_empty_as_present(self) -> bool {
+        matches!(self, ReasoningOnWire::KeepRequired)
     }
 }
 
@@ -1221,6 +1271,33 @@ mod tests {
             "I was thinking..."
         );
         assert_eq!(assistant["content"], "response");
+    }
+
+    // Plain Keep (OpenAI/OpenRouter default — NOT the ToolsGated-resolved
+    // keep) omits the field for turns without reasoning: there is no
+    // presence-enforcement contract there, so the `""` backfill would change
+    // historically-sent bytes for no benefit. `keep_empty_as_present` is
+    // what gates the backfill, and it is false for Keep.
+    #[test]
+    fn plain_keep_omits_reasoning_content_for_reasoning_less_turns() {
+        let messages = vec![
+            Message::user("hello"),
+            Message::assistant("thought about it").with_reasoning("thinking".into()),
+            Message::assistant("no thinking this turn"),
+            Message::user("continue"),
+        ];
+
+        let out = to_openai_messages(&messages, std::path::Path::new(".")).expect("messages");
+        assert_eq!(
+            out[1]["reasoning_content"].as_str(),
+            Some("thinking"),
+            "Some turns stay verbatim under Keep"
+        );
+        assert!(
+            out[2].get("reasoning_content").is_none(),
+            "None turns must stay OMITTED under plain Keep (no backfill — that is ToolsGated-only): {}",
+            out[2]
+        );
     }
 
     #[test]

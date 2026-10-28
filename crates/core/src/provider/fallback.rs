@@ -2146,6 +2146,14 @@ mod tests {
     // a no-op), each chain entry serializes the SAME original history under
     // its OWN policy. This test pins that end-to-end against real
     // OpenAiCompatProviders built by the factory over mock HTTP servers.
+    //
+    // The history deliberately mixes BOTH assistant shapes: a turn WITH
+    // reasoning and a turn WITHOUT (the no-reasoning turn is the GLM→DeepSeek
+    // incident shape this pair of tasks fixes — GLM-produced turns carry no
+    // `reasoning_content` at all, and DeepSeek's tools-mode 400 keys on the
+    // field's ABSENCE, not its content). GLM must still send NEITHER field
+    // (strip, byte-for-byte unchanged); DeepSeek must send BOTH — the
+    // reasoning turn verbatim, the reasoning-less turn backfilled "".
     #[tokio::test]
     async fn fallback_switch_serializes_under_target_policy_not_primary() {
         use crate::provider::factory::build_provider_for;
@@ -2170,9 +2178,10 @@ mod tests {
                 "GLM (Strip) request must not echo reasoning_content: {request_body}"
             );
         });
-        // Target (DeepSeek, ToolsGated): assert ON the request body that the
-        // assistant reasoning_content IS present — the pass-back the tools
-        // contract demands.
+        // Target (DeepSeek, ToolsGated): assert ON the request body that
+        // EVERY assistant carries the `reasoning_content` key — verbatim
+        // where reasoning exists, `""` backfilled where it does not (the
+        // presence-enforcement contract: `""` → 200, omission → 400).
         let deepseek_url = spawn_sse_server_with_body(sse_ok(), 200, |_request, request_body| {
             let parsed: serde_json::Value =
                 serde_json::from_str(request_body).expect("deepseek body is JSON");
@@ -2182,13 +2191,24 @@ mod tests {
                 .iter()
                 .filter(|m| m["role"] == "assistant")
                 .collect();
-            assert!(!assistants.is_empty());
-            assert!(
-                assistants.iter().all(|m| m
-                    .get("reasoning_content")
-                    .is_some_and(|r| r.as_str() == Some("survivor reasoning"))),
-                "DeepSeek failover target must receive reasoning_content under its own ToolsGated policy \
-                 (omitting it is the 400: 'The `reasoning_content` in the thinking mode must be passed back to the API.'): {request_body}"
+            assert_eq!(
+                assistants.len(),
+                2,
+                "history carries one reasoning turn and one reasoning-less turn: {request_body}"
+            );
+            // Turn WITH reasoning → verbatim pass-back.
+            assert_eq!(
+                assistants[0]["reasoning_content"].as_str(),
+                Some("survivor reasoning"),
+                "DeepSeek failover target must receive reasoning_content verbatim under its own ToolsGated policy: {request_body}"
+            );
+            // Turn WITHOUT reasoning → empty-string backfill, never omission
+            // (the 400) and never a placeholder (would be spliced into the
+            // model's chain-of-thought per the official docs).
+            assert_eq!(
+                assistants[1]["reasoning_content"].as_str(),
+                Some(""),
+                "reasoning-less turn must be backfilled as \"\" — DeepSeek's enforcement keys on field PRESENCE, not content (omitting it is the 400: 'The `reasoning_content` in the thinking mode must be passed back to the API.'): {request_body}"
             );
         });
 
@@ -2218,7 +2238,10 @@ mod tests {
         );
 
         // Mirror the driver contract: history still carrying reasoning (the
-        // session source of truth), a tools-bearing request.
+        // session source of truth), a tools-bearing request. Two assistant
+        // turns: one with reasoning + tool call, one reasoning-less with a
+        // tool call (the GLM-produced shape — GLM never emits
+        // reasoning_content, so its turns arrive as None).
         let mut assistant =
             Message::assistant("prior turn").with_reasoning("survivor reasoning".into());
         assistant.tool_calls = Some(vec![nca_common::message::MessageToolCall {
@@ -2226,10 +2249,18 @@ mod tests {
             name: "lookup".into(),
             arguments: serde_json::json!({}),
         }]);
+        let mut reasoning_less = Message::assistant("");
+        reasoning_less.tool_calls = Some(vec![nca_common::message::MessageToolCall {
+            id: "call_2".into(),
+            name: "lookup".into(),
+            arguments: serde_json::json!({}),
+        }]);
         let history = vec![
             Message::user("hello"),
             assistant,
             Message::tool("call_1", "result"),
+            reasoning_less,
+            Message::tool("call_2", "result"),
             Message::user("continue"),
         ];
         // The driver calls prepare on a CLONE now, but even the legacy
