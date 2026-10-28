@@ -1263,11 +1263,17 @@ fn panic_message(join: tokio::task::JoinError) -> String {
 /// born after an in-session `/model`, `/provider`, or agent switch inherit
 /// the new routing. The supervisor refreshes the handle after every
 /// successful `apply_agent_profile` / `apply_nca_config`.
+///
+/// `workspace_root` is likewise a LIVE handle (see
+/// [`Supervisor::workspace_root_handle`]): the consumer reads the current
+/// root at each spawn, so children born after a `/new` reset (D1) or a
+/// worktree switch are rooted where the session lives now — not where the
+/// consumer was wired.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_subagent_consumer(
     mut spawn_rx: mpsc::Receiver<SpawnRequest>,
     parent_session_id: String,
-    workspace_root: PathBuf,
+    workspace_root: Arc<std::sync::RwLock<PathBuf>>,
     config: Arc<std::sync::RwLock<NcaConfig>>,
     parent_history: Arc<Mutex<Vec<nca_common::message::Message>>>,
     event_tx: Option<tokio::sync::mpsc::Sender<AgentEvent>>,
@@ -1306,7 +1312,12 @@ pub fn spawn_subagent_consumer(
         );
         while let Some(req) = spawn_rx.recv().await {
             let parent_session_id = parent_session_id.clone();
-            let workspace_root = workspace_root.clone();
+            // Live workspace root (D1b): read at spawn time so a `/new`
+            // reset or worktree switch re-roots future children.
+            let workspace_root = workspace_root
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
             // Snapshot the CURRENT config (read-clone-release — the guard
             // never crosses an await) so a child spawned after an in-session
             // `/model`, `/provider`, or agent switch inherits the new

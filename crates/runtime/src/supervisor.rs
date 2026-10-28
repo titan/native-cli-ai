@@ -92,6 +92,21 @@ pub struct Supervisor {
     pub(crate) worktree_path: Option<PathBuf>,
     pub(crate) branch: Option<String>,
     pub(crate) base_branch: Option<String>,
+    /// The workspace root the process launched with (CLI startup root),
+    /// captured once at `create` and NEVER updated by `switch_to_worktree`
+    /// or resume-time worktree adoption. `reset_for_new_session` uses it to
+    /// restore `workspace_root`/fs/pty roots when a worktree-grounded
+    /// session starts a fresh `/new` session, so the new session (and its
+    /// store) live in the main repository again instead of a stale nested
+    /// worktree.
+    main_workspace_root: PathBuf,
+    /// Live workspace-root handle shared with the subagent spawn consumer
+    /// (same pattern as `live_config`): the consumer reads the CURRENT value
+    /// at each spawn instead of a wiring-time clone, so children spawned
+    /// after a `/new` reset (or a worktree switch) are rooted where the
+    /// session lives now. Written at `create`, `switch_to_worktree`,
+    /// resume-time adoption, and `reset_for_new_session`.
+    workspace_root_handle: Arc<std::sync::RwLock<PathBuf>>,
     parent_session_id: Option<String>,
     child_session_ids: Vec<String>,
     inherited_summary: Option<String>,
@@ -119,6 +134,10 @@ pub struct Supervisor {
     /// Recorded verbatim, even when the name no longer resolves (resume then
     /// warns and falls back to the default harness prompt).
     active_agent_name: Option<String>,
+    /// Session id this session was derived from via `/new` (see
+    /// [`SessionMeta::derived_from`]). Stamped by `reset_for_new_session`,
+    /// restored at resume, cleared only by a fresh `create`.
+    derived_from: Option<String>,
     hooks: Option<HookRunner>,
     plugins: Arc<PluginRegistry>,
     #[allow(dead_code)] // retained for RAII — drop cleans up child plugin processes.
@@ -1118,7 +1137,7 @@ impl Supervisor {
 
         let sup = Self {
             session_id,
-            workspace_root,
+            workspace_root: workspace_root.clone(),
             model: config.model.default_model.clone(),
             created_at,
             status: SessionStatus::Running,
@@ -1136,6 +1155,8 @@ impl Supervisor {
             worktree_path: None,
             branch: None,
             base_branch: None,
+            main_workspace_root: workspace_root.clone(),
+            workspace_root_handle: Arc::new(std::sync::RwLock::new(workspace_root.clone())),
             parent_session_id: None,
             child_session_ids: Vec::new(),
             inherited_summary: None,
@@ -1148,6 +1169,7 @@ impl Supervisor {
             sandbox_override: None,
             agent_profile,
             active_agent_name: requested_agent_name,
+            derived_from: None,
             hooks: hook_runner,
             plugins: Arc::new(plugins),
             plugin_host,
@@ -1222,8 +1244,29 @@ impl Supervisor {
 
         if let Some(loaded) = loaded.as_ref() {
             sup.session_id = loaded.meta.id.clone();
-            sup.workspace_root =
+            let resolved_root =
                 resolve_resume_workspace_root(&sup.workspace_root, &loaded.meta.workspace);
+            // When the adopted root differs from the create-time root (a
+            // worktree-grounded session resumed from the main repo), the fs
+            // and PTY roots must follow — same contract as
+            // `switch_to_worktree`. `resolve_resume_workspace_root` only
+            // adopts a differing stored path when it still exists, so
+            // `set_root` canonicalization cannot fail on an adopted path;
+            // a failure is still tolerated (warn) rather than failing the
+            // resume.
+            if resolved_root != sup.workspace_root {
+                if let Err(e) = sup.fs.set_root(resolved_root.clone()) {
+                    tracing::warn!(
+                        "resume: fs root adoption to {} failed: {e}",
+                        resolved_root.display()
+                    );
+                }
+                sup.pty.set_root(&resolved_root);
+                *sup.workspace_root_handle
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = resolved_root.clone();
+            }
+            sup.workspace_root = resolved_root;
             sup.model = loaded.meta.model.clone();
             sup.agent.model = loaded.meta.model.clone();
             sup.created_at = loaded.meta.created_at;
@@ -1238,6 +1281,7 @@ impl Supervisor {
             sup.session_summary = loaded.meta.session_summary.clone();
             sup.session_title = loaded.meta.session_title.clone();
             sup.orchestration = loaded.meta.orchestration.clone();
+            sup.derived_from = loaded.meta.derived_from.clone();
             sup.context_manager = Self::make_context_manager(&sup.config, &sup.model).await;
             // Recover the last AI summary text so fallback compactions after
             // resume still anchor on it. Best-effort scan of the persisted
@@ -1506,6 +1550,23 @@ impl Supervisor {
     /// (never hold the guard across an await).
     pub fn live_config(&self) -> Arc<std::sync::RwLock<NcaConfig>> {
         Arc::clone(&self.live_config)
+    }
+
+    /// Live workspace-root handle for the subagent spawn consumer (see the
+    /// `workspace_root_handle` field docs): reads at spawn time always see
+    /// the CURRENT root, so children spawned after a `/new` reset or a
+    /// worktree switch are rooted where the session lives now, not where
+    /// the consumer was wired.
+    pub fn workspace_root_handle(&self) -> Arc<std::sync::RwLock<PathBuf>> {
+        Arc::clone(&self.workspace_root_handle)
+    }
+
+    /// The workspace root the process launched with — the reset target for
+    /// [`Self::reset_for_new_session`] when a worktree-grounded session
+    /// starts fresh. Differs from [`Self::workspace_root`] only while the
+    /// session runs inside a worktree.
+    pub fn main_workspace_root(&self) -> &Path {
+        &self.main_workspace_root
     }
 
     /// Live escaped-provider handle for the subagent spawn consumer:
@@ -2231,6 +2292,7 @@ impl Supervisor {
                 session_title: self.session_title.clone(),
                 orchestration: self.orchestration.clone(),
                 agent_name: self.active_agent_name.clone(),
+                derived_from: self.derived_from.clone(),
             },
             messages: self.agent.messages.clone(),
             total_input_tokens: self.agent.cost_tracker.input_tokens,
@@ -2685,8 +2747,55 @@ impl Supervisor {
     }
 
     /// Reset for a fresh session: new ID, rebuild system prompt, clear lineage and cost.
+    ///
+    /// **Not the production `/new` path.** The shipped binary's `/new`
+    /// swaps in a brand-new supervisor
+    /// ([`nca_cli`-side `SessionRuntime::new_session`] → `Supervisor::create`),
+    /// which is what makes the CLI's event-bridge rewire protocol possible
+    /// (the old fanout must observe all-senders-dropped so its log rolls).
+    /// This in-place reset only exists for tests and embedders that drive a
+    /// supervisor directly without the CLI wiring; calling it does NOT
+    /// roll the event-log writer.
+    ///
+    /// Worktree grounding (D1): when the live root has drifted away from
+    /// [`Self::main_workspace_root`] (whether via `switch_to_worktree` or
+    /// resume-time adoption of a stored worktree root — including a session
+    /// whose `worktree_path` metadata is missing but whose root already
+    /// points into a worktree), the reset restores
+    /// `workspace_root`/fs/pty roots to [`Self::main_workspace_root`] and
+    /// clears `worktree_path`/`branch`/`base_branch`, so the new session's
+    /// store, event log, and spawned children all live in the main
+    /// repository again. A missing worktree directory is tolerated
+    /// (`fs::set_root` warns; the reset still completes — file operations
+    /// against a stale fs root fail loudly instead of silently writing
+    /// somewhere wrong).
     pub fn reset_for_new_session(&mut self) {
+        let prev_id = self.session_id.clone();
         self.session_id = generate_session_id();
+        self.derived_from = Some(prev_id);
+
+        // D1: reset worktree grounding so the fresh session starts in the
+        // main workspace (store + fs + pty all agree on one root). The
+        // criterion is root drift, not `worktree_path.is_some()`: a
+        // resumed session can carry a worktree root with no worktree
+        // metadata (older jsons, hand-edited sessions) and would otherwise
+        // keep writing under the stale root.
+        if self.workspace_root != self.main_workspace_root {
+            let target = self.main_workspace_root.clone();
+            self.worktree_path = None;
+            self.branch = None;
+            self.base_branch = None;
+            if let Err(e) = self.fs.set_root(target.clone()) {
+                tracing::warn!("reset: fs root restore to {} failed: {e}", target.display());
+            }
+            self.pty.set_root(&target);
+            self.workspace_root = target.clone();
+            *self
+                .workspace_root_handle
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = target;
+        }
+
         self.agent.messages.clear();
         self.rebuild_system_prompt();
         // Fresh session = fresh tool-call escalation state. This loop instance
@@ -2727,6 +2836,26 @@ impl Supervisor {
     /// Borrow the supervisor's merged config (includes OMO agents registered at startup).
     pub fn config(&self) -> &NcaConfig {
         &self.config
+    }
+
+    /// Borrow the config WITHOUT agent-profile overrides applied.
+    ///
+    /// [`Self::config`] is the *effective* config: once a specialist persona
+    /// is active it already carries that profile's provider/model pins. Using
+    /// it as the base for a NEW supervisor would bake those pins in, so two
+    /// consecutive `/new` swaps would stack them. The CLI's `/new` swap passes
+    /// THIS snapshot plus the active agent name, letting `create` re-apply the
+    /// profile overrides exactly as a fresh start would.
+    pub fn base_config(&self) -> &NcaConfig {
+        &self.base_config
+    }
+
+    /// External orchestration metadata this session was created/resumed with
+    /// (`NCA_ORCH_*`), if any. Read by the CLI's `/new` supervisor swap so the
+    /// fresh session keeps the same headless-orchestrator identity instead of
+    /// silently dropping out of its run.
+    pub fn orchestration_context(&self) -> Option<OrchestrationContext> {
+        self.orchestration.clone()
     }
 
     /// Mutable access to the live config, so CLI edits (e.g. `/set-editor`)
@@ -2846,6 +2975,27 @@ impl Supervisor {
         self.refresh_live_config();
     }
 
+    /// Current session-level sandbox override (`/sandbox`), if any.
+    /// `None` = following the configured mode. Read by the CLI's `/new`
+    /// supervisor swap so the fresh session keeps the same override.
+    pub fn sandbox_override(&self) -> Option<SandboxMode> {
+        self.sandbox_override
+    }
+
+    /// Name of the active agent profile (`[agents.<name>]` key or
+    /// skill-discovered name), if any. Read by the CLI's `/new` supervisor
+    /// swap so the fresh session keeps the same persona.
+    pub fn active_agent_name(&self) -> Option<&str> {
+        self.active_agent_name.as_deref()
+    }
+
+    /// Stamp the derivation ancestor (D2): the session this one was
+    /// derived from via `/new`. Called by the CLI's `/new` supervisor swap
+    /// after `create` (a fresh `create` has no derivation); persisted with
+    /// the next save.
+    pub fn set_derived_from(&mut self, prev_id: String) {
+        self.derived_from = Some(prev_id);
+    }
     /// Live sandbox state for `/sandbox status` and `/config` (see
     /// [`SandboxStatus`]).
     pub fn sandbox_status(&self) -> SandboxStatus {
@@ -3103,8 +3253,14 @@ impl Supervisor {
         // inside the worktree directory.
         self.pty.set_root(&worktree_path);
 
-        // Update the supervisor's own record of the workspace root.
-        self.workspace_root = worktree_path;
+        // Update the supervisor's own record of the workspace root and the
+        // live handle shared with the spawn consumer (children spawned from
+        // now on are rooted in the worktree).
+        self.workspace_root = worktree_path.clone();
+        *self
+            .workspace_root_handle
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = worktree_path;
     }
 
     pub fn set_parent(
@@ -3326,8 +3482,12 @@ mod tests {
     use nca_common::session::ChildSessionState;
 
     /// Offline default config for supervisor construction in tests (mirrors
-    /// the integration suites' `offline_config`).
-    async fn offline_supervisor(root: &Path) -> Supervisor {
+    /// the integration suites' `offline_config`). `session_id` is
+    /// caller-supplied: `Supervisor::create` binds an IPC socket named
+    /// after the id, so concurrent tests MUST use distinct ids (the shared
+    /// `SUPERVISOR_CREATE_LOCK` only serializes SOME helpers — this one is
+    /// lock-free).
+    async fn offline_supervisor_with_id(root: &Path, session_id: &str) -> Supervisor {
         let mut config = NcaConfig::default();
         config.provider.deepseek.api_key = Some("test-key".into());
         config.permissions.mode = nca_common::config::PermissionMode::BypassPermissions;
@@ -3339,7 +3499,7 @@ mod tests {
             workspace_root: root.to_path_buf(),
             safe_mode: false,
             interactive_approvals: false,
-            session_id: Some("pin-resume-worktree".into()),
+            session_id: Some(session_id.into()),
             approval_handler: None,
             orchestration_context: None,
             agent_name: None,
@@ -3349,27 +3509,35 @@ mod tests {
         .expect("offline supervisor")
     }
 
-    /// P2 C2 finding, pinned: `Supervisor::resume` restores the worktree
-    /// FIELDS (`workspace_root`/`worktree_path`/`branch`/`base_branch` from
-    /// the child's own meta) but does NOT re-root the filesystem adapter or
-    /// PTY manager — `fs.root()` stays the caller's root until an explicit
-    /// `switch_to_worktree`. Any revive-style resume MUST therefore call
-    /// `switch_to_worktree` explicitly, or the revived child's file tools
-    /// and shell commands silently run in the PARENT workspace.
+    async fn offline_supervisor(root: &Path) -> Supervisor {
+        offline_supervisor_with_id(root, "pin-resume-worktree").await
+    }
+
+    /// P2 C2 finding, revised by the D1 work: when `Supervisor::resume`
+    /// ADOPTS a stored `meta.workspace` that differs from the create-time
+    /// root (a worktree-grounded session resumed from the main repo), it
+    /// now syncs the fs adapter and PTY manager too — the same contract as
+    /// `switch_to_worktree` — so `reset_for_new_session` starts from a
+    /// predictable fs state and the resumed session's file tools / shell
+    /// commands run where its meta says it lives. Meta whose stored
+    /// workspace equals the caller's root keeps the old no-touch behavior.
     #[tokio::test(flavor = "multi_thread")]
-    async fn resume_restores_worktree_fields_but_not_fs_root() {
+    async fn resume_adopting_stored_worktree_root_syncs_fs_and_pty() {
         let ws = tempfile::tempdir().expect("tempdir");
         let wt = tempfile::tempdir().expect("worktree tempdir");
         let wt_path = wt.path().canonicalize().expect("canonicalize wt");
 
+        // Save a session whose meta.workspace is the worktree root — the
+        // shape a worktree-grounded session persists (switch_to_worktree
+        // updates workspace_root before the save).
         let mut sup = offline_supervisor(ws.path()).await;
-        sup.set_worktree_info(wt_path.clone(), "nca/pin".into(), "main".into());
-        sup.save().await.expect("persist meta with worktree info");
+        sup.switch_to_worktree(wt_path.clone(), "nca/pin".into(), "main".into());
+        sup.save().await.expect("persist worktree-grounded meta");
         drop(sup);
 
         let mut config = NcaConfig::default();
         config.provider.deepseek.api_key = Some("test-key".into());
-        let mut resumed = Supervisor::resume(
+        let resumed = Supervisor::resume(
             config,
             ws.path(),
             false,
@@ -3384,19 +3552,219 @@ mod tests {
         // Fields restored from meta…
         assert_eq!(resumed.worktree_path.as_deref(), Some(wt_path.as_path()));
         assert_eq!(resumed.branch.as_deref(), Some("nca/pin"));
-        // …but the fs adapter is still rooted at the caller's workspace.
+        // …and the adopted root now owns workspace_root, fs, AND pty.
+        assert_eq!(
+            resumed
+                .workspace_root
+                .canonicalize()
+                .expect("canonical root"),
+            wt_path
+        );
         let fs_root = resumed.fs.root().canonicalize().expect("canonical fs root");
-        assert_ne!(
+        assert_eq!(
             fs_root, wt_path,
-            "resume must NOT re-root the fs adapter on its own — revive has to \
-             call switch_to_worktree explicitly"
+            "resume adopting a differing stored root must re-root the fs adapter"
+        );
+        assert_eq!(
+            resumed
+                .pty
+                .workspace_root()
+                .canonicalize()
+                .expect("canonical pty root"),
+            wt_path,
+            "resume adopting a differing stored root must re-root the PTY"
+        );
+        let handle_root = resumed
+            .workspace_root_handle()
+            .read()
+            .expect("handle lock")
+            .clone();
+        assert_eq!(
+            handle_root.canonicalize().expect("canonical handle root"),
+            wt_path,
+            "live workspace-root handle follows the adopted root"
+        );
+        // The reset target stays the process launch root (D1).
+        assert_eq!(
+            resumed.main_workspace_root(),
+            ws.path().canonicalize().expect("canonical ws").as_path()
+        );
+    }
+
+    /// D1: a worktree-grounded supervisor that runs `/new` must land the
+    /// fresh session back in the MAIN workspace — workspace_root, fs, pty,
+    /// and the rebuilt session store all agree on the main root, and the
+    /// worktree metadata fields are cleared.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reset_clears_worktree_state() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        let wt = tempfile::tempdir().expect("worktree tempdir");
+        let wt_path = wt.path().canonicalize().expect("canonicalize wt");
+        let main_root = ws.path().canonicalize().expect("canonicalize ws");
+
+        let mut sup = offline_supervisor_with_id(ws.path(), "reset-clears-wt").await;
+        sup.switch_to_worktree(wt_path.clone(), "nca/reset".into(), "main".into());
+        assert_eq!(
+            sup.workspace_root.canonicalize().expect("canonical"),
+            wt_path,
+            "precondition: session is worktree-grounded"
         );
 
-        // The explicit switch (what task_revive does) fixes the cwd.
-        resumed.switch_to_worktree(wt_path.clone(), "nca/pin".into(), "main".into());
+        let prev_id = sup.session_id.clone();
+        sup.reset_for_new_session();
+
+        assert_ne!(sup.session_id, prev_id, "fresh id");
         assert_eq!(
-            resumed.fs.root().canonicalize().expect("canonical fs root"),
-            wt_path
+            sup.workspace_root.canonicalize().expect("canonical"),
+            main_root,
+            "workspace_root restored to the main root"
+        );
+        assert!(sup.worktree_path.is_none(), "worktree_path cleared");
+        assert!(sup.branch.is_none(), "branch cleared");
+        assert!(sup.base_branch.is_none(), "base_branch cleared");
+        assert_eq!(
+            sup.session_store.sessions_dir(),
+            main_root.join(".nca/sessions"),
+            "rebuilt store points at the MAIN sessions dir"
+        );
+        // derived_from records the derivation (D2).
+        assert_eq!(sup.derived_from.as_deref(), Some(prev_id.as_str()));
+    }
+
+    /// D1 reset root restoration, structural pins: fs root, PTY root, and
+    /// the live spawn-consumer handle all follow the main root after the
+    /// reset; a DELETED worktree directory must not fail the reset (the
+    /// fs adapter tolerates the missing dir; file ops against it fail
+    /// loudly later instead of the reset itself failing).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reset_fs_pty_root_restored() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        let wt = tempfile::tempdir().expect("worktree tempdir");
+        let wt_path = wt.path().canonicalize().expect("canonicalize wt");
+        let main_root = ws.path().canonicalize().expect("canonicalize ws");
+
+        // Live-directory case: fs/pty/handle all restored to the main root.
+        let mut sup = offline_supervisor_with_id(ws.path(), "reset-fs-pty-live").await;
+        sup.switch_to_worktree(wt_path.clone(), "nca/live".into(), "main".into());
+        sup.reset_for_new_session();
+        assert_eq!(
+            sup.fs.root().canonicalize().expect("canonical fs root"),
+            main_root,
+            "fs root restored"
+        );
+        assert_eq!(
+            sup.pty
+                .workspace_root()
+                .canonicalize()
+                .expect("canonical pty root"),
+            main_root,
+            "pty root restored"
+        );
+        let handle_root = sup
+            .workspace_root_handle()
+            .read()
+            .expect("handle lock")
+            .clone();
+        assert_eq!(
+            handle_root.canonicalize().expect("canonical handle root"),
+            main_root,
+            "live handle restored for future spawns"
+        );
+        drop(sup);
+
+        // Deleted-worktree case: reset completes and still restores the roots.
+        let wt2 = tempfile::tempdir().expect("worktree tempdir 2");
+        let wt2_path = wt2.path().canonicalize().expect("canonicalize wt2");
+        let mut sup2 = offline_supervisor_with_id(ws.path(), "reset-fs-pty-gone").await;
+        sup2.switch_to_worktree(wt2_path.clone(), "nca/gone".into(), "main".into());
+        drop(wt2); // delete the worktree directory out from under the session
+        assert!(!wt2_path.exists(), "precondition: worktree dir gone");
+
+        sup2.reset_for_new_session(); // must not panic / error
+        assert_eq!(
+            sup2.workspace_root.canonicalize().expect("canonical"),
+            main_root,
+            "workspace_root restored even with the worktree dir deleted"
+        );
+        assert_eq!(
+            sup2.session_store.sessions_dir(),
+            main_root.join(".nca/sessions"),
+            "store rebuilt at the main root"
+        );
+    }
+
+    /// M6: the reset criterion is ROOT DRIFT, not `worktree_path.is_some()`.
+    /// A resumed session can carry a root that already points into a
+    /// worktree while the worktree metadata is absent (older jsons,
+    /// hand-edited sessions, a store written by another tool). Such a session
+    /// must still land back on the main root — the old criterion left it
+    /// writing its store, event log and children under the stale root.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reset_restores_root_without_worktree_metadata() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        let wt = tempfile::tempdir().expect("worktree tempdir");
+        let wt_path = wt.path().canonicalize().expect("canonicalize wt");
+        let main_root = ws.path().canonicalize().expect("canonicalize ws");
+
+        let mut sup = offline_supervisor_with_id(ws.path(), "reset-root-drift").await;
+        sup.switch_to_worktree(wt_path.clone(), "nca/drift".into(), "main".into());
+        // Drop the worktree metadata: the root is drifted, the metadata says
+        // otherwise (the shape the old `worktree_path.is_some()` gate missed).
+        sup.worktree_path = None;
+        sup.branch = None;
+        sup.base_branch = None;
+
+        sup.reset_for_new_session();
+
+        assert_eq!(
+            sup.workspace_root.canonicalize().expect("canonical"),
+            main_root,
+            "a drifted root is restored even with no worktree metadata"
+        );
+        assert_eq!(
+            sup.session_store.sessions_dir(),
+            main_root.join(".nca/sessions"),
+            "the rebuilt store follows the restored root"
+        );
+        assert_eq!(
+            sup.fs.root().canonicalize().expect("canonical fs root"),
+            main_root,
+            "fs root restored"
+        );
+    }
+
+    /// D2: `/new` derivation survives persistence — the reset's
+    /// `derived_from` lands in the saved json and reloads verbatim.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reset_records_derived_from() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        let main_root = ws.path().canonicalize().expect("canonicalize ws");
+
+        let mut sup = offline_supervisor_with_id(ws.path(), "reset-derived-from").await;
+        let prev_id = sup.session_id.clone();
+        assert!(sup.derived_from.is_none(), "fresh session has no chain");
+
+        sup.reset_for_new_session();
+        assert_eq!(sup.derived_from.as_deref(), Some(prev_id.as_str()));
+
+        // Persist + reload round-trip keeps the field (single-writer: this
+        // supervisor is the session's own writer; a direct store reload
+        // avoids a second live supervisor for the same id).
+        sup.save().await.expect("save derived session");
+        let reloaded = sup
+            .session_store()
+            .load(&sup.session_id)
+            .await
+            .expect("reload derived session");
+        assert_eq!(
+            reloaded.meta.derived_from.as_deref(),
+            Some(prev_id.as_str()),
+            "derived_from survives the save/load round-trip"
+        );
+        assert_eq!(
+            reloaded.meta.workspace.canonicalize().expect("canonical"),
+            main_root,
+            "derived session meta records the main root"
         );
     }
 

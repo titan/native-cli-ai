@@ -168,7 +168,7 @@ async fn run_service_session_with_startup(
         Some(spawn_subagent_consumer(
             spawn_rx,
             info.session_id.clone(),
-            info.workspace_root.clone(),
+            supervisor.workspace_root_handle(),
             supervisor.live_config(),
             supervisor.spawn_history(),
             supervisor.event_tx(),
