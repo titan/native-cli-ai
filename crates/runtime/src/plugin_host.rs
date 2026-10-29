@@ -11,7 +11,9 @@
 //!            → Operational (bidirectional Cap'n Proto message exchange)
 //!
 //! Transport: self-delimiting Cap'n Proto streaming frames over stdin/stdout.
-//!            stderr is inherited for plugin diagnostics/logs.
+//!            stderr is piped and drained into a bounded tail (same pattern
+//!            as `core::tools::mcp`): a plugin's stray writes must not
+//!            corrupt the TUI, and the tail feeds error reporting.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -26,6 +28,18 @@ use nca_core::plugin_protocol::{self, FrameKind, PROTOCOL_MAJOR, WireError};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
+
+/// Hard cap on the retained stderr tail, bytes. Overflow drops the HEAD and
+/// keeps the TAIL (most recent diagnostics win), mirroring the MCP path in
+/// `nca_core::tools::mcp` (`STDERR_TAIL_LIMIT`) so both plugin surfaces
+/// behave identically.
+const STDERR_TAIL_LIMIT: usize = 64 * 1024;
+
+/// Bounded stderr tail buffer shared with the background drain task
+/// (`Arc<std::sync::Mutex<Vec<u8>>>`, same shape as the MCP path; `StderrTail`
+/// there is crate-private, so runtime keeps a local twin rather than widening
+/// core's exports).
+type StderrTail = Arc<std::sync::Mutex<Vec<u8>>>;
 
 /// A discovered plugin ready to be spawned.
 #[derive(Debug, Clone)]
@@ -46,6 +60,9 @@ struct RemotePluginInstance {
     process: Option<Child>,
     stdin: Option<Arc<Mutex<ChildStdin>>>,
     stdout: Option<Arc<Mutex<ChildStdout>>>,
+    /// Bounded stderr tail written by the background drain task (last
+    /// diagnostics win). Read for error reporting after a failed handshake.
+    stderr_tail: StderrTail,
     capabilities: Option<PluginCapabilities>,
     disabled: Arc<AtomicBool>,
     /// Last disable reason (G7 surfacing). Set alongside `disabled`.
@@ -237,9 +254,14 @@ impl PluginHost {
         permission_mode: &str,
     ) -> Result<(), String> {
         let mut cmd = Command::new(&desc.binary);
+        // stderr is `Stdio::piped()` — never inherited: a plugin's stray
+        // writes must not corrupt the TUI (same rule as `core::tools::mcp`).
+        // A background task drains the pipe into a bounded tail so the pipe
+        // never fills and deadlocks the child; the tail is attached to the
+        // instance below for error reporting.
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
 
         let mut process = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
@@ -249,6 +271,7 @@ impl PluginHost {
             .stdout
             .take()
             .ok_or_else(|| "no stdout".to_string())?;
+        let stderr_tail = spawn_stderr_drain(&mut process);
 
         let stdin = Arc::new(Mutex::new(stdin));
         let stdout = Arc::new(Mutex::new(stdout));
@@ -286,13 +309,14 @@ impl PluginHost {
             }
             Ok(Err(e)) => {
                 disabled.store(true, Ordering::SeqCst);
-                return Err(format!("handshake: {e}"));
+                return Err(format!("handshake: {e}{}", stderr_context(&stderr_tail)));
             }
             Err(_) => {
                 disabled.store(true, Ordering::SeqCst);
                 return Err(format!(
-                    "plugin {} did not send Hello within 10s",
-                    desc.name
+                    "plugin {} did not send Hello within 10s{}",
+                    desc.name,
+                    stderr_context(&stderr_tail)
                 ));
             }
         };
@@ -321,6 +345,7 @@ impl PluginHost {
             process: Some(process),
             stdin: Some(stdin),
             stdout: Some(stdout),
+            stderr_tail,
             capabilities: Some(capabilities),
             disabled,
             disable_reason,
@@ -352,6 +377,24 @@ impl PluginHost {
             }
         }
         reg
+    }
+
+    /// Diagnostic stderr tail captured from a plugin's process (bounded,
+    /// most recent bytes win). `None` when no plugin with that name is
+    /// loaded. For error reporting around failed handshakes / disabled
+    /// plugins — never surfaced into the transcript unprompted.
+    pub fn plugin_stderr_tail(&self, name: &str) -> Option<String> {
+        self.instances
+            .iter()
+            .find(|instance| instance.name == name)
+            .map(|instance| {
+                instance
+                    .stderr_tail
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone()
+            })
+            .map(|buf| String::from_utf8_lossy(&buf).into_owned())
     }
 
     /// Currently-disabled plugins with their last disable reason (G7).
@@ -411,6 +454,59 @@ impl Drop for PluginHost {
             }
         }
     }
+}
+
+// ─── stderr drain ────────────────────────────────────────────────────────────
+
+/// Spawn the background drain task for a freshly spawned plugin process's
+/// piped stderr (the MCP-path twin in `nca_core::tools::mcp`).
+///
+/// The child owns a pipe whose only reader would otherwise be us: if nobody
+/// drains it, a chatty plugin fills the OS pipe buffer and deadlocks. The
+/// task reads until EOF into a bounded drop-head-keep-tail buffer and holds
+/// the [`Child`] handle (via its `kill_on_drop(true)` flag) so the process
+/// is still killed when the instance is dropped.
+fn spawn_stderr_drain(child: &mut Child) -> StderrTail {
+    let tail: StderrTail = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let drain_tail = Arc::clone(&tail);
+    let Some(stderr) = child.stderr.take() else {
+        // Unreachable with our own Stdio config; kill the child rather than
+        // leave it running without a stdio pipe.
+        let _ = child.start_kill();
+        return tail;
+    };
+    tokio::spawn(async move {
+        let mut reader = stderr;
+        let mut chunk = [0u8; 4096];
+        loop {
+            match reader.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if let Ok(mut buf) = drain_tail.lock() {
+                        buf.extend_from_slice(&chunk[..n]);
+                        if buf.len() > STDERR_TAIL_LIMIT {
+                            let excess = buf.len() - STDERR_TAIL_LIMIT;
+                            buf.drain(..excess);
+                        }
+                    }
+                }
+            }
+        }
+    });
+    tail
+}
+
+/// Format the captured stderr tail for inclusion in an error message.
+/// Empty tails contribute nothing (same shape as the MCP path); the embedded
+/// portion is kept small so a chatty plugin cannot flood error strings.
+fn stderr_context(tail: &StderrTail) -> String {
+    let snapshot = tail.lock().unwrap_or_else(|p| p.into_inner()).to_vec();
+    if snapshot.is_empty() {
+        return String::new();
+    }
+    let start = snapshot.len().saturating_sub(4 * 1024);
+    let text = String::from_utf8_lossy(&snapshot[start..]);
+    format!("; stderr tail: {text}")
 }
 
 // ─── Hello parsing ───────────────────────────────────────────────────────────
@@ -1347,5 +1443,85 @@ mod tests {
         }
 
         let _ = process.start_kill();
+    }
+
+    // Verify the piped-stderr drain: a plugin that floods stderr must be
+    // drained continuously (no pipe-full deadlock) and the retained tail
+    // must stay bounded (drop-head-keep-tail) with the LATEST diagnostics
+    // kept — the signal is the final line, not the startup banner.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stderr_drain_keeps_bounded_tail_with_latest_bytes() {
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            "for i in $(seq 1 400); do echo \"banner line $i padding-padding-padding\"; done >&2",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+        let mut child = cmd.spawn().expect("spawn sh");
+        let tail = spawn_stderr_drain(&mut child);
+
+        // Give the drain task time to consume the pipe (the writer would
+        // block mid-script if the pipe were not being drained).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let snapshot = loop {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let snap = tail.lock().unwrap_or_else(|p| p.into_inner()).to_vec();
+            if snap.ends_with(b"400 padding-padding-padding\n")
+                || std::time::Instant::now() > deadline
+            {
+                break snap;
+            }
+        };
+
+        let _ = child.kill().await;
+        assert!(
+            snapshot.ends_with(b"400 padding-padding-padding\n"),
+            "drain must keep the latest bytes, got tail of {} bytes",
+            snapshot.len()
+        );
+        assert!(
+            snapshot.len() <= STDERR_TAIL_LIMIT,
+            "tail must stay bounded ({} <= {})",
+            snapshot.len(),
+            STDERR_TAIL_LIMIT
+        );
+    }
+
+    // A failed handshake error must embed the captured stderr tail: the
+    // useful diagnostic for "plugin did not send Hello" usually lands on
+    // the plugin's stderr.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_one_error_includes_stderr_tail() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("noisy-fail");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho NCA_PLUGIN_FAIL_MARKER >&2\nexit 3\n",
+        )
+        .expect("write script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+
+        let desc = PluginDescriptor {
+            name: "noisy-fail".into(),
+            binary: script,
+        };
+        let mut host = PluginHost::new();
+        let errors = host
+            .start_all(&[desc], dir.path(), "test-session", "default")
+            .await;
+        assert_eq!(errors.len(), 1, "startup must fail: {errors:?}");
+        assert!(
+            errors[0].contains("NCA_PLUGIN_FAIL_MARKER"),
+            "error must carry the plugin's stderr tail, got: {:?}",
+            errors[0]
+        );
     }
 }

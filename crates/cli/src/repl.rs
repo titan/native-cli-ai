@@ -1918,10 +1918,14 @@ impl Repl {
                 self.rewire_after_session_change(&out);
                 // The fresh supervisor re-ran the MCP handshake; its per-server
                 // report would otherwise be dropped (the startup report was
-                // already consumed at wiring). stderr, matching the startup
-                // report — stdout must stay clean for `--stream ndjson`.
+                // already consumed at wiring). Route by output surface — TUI:
+                // transcript lines (a raw stderr write mid-alt-screen would
+                // garble the display); stdio/ndjson: stderr (stdout purity).
                 for line in crate::runner::mcp_report_lines(&self.runtime.take_mcp_report()) {
-                    eprintln!("{line}");
+                    match &out {
+                        ReplOutput::Tui(st) => st.push_system(line),
+                        ReplOutput::Stdio => eprintln!("{line}"),
+                    }
                 }
                 let new_id = self.runtime.session_id().to_string();
                 if let ReplOutput::Tui(st) = &out {
@@ -2168,6 +2172,11 @@ impl Repl {
         // TuiFeedbackChannel: all writes from cmd_rx loop go through this.
         let tui_feedback: Arc<TuiFeedbackChannel> =
             Arc::new(TuiFeedbackChannel::new(feedback_tx.clone()));
+        // The runtime must hold the TUI channel BEFORE any later supervisor
+        // swap: `/new` announces the MCP reload through it (`announce_mcp_load`),
+        // so the line lands in the transcript instead of being eprintln'd into
+        // the alt screen (garbled-screen fix).
+        self.runtime.set_tui_feedback(Arc::clone(&tui_feedback));
 
         let log_path = self.runtime.event_log_path();
         // Replay historical events into the Elm feedback channel (consumed by NcaModel at startup).

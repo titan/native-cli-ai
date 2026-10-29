@@ -1,4 +1,5 @@
 use crate::ipc_pending::{ApprovalPendingMap, QuestionPendingMap};
+use crate::tui::elm::feedback::{TuiFeedback, TuiFeedbackChannel};
 use nca_common::config::{NcaConfig, PermissionMode, PlanEntry, ProviderKind, SandboxMode};
 use nca_common::event::{AgentEvent, EndReason, QuestionSelection};
 use nca_common::session::{OrchestrationContext, SessionSnapshot};
@@ -70,9 +71,23 @@ pub struct SessionRuntime {
     /// IPC-pending approval map — whose receiver has no consumer in stdio
     /// mode, so the first approval-gated tool call hung forever.
     approval_handler: Option<Arc<dyn ApprovalHandler>>,
+    /// TUI feedback channel, `Some` when the session is driven by the
+    /// full-screen TUI. Carried across the `/new` supervisor swap so the
+    /// swap's MCP announcement lands in the transcript instead of being
+    /// `eprintln!`'d into the alt screen (garbled-screen fix). `None` for
+    /// stdio REPL / headless / initial-startup sessions.
+    tui_feedback: Option<Arc<TuiFeedbackChannel>>,
 }
 
 impl SessionRuntime {
+    /// Set the TUI feedback channel on a runtime built without one (the
+    /// runtime must exist before the channel does: the channel is created
+    /// inside the TUI wiring that itself builds the runtime). `announce_mcp_load`
+    /// during a later `/new` supervisor swap routes through this channel.
+    pub fn set_tui_feedback(&mut self, tui_feedback: Arc<TuiFeedbackChannel>) {
+        self.tui_feedback = Some(tui_feedback);
+    }
+
     pub fn take_event_rx(&mut self) -> Option<tokio::sync::mpsc::Receiver<AgentEvent>> {
         self.handle.as_mut()?.take_event_rx()
     }
@@ -509,8 +524,10 @@ impl SessionRuntime {
 
         // Same pre-load announcement as the initial create (MCP handshakes
         // can take tens of seconds on a cold cache — `/new` must not look
-        // like a freeze).
-        announce_mcp_load(&config);
+        // like a freeze). When the caller is a full-screen TUI, the line
+        // rides the feedback channel into the transcript (a raw stderr write
+        // would corrupt the alt screen mid-session).
+        announce_mcp_load(&config, self.tui_feedback.as_deref());
 
         let mut supervisor = Supervisor::create(SupervisorConfig {
             config,
@@ -698,18 +715,24 @@ fn mcp_load_announcement(config: &NcaConfig) -> Option<String> {
 }
 
 /// Announce MCP loading BEFORE the supervisor's create/resume handshake
-/// runs. The TUI has not entered the alt screen yet, so this stderr line is
-/// exactly what the user sees during a slow cold-cache `bunx -y pkg@latest`
-/// fetch (non-TTY modes see it on stderr too). Main-session paths only —
-/// never the subagent spawn path (children run headless). No-op when no
-/// enabled servers exist.
-fn announce_mcp_load(config: &NcaConfig) {
+/// runs. Main-session paths only — never the subagent spawn path (children
+/// run headless). No-op when no enabled servers exist.
+///
+/// Output channel:
+/// - `Some(feedback)` (the `/new` supervisor swap while the full-screen TUI
+///   is up): the line goes through the TUI feedback channel into the
+///   transcript. A raw stderr write here would be injected mid-alt-screen,
+///   and ratatui's differential rendering never repairs cells it does not
+///   own — a garbled screen.
+/// - `None` (initial create/resume, before the TUI enters the alt screen;
+///   stdio REPL; `--stream ndjson`): the pre-existing stderr behavior —
+///   stdout purity is preserved for ndjson.
+fn announce_mcp_load(config: &NcaConfig, tui: Option<&TuiFeedbackChannel>) {
     if let Some(line) = mcp_load_announcement(config) {
-        // stderr in ALL modes: under `--stream ndjson` stdout must stay pure,
-        // and in TUI mode tracing/stderr is redirected away from the
-        // alt-screen (tracing only — but this fires mid-session rarely
-        // enough, and a stray stderr line beats a multi-second freeze).
-        eprintln!("{line}");
+        match tui {
+            Some(feedback) => feedback.push_system(line),
+            None => eprintln!("{line}"),
+        }
     }
 }
 
@@ -750,7 +773,7 @@ pub async fn build_session_runtime(
 
     // Before `create` is awaited (PRD R2): MCP servers can take tens of
     // seconds on a cold cache — show progress instead of a silent hang.
-    announce_mcp_load(&config);
+    announce_mcp_load(&config, None);
 
     let mut supervisor = Supervisor::create(SupervisorConfig {
         config,
@@ -776,6 +799,7 @@ pub async fn build_session_runtime(
         safe_mode,
         interactive_approvals,
         approval_handler,
+        tui_feedback: None,
     })
 }
 
@@ -790,7 +814,7 @@ pub async fn build_resumed_session_runtime(
     // Same pre-load announcement as the create path: `Supervisor::resume`
     // re-runs the create pipeline (MCP handshake included), so a resumed
     // session gets the same during-load visibility.
-    announce_mcp_load(&config);
+    announce_mcp_load(&config, None);
     let mut supervisor = Supervisor::resume(
         config,
         workspace_root,
@@ -810,6 +834,7 @@ pub async fn build_resumed_session_runtime(
         safe_mode,
         interactive_approvals,
         approval_handler,
+        tui_feedback: None,
     })
 }
 
